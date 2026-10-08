@@ -13,6 +13,9 @@
 #include "flutter/lib/io/dart_io.h"
 #include "flutter/lib/ui/dart_runtime_hooks.h"
 #include "flutter/lib/ui/dart_ui.h"
+#if defined(FLAX_ENGINE_EMBEDDED)
+#include "flutter/flax/native/include/flax/engine_gc.h"
+#endif
 #include "flutter/runtime/dart_isolate_group_data.h"
 #include "flutter/runtime/dart_plugin_registrant.h"
 #include "flutter/runtime/dart_service_isolate.h"
@@ -1359,6 +1362,9 @@ void DartIsolate::DartIsolateShutdownCallback(
     return;
   }
 
+#if defined(FLAX_ENGINE_EMBEDDED)
+  flax_engine_shutdown_current_isolate();
+#endif
   isolate_data->get()->OnShutdownCallback();
 }
 

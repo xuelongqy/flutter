@@ -1,0 +1,420 @@
+diff --git a/runtime/BUILD.gn b/runtime/BUILD.gn
+index 5c3eb760..360a19f1 100644
+--- a/runtime/BUILD.gn
++++ b/runtime/BUILD.gn
+@@ -352,6 +352,7 @@ source_set("dart_api") {
+   sources = [
+     "include/analyze_snapshot_api.h",
+     "include/dart_api.h",
++    "include/dart_flax_api.h",
+     "include/dart_api_dl.c",
+     "include/dart_api_dl.h",
+     "include/dart_native_api.h",
+@@ -390,6 +391,7 @@ library_for_all_configs("libdart") {
+     "$target_gen_dir/version.cc",
+     "include/analyze_snapshot_api.h",
+     "include/dart_api.h",
++    "include/dart_flax_api.h",
+     "include/dart_native_api.h",
+     "include/dart_tools_api.h",
+     "vm/analyze_snapshot_api_impl.cc",
+diff --git a/runtime/bin/BUILD.gn b/runtime/bin/BUILD.gn
+index ecff06a6..467fad02 100644
+--- a/runtime/bin/BUILD.gn
++++ b/runtime/bin/BUILD.gn
+@@ -1125,6 +1125,7 @@ source_set("run_vm_tests_set") {
+   deps = [
+     "//third_party/boringssl",  # for secure_socket_utils_test
+     "//third_party/perfetto:libprotozero",  # for timeline_test
++    "//third_party/zlib",  # for gzip.cc in the Flutter engine checkout
+   ]
+ 
+   if (is_fuchsia) {
+diff --git a/runtime/vm/dart_api_impl.cc b/runtime/vm/dart_api_impl.cc
+index ac526ee0..ff9bc2c2 100644
+--- a/runtime/vm/dart_api_impl.cc
++++ b/runtime/vm/dart_api_impl.cc
+@@ -3,6 +3,7 @@
+ // BSD-style license that can be found in the LICENSE file.
+ 
+ #include "include/dart_api.h"
++#include "include/dart_flax_api.h"
+ #include "include/dart_native_api.h"
+ 
+ #include <cstring>
+@@ -1071,6 +1072,41 @@ Dart_NewFinalizableHandle(Dart_Handle object,
+                                    callback);
+ }
+ 
++DART_EXPORT bool Dart_FlaxSetCollector(Dart_FlaxCollector collector,
++                                       void* peer) {
++  Thread* T = Thread::Current();
++  CHECK_ISOLATE_GROUP(T->isolate_group());
++  TransitionToVM transition(T);
++  return T->isolate_group()->api_state()->SetFlaxCollector(collector, peer, T);
++}
++
++DART_EXPORT bool Dart_FlaxRegisterHandle(Dart_WeakPersistentHandle handle,
++                                         bool is_origin) {
++  Thread* T = Thread::Current();
++  CHECK_ISOLATE_GROUP(T->isolate_group());
++  TransitionToVM transition(T);
++  auto* state = T->isolate_group()->api_state();
++  if (state->flax_owner() != T) return false;
++  return state->RegisterFlaxHandle(handle, is_origin);
++}
++
++DART_EXPORT void Dart_FlaxSetCollectionRequest(void (*request)(void*)) {
++  Thread* T = Thread::Current();
++  CHECK_ISOLATE_GROUP(T->isolate_group());
++  TransitionToVM transition(T);
++  RELEASE_ASSERT(T->isolate_group()->api_state()->flax_owner() == T);
++  T->isolate_group()->api_state()->SetFlaxCollectionRequest(request);
++}
++
++DART_EXPORT void Dart_FlaxCollect(bool young, bool compact) {
++  DARTSCOPE(Thread::Current());
++  if (young) {
++    T->heap()->CollectGarbage(T, GCType::kScavenge, GCReason::kDebugging);
++  } else {
++    T->heap()->CollectAllGarbage(GCReason::kDebugging, compact);
++  }
++}
++
+ DART_EXPORT void Dart_DeletePersistentHandle(Dart_PersistentHandle object) {
+   Thread* T = Thread::Current();
+   IsolateGroup* isolate_group = T->isolate_group();
+diff --git a/runtime/vm/dart_api_state.h b/runtime/vm/dart_api_state.h
+index 394ac210..85524a4b 100644
+--- a/runtime/vm/dart_api_state.h
++++ b/runtime/vm/dart_api_state.h
+@@ -5,7 +5,10 @@
+ #ifndef RUNTIME_VM_DART_API_STATE_H_
+ #define RUNTIME_VM_DART_API_STATE_H_
+ 
++#include <unordered_map>
++
+ #include "include/dart_api.h"
++#include "include/dart_flax_api.h"
+ #include "platform/utils.h"
+ #include "vm/bitfield.h"
+ #include "vm/dart_api_impl.h"
+@@ -726,9 +729,57 @@ class ApiState {
+   }
+   void FreeWeakPersistentHandle(FinalizablePersistentHandle* weak_ref) {
+     MutexLocker ml(&mutex_);
++    flax_handles_.erase(weak_ref);
+     weak_persistent_handles_.FreeHandle(weak_ref);
+   }
+ 
++  // Experimental: minor collections retain bridge targets until a joint major
++  // collection. Normal major root enumeration deliberately omits these handles.
++  void VisitFlaxHandles(ObjectPointerVisitor* visitor) {
++    MutexLocker ml(&mutex_);
++    for (auto& entry : flax_handles_) {
++      auto* handle = entry.first;
++      if (!handle->IsFinalizedNotFreed() && handle->ptr()->IsHeapObject()) {
++        // Keep the weak slot in from-space until the ordinary weak visitor
++        // sees the forwarding header. Updating it early looks unreachable.
++        ObjectPtr object = handle->ptr();
++        visitor->VisitPointer(&object);
++      }
++    }
++  }
++
++  bool RegisterFlaxHandle(Dart_WeakPersistentHandle object, bool is_origin) {
++    MutexLocker ml(&mutex_);
++    if (!weak_persistent_handles_.IsValidHandle(object) ||
++        weak_persistent_handles_.IsFreeHandle(object))
++      return false;
++    auto* handle = reinterpret_cast<FinalizablePersistentHandle*>(object);
++    if (handle->auto_delete() || handle->IsFinalizedNotFreed()) return false;
++    return flax_handles_.emplace(handle, is_origin).second;
++  }
++
++  bool SetFlaxCollector(Dart_FlaxCollector collector,
++                        void* peer,
++                        Thread* owner) {
++    if (flax_collector_ != nullptr && collector != nullptr) return false;
++    if (flax_collector_ != nullptr && flax_owner_ != owner) return false;
++    flax_collector_ = collector;
++    flax_peer_ = peer;
++    flax_owner_ = collector == nullptr ? nullptr : owner;
++    if (collector == nullptr) flax_request_ = nullptr;
++    return true;
++  }
++  Dart_FlaxCollector flax_collector() const { return flax_collector_; }
++  void* flax_peer() const { return flax_peer_; }
++  Thread* flax_owner() const { return flax_owner_; }
++  const auto& flax_handles() const { return flax_handles_; }
++  void SetFlaxCollectionRequest(void (*request)(void*)) {
++    flax_request_ = request;
++  }
++  void RequestFlaxCollection() const {
++    if (flax_request_ != nullptr) flax_request_(flax_peer_);
++  }
++
+   bool IsValidPersistentHandle(Dart_PersistentHandle object) {
+     MutexLocker ml(&mutex_);
+     return persistent_handles_.IsValidHandle(object);
+@@ -781,6 +832,11 @@ class ApiState {
+   PersistentHandles persistent_handles_;
+   FinalizablePersistentHandles weak_persistent_handles_;
+   WeakTable acquired_table_;
++  std::unordered_map<FinalizablePersistentHandle*, bool> flax_handles_;
++  Dart_FlaxCollector flax_collector_ = nullptr;
++  void* flax_peer_ = nullptr;
++  Thread* flax_owner_ = nullptr;
++  void (*flax_request_)(void*) = nullptr;
+ 
+   DISALLOW_COPY_AND_ASSIGN(ApiState);
+ };
+diff --git a/runtime/vm/heap/marker.cc b/runtime/vm/heap/marker.cc
+index f58905a0..02246323 100644
+--- a/runtime/vm/heap/marker.cc
++++ b/runtime/vm/heap/marker.cc
+@@ -4,6 +4,9 @@
+ 
+ #include "vm/heap/marker.h"
+ 
++#include <unordered_map>
++#include <vector>
++
+ #include "platform/assert.h"
+ #include "platform/atomic.h"
+ #include "platform/thread_sanitizer.h"
+@@ -59,6 +62,54 @@ class MarkingVisitor : public ObjectPointerVisitor {
+     return raw->untag()->IsMarked();
+   }
+ 
++  void DrainFlaxMarking() {
++    do {
++      ProcessDeferredMarking();
++      DrainMarkingStack();
++    } while (ProcessPendingWeakProperties() || !deferred_work_list_.IsEmpty());
++  }
++
++  // Index only bridge origins at the safepoint. The VM reports newly marked
++  // origins directly; this neither scans nor projects the JavaScript heap.
++  void BeginFlaxTracing(ApiState* state) {
++    flax_state_ = state;
++    for (auto& entry : state->flax_handles()) {
++      auto* handle = entry.first;
++      if (!entry.second || handle->IsFinalizedNotFreed()) continue;
++      ObjectPtr object = handle->ptr();
++      if (!object->IsHeapObject()) continue;
++      auto api = handle->ApiWeakPersistentHandle();
++      flax_origins_[static_cast<uword>(object)].push_back(api);
++      if (object->untag()->IsMarked()) flax_marked_.push_back(api);
++    }
++  }
++
++  static bool FlaxIsMarked(void* context, Dart_WeakPersistentHandle api) {
++    auto* visitor = static_cast<MarkingVisitor*>(context);
++    auto* handle = reinterpret_cast<FinalizablePersistentHandle*>(api);
++    if (!visitor->flax_state_->flax_handles().contains(handle) ||
++        handle->IsFinalizedNotFreed())
++      return false;
++    ObjectPtr object = handle->ptr();
++    return object->IsHeapObject() && object->untag()->IsMarked();
++  }
++
++  static void FlaxMark(void* context, Dart_WeakPersistentHandle api) {
++    auto* visitor = static_cast<MarkingVisitor*>(context);
++    auto* handle = reinterpret_cast<FinalizablePersistentHandle*>(api);
++    RELEASE_ASSERT(visitor->flax_state_->flax_handles().contains(handle));
++    RELEASE_ASSERT(!handle->IsFinalizedNotFreed());
++    visitor->MarkObject(handle->ptr());
++    visitor->FinishedRoots();
++    visitor->DrainFlaxMarking();
++  }
++
++  static Dart_WeakPersistentHandle FlaxNextOrigin(void* context) {
++    auto* visitor = static_cast<MarkingVisitor*>(context);
++    if (visitor->flax_next_ == visitor->flax_marked_.size()) return nullptr;
++    return visitor->flax_marked_[visitor->flax_next_++];
++  }
++
+   void FinishedRoots() {
+     // Nothing to remember for roots. Don't carry over to objects.
+     has_evacuation_candidate_ = false;
+@@ -491,6 +542,7 @@ class MarkingVisitor : public ObjectPointerVisitor {
+       // Add the size only if we win the marking race to prevent
+       // double-counting.
+       if (obj->untag()->TryAcquireMarkBit()) {
++        FlaxObjectMarked(obj);
+         if (!obj->IsNewObject()) {
+           marked_bytes_ += size;
+         }
+@@ -632,6 +684,15 @@ class MarkingVisitor : public ObjectPointerVisitor {
+   GCLinkedLists* delayed() { return &delayed_; }
+ 
+  private:
++  void FlaxObjectMarked(ObjectPtr object) {
++    if (flax_state_ == nullptr) return;
++    auto found = flax_origins_.find(static_cast<uword>(object));
++    if (found != flax_origins_.end()) {
++      for (auto api : found->second)
++        flax_marked_.push_back(api);
++    }
++  }
++
+   DART_FORCE_INLINE
+   bool MarkObject(ObjectPtr obj) {
+     if (obj->IsImmediateObject()) {
+@@ -642,6 +703,7 @@ class MarkingVisitor : public ObjectPointerVisitor {
+ #if defined(HOST_HAS_FAST_WRITE_WRITE_FENCE)
+       // Ignore race: TSAN doesn't support fences.
+       if (obj->untag()->TryAcquireMarkBitIgnoreRace()) {
++        FlaxObjectMarked(obj);
+         new_work_list_.Push(obj);
+       }
+ #else
+@@ -650,6 +712,7 @@ class MarkingVisitor : public ObjectPointerVisitor {
+         // initializing store.
+         deferred_work_list_.Push(obj);
+       } else if (obj->untag()->TryAcquireMarkBit()) {
++        FlaxObjectMarked(obj);
+         new_work_list_.Push(obj);
+       }
+ #endif
+@@ -683,12 +746,18 @@ class MarkingVisitor : public ObjectPointerVisitor {
+     }
+ 
+     if (obj->untag()->TryAcquireMarkBit()) {
++      FlaxObjectMarked(obj);
+       old_work_list_.Push(obj);
+     }
+ 
+     return UntaggedObject::IsEvacuationCandidate(tags);
+   }
+ 
++  ApiState* flax_state_ = nullptr;
++  std::unordered_map<uword, std::vector<Dart_WeakPersistentHandle>>
++      flax_origins_;
++  std::vector<Dart_WeakPersistentHandle> flax_marked_;
++  size_t flax_next_ = 0;
+   PageSpace* page_space_;
+   MarkerWorkList old_work_list_;
+   MarkerWorkList new_work_list_;
+@@ -970,6 +1039,14 @@ class ParallelMarkTask : public SafepointTask {
+       visitor_->ProcessDeferredMarking();
+       barrier_->Sync();
+ 
++      // The ordinary mark stays parallel. A registered foreign collector joins
++      // on the safepoint owner before any weak references are cleared.
++      if (thread->isolate_group()->api_state()->flax_collector() != nullptr) {
++        thread->ReleaseStoreBuffer();
++        visitor_->AddMicros(OS::GetCurrentMonotonicMicros() - start);
++        return;
++      }
++
+       // Phase 3: Weak processing and statistics.
+       visitor_->MournWeakProperties();
+       visitor_->MournWeakReferences();
+@@ -1295,6 +1372,8 @@ void GCMarker::MarkObjects(PageSpace* page_space) {
+ 
+   const int num_tasks = FLAG_marker_tasks;
+   RELEASE_ASSERT(num_tasks > 0);
++  ApiState* api = isolate_group_->api_state();
++  auto collector = api->flax_collector();
+   ThreadBarrier* barrier = new ThreadBarrier(num_tasks, /*initial=*/1);
+ 
+   ResetSlices();
+@@ -1324,6 +1403,39 @@ void GCMarker::MarkObjects(PageSpace* page_space) {
+   }
+   visitors_[0]->Adopt(&global_list_);
+   isolate_group_->safepoint_handler()->RunTasks(&tasks);
++  if (collector != nullptr) {
++    // Merge pending weak work only after the parallel tasks finish. Newly
++    // discovered cross-heap edges must reach a fixed point before mourning.
++    for (intptr_t i = 0; i < num_tasks; i++) {
++      visitors_[i]->Flush(&global_list_);
++    }
++    auto* visitor = visitors_[0];
++    visitor->Adopt(&global_list_);
++    auto* thread = Thread::Current();
++    int64_t start = OS::GetCurrentMonotonicMicros();
++    visitor->set_concurrent(false);
++    visitor->ProcessDeferredMarking();
++    visitor->DrainFlaxMarking();
++    if (thread == api->flax_owner()) {
++      visitor->BeginFlaxTracing(api);
++      Dart_FlaxGC gc = {visitor, MarkingVisitor::FlaxIsMarked,
++                        MarkingVisitor::FlaxMark,
++                        MarkingVisitor::FlaxNextOrigin};
++      collector(api->flax_peer(), &gc);
++    } else {
++      // Never enter a JS isolate from another Dart thread. This conservative
++      // fallback defers cross-heap cycle collection to an owning-thread major.
++      api->VisitFlaxHandles(visitor);
++      visitor->DrainFlaxMarking();
++      api->RequestFlaxCollection();
++    }
++    visitor->MournWeakProperties();
++    visitor->MournWeakReferences();
++    visitor->MournWeakArrays();
++    thread->ReleaseStoreBuffer();
++    IterateWeakRoots(thread);
++    visitor->AddMicros(OS::GetCurrentMonotonicMicros() - start);
++  }
+ 
+   for (intptr_t i = 0; i < num_tasks; i++) {
+     MarkingVisitor* visitor = visitors_[i];
+diff --git a/runtime/vm/heap/scavenger.cc b/runtime/vm/heap/scavenger.cc
+index 9fba03d6..269af227 100644
+--- a/runtime/vm/heap/scavenger.cc
++++ b/runtime/vm/heap/scavenger.cc
+@@ -1163,6 +1163,7 @@ void Scavenger::IterateIsolateRoots(ObjectPointerVisitor* visitor) {
+   TIMELINE_FUNCTION_GC_DURATION(Thread::Current(), "IterateIsolateRoots");
+   heap_->isolate_group()->VisitObjectPointers(
+       visitor, ValidationPolicy::kDontValidateFrames);
++  heap_->isolate_group()->api_state()->VisitFlaxHandles(visitor);
+ }
+ 
+ void Scavenger::IterateStoreBuffers(ScavengerVisitor* visitor) {
+diff --git a/runtime/vm/visitor.cc b/runtime/vm/visitor.cc
+index 37806bb6..de8133f8 100644
+--- a/runtime/vm/visitor.cc
++++ b/runtime/vm/visitor.cc
+@@ -5,6 +5,7 @@
+ #include "vm/visitor.h"
+ 
+ #include "vm/isolate.h"
++#include "vm/raw_object.h"
+ 
+ namespace dart {
+ 
+diff --git a/runtime/include/dart_flax_api.h b/runtime/include/dart_flax_api.h
+new file mode 100644
+index 00000000..80ddf43b
+--- /dev/null
++++ b/runtime/include/dart_flax_api.h
+@@ -0,0 +1,27 @@
++// Experimental Flax cross-heap tracing. Not part of the public Dart API.
++#ifndef RUNTIME_INCLUDE_DART_FLAX_API_H_
++#define RUNTIME_INCLUDE_DART_FLAX_API_H_
++#include "dart_api.h"
++#ifdef __cplusplus
++extern "C" {
++#endif
++// Valid only during the collector callback, on its owning thread. No Dart
++// execution, heap allocation, ordinary Dart API calls, or retained context.
++typedef struct {
++  void* context;
++  bool (*is_marked)(void*, Dart_WeakPersistentHandle);
++  void (*mark)(void*, Dart_WeakPersistentHandle);
++  Dart_WeakPersistentHandle (*next_marked_origin)(void*);
++} Dart_FlaxGC;
++typedef void (*Dart_FlaxCollector)(void*, const Dart_FlaxGC*);
++DART_EXPORT bool Dart_FlaxSetCollector(Dart_FlaxCollector collector,
++                                       void* peer);
++DART_EXPORT bool Dart_FlaxRegisterHandle(Dart_WeakPersistentHandle handle,
++                                         bool is_origin);
++DART_EXPORT void Dart_FlaxSetCollectionRequest(void (*request)(void*));
++// Controlled GC for this experiment, separate from automatic allocation GC.
++DART_EXPORT void Dart_FlaxCollect(bool young, bool compact);
++#ifdef __cplusplus
++}
++#endif
++#endif

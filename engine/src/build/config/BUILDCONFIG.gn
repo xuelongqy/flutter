@@ -358,7 +358,12 @@ if (!is_clang && using_sanitizer) {
   is_clang = true
 }
 
-use_flutter_cxx = is_clang && (is_linux || is_android || is_mac || is_ios)
+declare_args() {
+  # Match the maintained V8 SDK's Apple or Android NDK libc++ ABI.
+  flax_system_cxx = false
+}
+use_flutter_cxx =
+    is_clang && (is_linux || is_android || is_mac || is_ios) && !flax_system_cxx
 
 if (is_msan && !is_linux) {
   assert(false, "Memory sanitizer is only available on Linux.")
@@ -391,6 +396,11 @@ if (use_flutter_cxx) {
     "//flutter/third_party/libcxxabi:libcxxabi_config",
     "//flutter/third_party/libcxx:libcxx_config",
   ]
+}
+if (flax_system_cxx) {
+  assert(is_mac || is_android,
+         "Flax system libc++ is only accepted on macOS and Android")
+  _native_compiler_configs += [ "//flutter/flax:system_cxx" ]
 }
 
 if (is_win) {

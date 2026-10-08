@@ -16,6 +16,9 @@
 #include "flutter/runtime/isolate_configuration.h"
 #include "flutter/runtime/runtime_delegate.h"
 #include "third_party/tonic/dart_message_handler.h"
+#if defined(FLAX_ENGINE_EMBEDDED)
+#include "flutter/flax/native/include/flax/engine_gc.h"
+#endif
 
 namespace flutter {
 
@@ -339,6 +342,9 @@ bool RuntimeController::NotifyIdle(fml::TimeDelta deadline) {
   }
 
   Dart_NotifyIdle(deadline.ToMicroseconds());
+#if defined(FLAX_ENGINE_EMBEDDED)
+  flax_engine_notify_idle_current_isolate();
+#endif
 
   // Idle notifications being in isolate scope are part of the contract.
   if (idle_notification_callback_) {

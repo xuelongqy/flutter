@@ -8,3 +8,5 @@ _Spawn
 _LoadLibraryFromKernel
 _LookupEntryPoint
 _ForceShutdownIsolate
+_flax_engine_get_api
+_flax_engine_get_gc_api

@@ -1,0 +1,13 @@
+# Local producers select a verified SDK; applications consume the Flutter engine.
+declare_args() {
+  flax_v8_sdk = ""
+}
+if (flax_v8_sdk != "") {
+  assert(
+      (target_os == "mac" || target_os == "android") && target_cpu == "arm64",
+      "The Flax engine currently supports macOS and Android arm64")
+}
+
+# Cross-compilation host tools must never link the target's V8 SDK.
+flax_enable_runtime =
+    flax_v8_sdk != "" && current_os == target_os && current_cpu == target_cpu
