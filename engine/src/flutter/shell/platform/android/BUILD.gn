@@ -7,6 +7,7 @@ import("//build/toolchain/clang.gni")
 import("//flutter/build/bin_to_obj.gni")
 import("//flutter/build/zip_bundle.gni")
 import("//flutter/common/config.gni")
+import("//flutter/flax/config.gni")
 import("//flutter/impeller/tools/impeller.gni")
 import("//flutter/lib/snapshot/gen_snapshot.gni")
 import("//flutter/shell/config.gni")
@@ -553,6 +554,26 @@ action("android_jar") {
     "--android_abi",
     "$android_app_abi",
   ]
+
+  if (flax_enable_runtime) {
+    sdk = exec_script("//flutter/flax/tools/sdk_info.py",
+                      [
+                        flax_v8_sdk,
+                        "android-arm64",
+                      ],
+                      "json",
+                      [
+                        "//flutter/flax/source.lock.json",
+                        "$flax_v8_sdk/manifest.json",
+                      ])
+    inputs += sdk.libraries
+    foreach(library, sdk.libraries) {
+      args += [
+        "--native_lib",
+        rebase_path(library, root_build_dir),
+      ]
+    }
+  }
 
   deps = [
     ":flutter_shell_java",

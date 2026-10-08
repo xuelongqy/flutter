@@ -1,0 +1,28 @@
+{
+  "flutter": "3.47.6",
+  "flutterRevision": "5fc346839b5d0eef006ed8404392afb4dfae428d",
+  "dartRevision": "04bcd1036cdc799ac6564988f159ee454d42c822",
+  "flaxBridgeRevision": "10d4d8c07cefceaaceb1eef56d319f303133a038",
+  "sdkVersion": "0.3.0",
+  "v8Version": "15.4.80.15",
+  "v8Revision": "e959d47215186f24e182a0503a52374c96569722",
+  "targets": {
+    "macos-arm64": {
+      "sdkManifestSha256": "ec103ede166ad7b30ce8d1cab251b4ce4612bc1551ef4d22e221e86eba0199ac",
+      "libraries": {
+        "lib/libchrome_zlib.dylib": "343eb7d5685133758ee4a09ded7c4c0680fd4980a7e7abea58a33e5e4088c5e2",
+        "lib/libthird_party_abseil-cpp_absl.dylib": "2482b22c108c2d0e6cb88dfb6d2eb73efca4c04be12e074ea4afe15ebcfcb455",
+        "lib/libv8.dylib": "fb2aff71509c6785a5655a008596781b0f80416dbdee762bcd265afb1dcd62d2",
+        "lib/libv8_libbase.dylib": "b3e08e51b58190a856e2a16ecff016caeb044b0ea32e81d33a65ea620aba9e18",
+        "lib/libv8_libplatform.dylib": "7d5fd5d8273ac8652ab879fe69bc8a4abeaac3a974ea9e7d828e4a8553244343"
+      }
+    },
+    "android-arm64": {
+      "sdkManifestSha256": "121e20d7ce78f0277ef7469c161ad3223dbe96cf1ffdd4c2fd117c66e045c0fb",
+      "libraries": {
+        "lib/libv8.so": "70f21916992fbb05f2ebc8160b530d876f6eef82d136ede117449505699f9990",
+        "lib/libc++_shared.so": "179286feca53f3c2a6b10239594f640820c5704cc3d6b23d8622f835ed233e4f"
+      }
+    }
+  }
+}

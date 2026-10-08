@@ -6,6 +6,7 @@ assert(is_mac)
 
 import("//build/config/darwin/darwin_sdk.gni")
 import("//flutter/build/zip_bundle.gni")
+import("//flutter/flax/config.gni")
 import("//flutter/shell/gpu/gpu.gni")
 import("//flutter/shell/platform/darwin/common/framework_common.gni")
 import("//flutter/shell/platform/glfw/config.gni")
@@ -366,6 +367,9 @@ action("_generate_symlinks") {
     ":copy_framework_privacy_manifest",
     ":copy_license",
   ]
+  if (flax_enable_runtime) {
+    deps += [ "//flutter/flax:framework_libraries" ]
+  }
   metadata = {
     macos_framework_without_entitlement =
         [ "FlutterMacOS.framework.zip/Versions/A/FlutterMacOS" ]

@@ -843,6 +843,11 @@ recursedeps = [
 
 hooks = [
   {
+    'name': 'Apply revision-locked Flax Dart GC patch',
+    'pattern': '.',
+    'action': ['python3', 'engine/src/flutter/flax/tools/apply_dart_patch.py'],
+  },
+  {
     # Generate the Dart SDK's .dart_tool/package_confg.json file.
     'name': 'Generate .dart_tool/package_confg.json',
     'pattern': '.',
