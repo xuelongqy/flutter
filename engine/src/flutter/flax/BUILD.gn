@@ -34,22 +34,43 @@ config("system_cxx") {
 }
 
 if (flax_enable_runtime) {
-  sdk_target = "macos-arm64"
-  if (is_android) {
-    sdk_target = "android-arm64"
+  if (is_ios) {
+    sdk_target = "ios-device-arm64"
+    if (use_ios_simulator) {
+      sdk_target = "ios-simulator-arm64"
+    }
+    sdk = exec_script("tools/sdk_info.py",
+                      [
+                        flax_hermes_build,
+                        sdk_target,
+                      ],
+                      "json",
+                      [
+                        "source.lock.json",
+                        "$flax_hermes_build/flax-hermes.json",
+                      ])
+  } else {
+    sdk_target = "macos-arm64"
+    if (is_android) {
+      sdk_target = "android-arm64"
+    }
+    sdk = exec_script("tools/sdk_info.py",
+                      [
+                        flax_v8_sdk,
+                        sdk_target,
+                      ],
+                      "json",
+                      [
+                        "source.lock.json",
+                        "$flax_v8_sdk/manifest.json",
+                      ])
   }
-  sdk = exec_script("tools/sdk_info.py",
-                    [
-                      flax_v8_sdk,
-                      sdk_target,
-                    ],
-                    "json",
-                    [
-                      "source.lock.json",
-                      "$flax_v8_sdk/manifest.json",
-                    ])
   config("sdk") {
-    include_dirs = [ "$flax_v8_sdk/include" ]
+    if (is_ios) {
+      include_dirs = sdk.includeDirs
+    } else {
+      include_dirs = [ "$flax_v8_sdk/include" ]
+    }
     defines = sdk.defines
     libs = sdk.libraries
     if (is_android) {
@@ -65,31 +86,38 @@ if (flax_enable_runtime) {
     }
   }
   source_set("runtime") {
-    sources = [
-      "native/jsi/jsi/jsi.cpp",
-      "native/src/joint_gc.cc",
-      "native/src/runtime.cpp",
-      "native/v8-jsi/src/MurmurHash.cpp",
-      "native/v8-jsi/src/jsi_abi/JsiAbiRuntime.cpp",
-      "native/v8-jsi/src/jsi_abi/jsi_abi_v8.cpp",
-      "native/v8-jsi/src/v8_core.cpp",
-      "native/v8_engine.cpp",
-    ]
+    sources = [ "native/src/runtime.cpp" ]
     include_dirs = [
       "native/include",
       "native/src",
-      "native/jsi",
-      "native/v8-jsi/src",
       "//flutter/third_party/dart/runtime/include",
     ]
-    defines = [
-      "FLAX_BUILDING_BRIDGE",
-      "FLAX_ENGINE_ID=2",
-      "JSI_VERSION=20",
-      "JSI_NOEXCEPT_15=noexcept",
-      "JSI_CONST_10=const",
-      "JSI_NO_CONST_3=",
-    ]
+    defines = [ "FLAX_BUILDING_BRIDGE" ]
+    if (is_ios) {
+      sources += [ "native/hermes_engine.cpp" ]
+      defines += [ "FLAX_ENGINE_ID=1" ]
+    } else {
+      sources += [
+        "native/jsi/jsi/jsi.cpp",
+        "native/src/joint_gc.cc",
+        "native/v8-jsi/src/MurmurHash.cpp",
+        "native/v8-jsi/src/jsi_abi/JsiAbiRuntime.cpp",
+        "native/v8-jsi/src/jsi_abi/jsi_abi_v8.cpp",
+        "native/v8-jsi/src/v8_core.cpp",
+        "native/v8_engine.cpp",
+      ]
+      include_dirs += [
+        "native/jsi",
+        "native/v8-jsi/src",
+      ]
+      defines += [
+        "FLAX_ENGINE_ID=2",
+        "JSI_VERSION=20",
+        "JSI_NOEXCEPT_15=noexcept",
+        "JSI_CONST_10=const",
+        "JSI_NO_CONST_3=",
+      ]
+    }
     configs += [
       ":sdk",
       "//build/config/compiler:enable_exceptions",

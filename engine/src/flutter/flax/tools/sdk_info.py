@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Return GN inputs from the immutable, revision-locked V8 SDK."""
+"""Return GN inputs from verified V8 SDKs or the patched Hermes producer."""
 
 import hashlib
 import json
@@ -7,6 +7,32 @@ import os
 from pathlib import Path
 import re
 import sys
+
+from build_hermes import digest, recipe_digest
+
+
+def hermes_inputs(build: Path, lock: dict, target: str) -> dict:
+    manifest = json.loads((build / "flax-hermes.json").read_text())
+    if (target not in ("ios-device-arm64", "ios-simulator-arm64") or
+            manifest["engine"] != "hermes" or manifest["target"] != target or
+            manifest["jit"] is not False or manifest["gcExtension"] != 1 or
+            manifest["revision"] != lock["hermes"]["revision"] or
+            manifest["recipe"] != recipe_digest(lock["hermes"])):
+        raise ValueError("Expected the pinned " + target + " Hermes joint-GC build")
+    expected = [str(build / "hermes/lib/libhermesvm_a.a"),
+                str(build / "hermes/jsi/libjsi.a"),
+                str(build / "hermes/external/boost/boost_1_86_0/libs/context/libboost_context.a")]
+    if manifest["libraries"] != expected:
+        raise ValueError("Unexpected Hermes static libraries")
+    for name, expected_digest in manifest["files"].items():
+        if digest(Path(name)) != expected_digest:
+            raise ValueError("Hermes producer input changed: " + name)
+    if any(name not in manifest["files"] for name in expected):
+        raise ValueError("Hermes library hash is missing")
+    return {"includeDirs": manifest["includeDirs"], "libraries": expected,
+            "defines": ['FLAX_HERMES_REVISION="' + lock['hermes']['revision'] + '"',
+                        'FLAX_FLUTTER_REVISION="' + lock['flutterRevision'] + '"',
+                        'FLAX_DART_REVISION="' + lock['dartRevision'] + '"']}
 
 def sdk_inputs(sdk: Path, target: str, lock: dict) -> dict:
     sdk = sdk.resolve()
@@ -56,7 +82,8 @@ if __name__ == "__main__":
     lock = json.loads((flax / "source.lock.json").read_text())
     sdk = Path(sys.argv[1]).resolve()
     target = sys.argv[2]
-    inputs = sdk_inputs(sdk, target, lock)
+    inputs = (hermes_inputs(sdk, lock, target) if target in ("ios-device-arm64", "ios-simulator-arm64")
+              else sdk_inputs(sdk, target, lock))
     if target == "android-arm64":
         android_sdk = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT")
         if not android_sdk:

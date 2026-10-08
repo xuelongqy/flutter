@@ -24,5 +24,43 @@
         "lib/libc++_shared.so": "179286feca53f3c2a6b10239594f640820c5704cc3d6b23d8622f835ed233e4f"
       }
     }
+  },
+  "hermes": {
+    "repository": "https://github.com/facebook/hermes",
+    "version": "260318099.0.4",
+    "revision": "d412d3bd851278712c20cca25d094e32641a0465",
+    "archive": "https://codeload.github.com/facebook/hermes/tar.gz/d412d3bd851278712c20cca25d094e32641a0465",
+    "sha256": "be7fadbb2ef66f97bfba3d52de183823cbcc95f7b634ea0f8b19018a67b4daf7",
+    "name": "Hermes",
+    "patches": [
+      {
+        "file": "hermes-transfer.patch",
+        "sha256": "15b8be251c0b2079325e89b86d46057bfa3b34f8d52c1075e9b562c8417abf76"
+      },
+      {
+        "file": "hermes-windows-shared.patch",
+        "sha256": "3802aa243a7880395a39c25482debd8bd867e8dadb193b02e1084db06e5a2d6e"
+      },
+      {
+        "file": "hermes-android-unicode-lite.patch",
+        "sha256": "b8df1bc90b187f749a088451b4332cb5e24b897867b58b95dba8e58965e756f1"
+      },
+      {
+        "file": "hermes-apple-sysroot.patch",
+        "sha256": "113ce15935a29d6743086c57e9c27ab4593ef4068466fd226ca6c7a406563157"
+      },
+      {
+        "file": "hermes-gcc-noinline-linkage.patch",
+        "sha256": "80dbae7c689381cadb31dcead01cba239a9acad0969d5ac57c494d3ba96fce66"
+      },
+      {
+        "file": "hermes-windows-native-stack.patch",
+        "sha256": "4fbc18aec4eb98d462553bb908ad7532cef5192ac1bc4801f8da2c340e190385"
+      },
+      {
+        "file": "hermes-joint-gc.patch",
+        "sha256": "2789608c130af121aba0c2daf58f8d5ceeb4e44d591248de298c3346a21f76a2"
+      }
+    ]
   }
 }

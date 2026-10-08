@@ -1,18 +1,20 @@
-#include "engine.h"
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
+#include "engine.h"
 unsigned flaxV8JitEventCount();
 #include "flax_v8.h"
+#include "joint_gc.h"
 #include "jsi_abi/JsiAbiRuntime.h"
+#include "jsi_abi/jsi_abi_v8_internal.h"
 #include "jsi_abi/v8_jsi_config.h"
 
 namespace flax {
-std::unique_ptr<facebook::jsi::Runtime> createEngineRuntime() {
+std::unique_ptr<facebook::jsi::Runtime> createEngineRuntime(size_t*) {
   const auto previousJitEvents = flaxV8JitEventCount();
   auto runtime = jsi::abi::makeJsiAbiRuntime(
       v8_create_runtime,
-      [](void *, jsi_config config) {
+      [](void*, jsi_config config) {
         v8_jsi_config_set_explicit_microtask_policy(config, true);
         v8_jsi_config_enable_multi_thread(config, true);
         v8_jsi_config_enable_jit_tracing(
@@ -49,13 +51,43 @@ std::unique_ptr<facebook::jsi::Runtime> createEngineRuntime() {
 #endif
   return runtime;
 }
-} // namespace flax
+facebook::jsi::Value prepareEngineValue(facebook::jsi::Runtime&,
+                                        facebook::jsi::Value value) {
+  return value;
+}
+JointCell* bindDartPeer(facebook::jsi::Runtime& runtime,
+                        const facebook::jsi::Object& object,
+                        Dart_Handle target,
+                        Dart_Handle origin,
+                        bool weaken,
+                        void (*cleanup)(void*),
+                        void* data) {
+  return v8rt_internal::bindDartPeer(jsi::abi::getAbiRuntime(runtime),
+                                     jsi::abi::getAbiObject(runtime, object),
+                                     target, origin, weaken, cleanup, data);
+}
+void releaseDartPeer(facebook::jsi::Runtime& runtime, JointCell* cell) {
+  v8rt_internal::releaseDartPeer(jsi::abi::getAbiRuntime(runtime), cell);
+}
+uint64_t jointCellCount(facebook::jsi::Runtime& runtime) {
+  return v8rt_internal::jointCellCount(jsi::abi::getAbiRuntime(runtime));
+}
+void closeEngineRuntime(facebook::jsi::Runtime&) {}
+// V8 already schedules idle work when its outermost JSI scope exits.
+void notifyEngineWork(facebook::jsi::Runtime&) {}
+void shutdownJointHeap() {
+  JointHeap::ShutdownCurrent();
+}
+void notifyIdleJointHeap() {
+  JointHeap::NotifyIdleCurrent();
+}
+}  // namespace flax
 
-extern "C" const void *flax_v8_get_api(uint32_t version) {
+extern "C" const void* flax_v8_get_api(uint32_t version) {
   return version == FLAX_ABI_VERSION ? flax::runtimeApi() : nullptr;
 }
 
-extern "C" __attribute__((visibility("default")))
-const FlaxApi *flax_engine_get_api(uint32_t version) {
+extern "C" __attribute__((visibility("default"))) const FlaxApi*
+flax_engine_get_api(uint32_t version) {
   return version == FLAX_ABI_VERSION ? flax::runtimeApi() : nullptr;
 }

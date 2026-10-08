@@ -1,8 +1,5 @@
 #include "engine.h"
 #include "flax/engine_gc.h"
-#include "joint_gc.h"
-#include "jsi_abi/JsiAbiRuntime.h"
-#include "jsi_abi/jsi_abi_v8_internal.h"
 
 #include "value_id.h"
 #include <cstdlib>
@@ -18,6 +15,9 @@ namespace fbjsi = facebook::jsi;
 struct BoundValue;
 
 struct FlaxRuntime {
+  ~FlaxRuntime() {
+    if (js) flax::closeEngineRuntime(*js);
+  }
   Dart_Isolate owner = Dart_CurrentIsolate();
   std::recursive_mutex mutex;
   size_t depth = 0;
@@ -127,7 +127,10 @@ struct Entry {
       throw BridgeError(FLAX_STATE_ERROR, "Runtime belongs to another Dart isolate");
     ++runtime->depth;
   }
-  ~Entry() { --runtime.depth; }
+  ~Entry() {
+    if (--runtime.depth == 0)
+      flax::notifyEngineWork(*runtime.js);
+  }
 };
 
 template <typename Action>
@@ -159,7 +162,7 @@ fbjsi::Value &value(FlaxRuntime *runtime, FlaxValueId id) {
 
 FlaxValueId keep(FlaxRuntime *runtime, fbjsi::Value value) {
   const auto id = nextValue.next();
-  runtime->values.emplace(id, std::move(value));
+  runtime->values.emplace(id, flax::prepareEngineValue(*runtime->js, std::move(value)));
   return id;
 }
 
@@ -186,7 +189,7 @@ fbjsi::PropNameID propertyName(FlaxRuntime *runtime, const uint16_t *name,
 int32_t create(FlaxRuntime **output, FlaxError *error) {
   return protect(error, [&] {
     auto runtime = std::make_unique<FlaxRuntime>();
-    runtime->js = flax::createEngineRuntime();
+    runtime->js = flax::createEngineRuntime(&runtime->depth);
     runtime->arrayBufferConstructor = std::make_unique<fbjsi::Function>(
         runtime->js->global().getPropertyAsFunction(*runtime->js, "ArrayBuffer"));
     // Capture intrinsic getters: a view's own buffer/offset properties may lie.
@@ -228,6 +231,7 @@ int32_t destroy(FlaxRuntime *runtime, FlaxError *error) {
       runtime->values.clear();
       runtime->byteView.reset();
       runtime->arrayBufferConstructor.reset();
+      flax::closeEngineRuntime(*runtime->js);
       runtime->js.reset();
     }
     {
@@ -333,7 +337,7 @@ int32_t releaseValue(FlaxRuntime *runtime, FlaxValueId id, FlaxError *error) {
   return enter(runtime, error, [&] {
     auto bound = runtime->boundValues.find(id);
     if (bound != runtime->boundValues.end()) {
-      v8rt_internal::releaseDartPeer(jsi::abi::getAbiRuntime(*runtime->js), bound->second->cell);
+      flax::releaseDartPeer(*runtime->js, bound->second->cell);
       return;
     }
     if (!runtime->values.erase(id))
@@ -446,8 +450,7 @@ int32_t registerHostPeer(FlaxRuntime *runtime, const uint16_t *name, size_t leng
           return fbjsi::Value(js, value(runtime, frame.result));
         });
     if (target) {
-      v8rt_internal::bindDartPeer(jsi::abi::getAbiRuntime(*runtime->js),
-          jsi::abi::getAbiObject(*runtime->js, function), target, nullptr, false);
+      flax::bindDartPeer(*runtime->js, function, target, nullptr, false);
     }
     runtime->js->global().setProperty(*runtime->js, prop, std::move(function));
   });
@@ -532,8 +535,7 @@ int32_t bindValue(FlaxRuntime* runtime, FlaxValueId id,
     bound->runtime = runtime;
     bound->id = id;
     try {
-      bound->cell = v8rt_internal::bindDartPeer(jsi::abi::getAbiRuntime(*runtime->js),
-          jsi::abi::getAbiObject(*runtime->js, object), nullptr, origin, true,
+      bound->cell = flax::bindDartPeer(*runtime->js, object, nullptr, origin, true,
           BoundValue::collected, bound.get());
       runtime->boundValues.emplace(id, bound.release());
       saved = std::move(object);
@@ -550,14 +552,12 @@ int32_t bindPeer(FlaxRuntime* runtime, FlaxValueId id,
     if (!target || Dart_IsNull(target))
       throw BridgeError(FLAX_ARGUMENT_ERROR, "Expected a Dart peer");
     auto object = ::object(runtime, id);
-    v8rt_internal::bindDartPeer(jsi::abi::getAbiRuntime(*runtime->js),
-        jsi::abi::getAbiObject(*runtime->js, object), target, origin, false);
+    flax::bindDartPeer(*runtime->js, object, target, origin, false);
   });
 }
 
 uint64_t cellCount(FlaxRuntime* runtime) {
-  return runtime && runtime->js ? v8rt_internal::jointCellCount(
-      jsi::abi::getAbiRuntime(*runtime->js)) : 0;
+  return runtime && runtime->js ? flax::jointCellCount(*runtime->js) : 0;
 }
 
 const FlaxEngineGcApi gcApi{FLAX_ENGINE_GC_VERSION, sizeof(FlaxEngineGcApi),
@@ -581,7 +581,7 @@ extern "C" void flax_engine_shutdown_current_isolate() {
     auto it = runtimes.find(Dart_CurrentIsolate());
     if (it != runtimes.end()) live.assign(it->second.begin(), it->second.end());
   }
-  flax::JointHeap::ShutdownCurrent();
+  flax::shutdownJointHeap();
   for (auto* runtime : live) {
     FlaxError error{};
     if (destroy(runtime, &error) != FLAX_OK) std::abort();
@@ -589,5 +589,5 @@ extern "C" void flax_engine_shutdown_current_isolate() {
 }
 
 extern "C" void flax_engine_notify_idle_current_isolate() {
-  flax::JointHeap::NotifyIdleCurrent();
+  flax::notifyIdleJointHeap();
 }

@@ -398,8 +398,8 @@ if (use_flutter_cxx) {
   ]
 }
 if (flax_system_cxx) {
-  assert(is_mac || is_android,
-         "Flax system libc++ is only accepted on macOS and Android")
+  assert(is_mac || is_android || is_ios,
+         "Flax system libc++ is only accepted on macOS, Android and iOS")
   _native_compiler_configs += [ "//flutter/flax:system_cxx" ]
 }
 
