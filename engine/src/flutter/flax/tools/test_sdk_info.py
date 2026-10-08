@@ -6,10 +6,44 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from sdk_info import android_cxx_headers, sdk_inputs
+from sdk_info import android_cxx_headers, sdk_inputs, hermes_inputs
+from build_hermes import recipe_digest
 
 
 class SdkTest(unittest.TestCase):
+    def test_hermes_requires_the_joint_gc_recipe_and_unchanged_libraries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            build = Path(directory).resolve()
+            libraries = [build / "hermes/lib/libhermesvm_a.a", build / "hermes/jsi/libjsi.a",
+                         build / "hermes/external/boost/boost_1_86_0/libs/context/libboost_context.a"]
+            for path in libraries:
+                path.parent.mkdir(parents=True)
+                path.write_bytes(b"fixture")
+            lock = {"hermes": {"revision": "hermes", "patches": []},
+                    "flutterRevision": "flutter", "dartRevision": "dart"}
+            manifest = {"engine": "hermes", "target": "ios-simulator-arm64", "jit": False,
+                        "gcExtension": 1, "revision": "hermes", "recipe": recipe_digest(lock["hermes"]),
+                        "libraries": [str(p) for p in libraries], "includeDirs": [],
+                        "files": {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in libraries}}
+            path = build / "flax-hermes.json"
+            path.write_text(json.dumps(manifest))
+            for target in ("ios-device-arm64", "ios-simulator-arm64"):
+                manifest["target"] = target
+                path.write_text(json.dumps(manifest))
+                self.assertEqual(hermes_inputs(build, lock, target)["libraries"], manifest["libraries"])
+                other = "ios-device-arm64" if target == "ios-simulator-arm64" else "ios-simulator-arm64"
+                with self.assertRaisesRegex(ValueError, "joint-GC"):
+                    hermes_inputs(build, lock, other)
+            manifest["gcExtension"] = 0
+            path.write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, "joint-GC"):
+                hermes_inputs(build, lock, "ios-simulator-arm64")
+            manifest["gcExtension"] = 1
+            path.write_text(json.dumps(manifest))
+            libraries[0].write_bytes(b"changed")
+            with self.assertRaisesRegex(ValueError, "input changed"):
+                hermes_inputs(build, lock, "ios-simulator-arm64")
+
     def test_android_headers_match_the_sdk_revision(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()

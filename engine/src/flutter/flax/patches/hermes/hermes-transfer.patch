@@ -1,0 +1,136 @@
+--- a/include/hermes/VM/PredefinedStrings.def
++++ b/include/hermes/VM/PredefinedStrings.def
+@@ -211,6 +211,7 @@
+ 
+ STR(ArrayBuffer, "ArrayBuffer")
+ STR(byteLength, "byteLength")
++STR(transfer, "transfer")
+ STR(detached, "detached")
+ STR(isView, "isView")
+ STR(buffer, "buffer")
+--- a/include/hermes/VM/NativeFunctions.def
++++ b/include/hermes/VM/NativeFunctions.def
+@@ -6,7 +6,7 @@
+  */
+ 
+ // Updated January 28, 2022
+-#define NATIVE_FUNCTION_VERSION_VALUE 12
++#define NATIVE_FUNCTION_VERSION_VALUE 13
+ 
+ #ifndef NATIVE_FUNCTION
+ #define NATIVE_FUNCTION(func)
+@@ -18,6 +18,7 @@
+ NATIVE_FUNCTION(arrayBufferPrototypeByteLength)
+ NATIVE_FUNCTION(arrayBufferPrototypeDetached)
+ NATIVE_FUNCTION(arrayBufferPrototypeSlice)
++NATIVE_FUNCTION(arrayBufferPrototypeTransfer)
+ 
+ NATIVE_FUNCTION(arrayConstructor)
+ NATIVE_FUNCTION(arrayIsArray)
+--- a/lib/VM/JSLib/ArrayBuffer.cpp
++++ b/lib/VM/JSLib/ArrayBuffer.cpp
+@@ -69,6 +69,13 @@
+       nullptr,
+       arrayBufferPrototypeSlice,
+       2);
++  defineMethod(
++      runtime,
++      arrayBufferPrototype,
++      Predefined::getSymbolID(Predefined::transfer),
++      nullptr,
++      arrayBufferPrototypeTransfer,
++      0);
+ 
+   auto dpf = DefinePropertyFlags::getDefaultNewPropertyFlags();
+   dpf.writable = 0;
+@@ -269,6 +276,46 @@
+   // 26. Return new.
+   return lv.newBuf.getHermesValue();
+ }
++
++// ArrayBufferCopyAndDetach for fixed-length, unshared ArrayBuffers.
++CallResult<HermesValue> arrayBufferPrototypeTransfer(void *, Runtime &runtime) {
++  NativeArgs args = runtime.getCurrentFrame().getNativeArgs();
++  auto self = args.dyncastThis<JSArrayBuffer>();
++  if (!self) {
++    return runtime.raiseTypeError("transfer called on a non-ArrayBuffer");
++  }
++  uint64_t length = self->size();
++  if (!args.getArg(0).isUndefined()) {
++    auto result = toIndex(runtime, args.getArgHandle(0));
++    if (result == ExecutionStatus::EXCEPTION) {
++      return ExecutionStatus::EXCEPTION;
++    }
++    length = result->getNumberAs<uint64_t>();
++  }
++  // Conversion can execute user code and detach the source.
++  if (!self->attached()) {
++    return runtime.raiseTypeError("Detached ArrayBuffer");
++  }
++  if (length > std::numeric_limits<JSArrayBuffer::size_type>::max()) {
++    return runtime.raiseRangeError("Too large of a byteLength requested");
++  }
++  struct : public Locals {
++    PinnedValue<JSArrayBuffer> target;
++  } lv;
++  LocalsRAII lraii(runtime, &lv);
++  lv.target.castAndSetHermesValue<JSArrayBuffer>(
++      JSArrayBuffer::create(
++          runtime, Handle<JSObject>::vmcast(&runtime.arrayBufferPrototype))
++          .getHermesValue());
++  if (JSArrayBuffer::createDataBlock(runtime, lv.target, length) ==
++      ExecutionStatus::EXCEPTION) {
++    return ExecutionStatus::EXCEPTION;
++  }
++  JSArrayBuffer::copyDataBlockBytes(
++      runtime, *lv.target, 0, *self, 0, std::min<uint64_t>(length, self->size()));
++  JSArrayBuffer::detach(runtime, self);
++  return lv.target.getHermesValue();
++}
+ /// @}
+ } // namespace vm
+ } // namespace hermes
+--- a/lib/VM/JSLib/TypedArray.cpp
++++ b/lib/VM/JSLib/TypedArray.cpp
+@@ -183,6 +183,9 @@
+     Runtime &runtime,
+     Handle<JSTypedArray<T, C>> self,
+     Handle<JSTypedArrayBase> other) {
++  if (!other->attached(runtime)) {
++    return runtime.raiseTypeError("Cannot copy a detached TypedArray");
++  }
+   if (JSTypedArray<T, C>::createBuffer(runtime, self, other->getLength()) ==
+       ExecutionStatus::EXCEPTION) {
+     return ExecutionStatus::EXCEPTION;
+@@ -217,6 +220,19 @@
+         "[length]): if byteOffset is specified, it "
+         "must be evenly divisible by the element size");
+   }
++  uint64_t newLength = 0;
++  if (!length->isUndefined()) {
++    auto res2 = toIndex(runtime, length);
++    if (res2 == ExecutionStatus::EXCEPTION) {
++      return ExecutionStatus::EXCEPTION;
++    }
++    newLength = res2->getNumberAs<uint64_t>();
++  }
++  // Offset and length conversion can execute JS and detach the source.
++  if (!buffer->attached()) {
++    return runtime.raiseTypeError(
++        "Cannot construct TypedArray on a detached ArrayBuffer");
++  }
+   auto bufferByteLength = buffer->size();
+   uint64_t newByteLength = 0;
+   if (length->isUndefined()) {
+@@ -234,11 +250,6 @@
+     }
+     newByteLength = bufferByteLength - offset;
+   } else {
+-    auto res2 = toLength(runtime, length);
+-    if (res2 == ExecutionStatus::EXCEPTION) {
+-      return ExecutionStatus::EXCEPTION;
+-    }
+-    uint64_t newLength = res2->getNumberAs<uint64_t>();
+     newByteLength = newLength * sizeof(T);
+     if (offset + newByteLength > bufferByteLength) {
+       return runtime.raiseRangeError(
