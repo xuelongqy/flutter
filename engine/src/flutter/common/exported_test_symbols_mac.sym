@@ -10,3 +10,4 @@ _LookupEntryPoint
 _ForceShutdownIsolate
 _flax_engine_get_api
 _flax_engine_get_gc_api
+_flax_engine_get_binding_api

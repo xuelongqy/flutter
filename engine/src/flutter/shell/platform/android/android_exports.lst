@@ -9,6 +9,7 @@
     JNI_OnLoad;
     flax_engine_get_api;
     flax_engine_get_gc_api;
+    flax_engine_get_binding_api;
     _binary_icudtl_dat_start;
     _binary_icudtl_dat_size;
     InternalFlutterGpu*;

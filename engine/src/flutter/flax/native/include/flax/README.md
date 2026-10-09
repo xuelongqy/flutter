@@ -10,5 +10,8 @@ used after destruction. The Dart wrapper provides disposal and reference guards.
 
 Regenerate Dart declarations in the Flax workspace with `dart run melos run ffi:generate`
 and verify them with `ffi:check`. Incompatible changes require an ABI version update.
-`engine_gc.h` is a separately versioned engine extension. See
+`engine_gc.h` and `engine_binding.h` are separately versioned engine extensions.
+Binding extension 1 registers shared member layouts and invokes current JS receivers
+with flat typed arguments. Keep these headers identical to the Flax workspace copies.
+See
 [engine build and ownership](../../../README.md).
