@@ -772,7 +772,9 @@ int32_t invokeMember(FlaxRuntime* runtime,
       auto fn = function.getObject(js).getFunction(js);
       result = js.call(fn, fbjsi::Value(js, target), args.data(), args.size());
     }
-    if (member->kind != 0 && result.isObject()) {
+    // Getter values use typed Dart conversion; setter execution stays
+    // synchronous.
+    if (member->kind == 2 && result.isObject()) {
       auto then = result.getObject(js).getProperty(js, "then");
       if (then.isObject() && then.getObject(js).isFunction(js))
         throw fbjsi::JSError(js, "Proxy property must be synchronous");
