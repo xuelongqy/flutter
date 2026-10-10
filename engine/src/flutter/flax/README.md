@@ -121,6 +121,11 @@ Only one UI isolate per Dart isolate group is supported. Background runtime
 creation and a second UI isolate in that group fail explicitly. GC does not
 dispose application controllers or change Flutter's Element/State lifecycle.
 
+Proxy getters return values through Flax's typed Dart converter, including Promise
+values for Future/FutureOr properties and lazy Stream references. Native dispatch
+still rejects a Promise returned by the setter function; assigning a Future-valued
+property does not make the Dart assignment asynchronous. Native ABI 2 is unchanged.
+
 `experiments/cross_heap_gc` is the preserved standalone experiment. It is not
 the engine implementation or proof of real application acceptance. Real Flax
 regressions and acceptance evidence belong to the Flax checkout.
