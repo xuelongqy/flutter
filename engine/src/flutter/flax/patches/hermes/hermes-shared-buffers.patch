@@ -1,0 +1,126 @@
+--- a/API/hermes/hermes.cpp
++++ b/API/hermes/hermes.cpp
+@@ -3358,7 +3358,23 @@
+     return nullptr;
+   }
+   if (LLVM_UNLIKELY(!abHandle->external())) {
+-    return nullptr;
++    class SharedBytes final : public jsi::MutableBuffer {
++     public:
++      SharedBytes(uint8_t* data, size_t size) : data_(data), size_(size) {}
++      ~SharedBytes() override { std::free(data_); }
++      uint8_t* data() override { return data_; }
++      size_t size() const override { return size_; }
++     private:
++      uint8_t* data_;
++      size_t size_;
++    };
++    vm::GCScope gcScope(runtime_);
++    auto data = abHandle->getDataBlock();
++    auto size = abHandle->size();
++    auto storage = std::make_shared<SharedBytes>(data, size);
++    // Keep the ArrayBuffer and every existing view; adopt its bytes without copying.
++    vm::JSArrayBuffer::ejectBufferUnsafe(runtime_, abHandle);
++    vm::JSArrayBuffer::setExternalDataBlock(runtime_, abHandle, data, size, storage);
+   }
+ 
+   // External ArrayBuffers are created using the `createArrayBuffer` API with a
+@@ -3379,26 +3395,21 @@
+ }
+ 
+ jsi::Uint8Array HermesRuntimeImpl::createUint8Array(
+-    const jsi::ArrayBuffer &buffer,
+-    size_t offset,
+-    size_t length) {
++    const jsi::ArrayBuffer& buffer, size_t offset, size_t length) {
+   vm::GCScope gcScope(runtime_);
+   auto abHandle = arrayBufferHandle(buffer);
+-
+-  auto typedArrayRes =
+-      vm::JSTypedArray<uint8_t, vm::CellKind::Uint8ArrayKind>::allocate(
+-          runtime_, length);
+-  checkStatus(typedArrayRes.getStatus());
+-
+-  vm::JSTypedArrayBase::setBuffer(
+-      runtime_,
+-      typedArrayRes->get(),
+-      *abHandle,
+-      offset,
+-      length,
+-      sizeof(uint8_t));
+-
+-  return add<jsi::Uint8Array>(typedArrayRes->getHermesValue());
++  if (!abHandle->attached() || offset > abHandle->size() ||
++      length > abHandle->size() - offset) {
++    throw jsi::JSINativeException("Uint8Array range is out of bounds");
++  }
++  using Array = vm::JSTypedArray<uint8_t, vm::CellKind::Uint8ArrayKind>;
++  // Create the view directly; allocate(length) first creates an unused byte
++  // buffer.
++  auto array = runtime_.makeHandle(
++      Array::create(runtime_, Array::getPrototype(runtime_)));
++  vm::JSTypedArrayBase::setBuffer(runtime_, array.get(), *abHandle, offset,
++                                  length, sizeof(uint8_t));
++  return add<jsi::Uint8Array>(array.getHermesValue());
+ }
+ 
+ jsi::ArrayBuffer HermesRuntimeImpl::buffer(const jsi::TypedArray &typedArray) {
+--- a/lib/VM/JSLib/ArrayBuffer.cpp
++++ b/lib/VM/JSLib/ArrayBuffer.cpp
+@@ -307,6 +307,14 @@
+       JSArrayBuffer::create(
+           runtime, Handle<JSObject>::vmcast(&runtime.arrayBufferPrototype))
+           .getHermesValue());
++  // Equal-size shared storage can change JS ownership without moving its bytes.
++  if (self->external() && length == self->size()) {
++    auto context = JSArrayBuffer::getExternalDataContext(runtime, self);
++    JSArrayBuffer::setExternalDataBlock(
++        runtime, lv.target, self->getDataBlock(), self->size(), context);
++    JSArrayBuffer::detach(runtime, self);
++    return lv.target.getHermesValue();
++  }
+   if (JSArrayBuffer::createDataBlock(runtime, lv.target, length) ==
+       ExecutionStatus::EXCEPTION) {
+     return ExecutionStatus::EXCEPTION;
+--- a/lib/VM/JSArrayBuffer.cpp
++++ b/lib/VM/JSArrayBuffer.cpp
+@@ -132,8 +132,12 @@
+ 
+ void JSArrayBuffer::_finalizeImpl(GCCell *cell, GC &gc) {
+   auto *self = vmcast<JSArrayBuffer>(cell);
+-  if (self->attached() && !self->external_)
+-    self->freeInternalBuffer(gc);
++  if (self->attached()) {
++    if (self->external_)
++      gc.debitExternalMemory(self, self->size_);
++    else
++      self->freeInternalBuffer(gc);
++  }
+   self->~JSArrayBuffer();
+ }
+ 
+@@ -203,6 +207,7 @@
+   if (!self->external_)
+     self->freeInternalBuffer(runtime.getHeap());
+   else {
++    runtime.getHeap().debitExternalMemory(*self, self->size_);
+     setExternalFinalizer(runtime, self, HandleRootOwner::getUndefinedValue());
+   }
+   // Note that whether a buffer is attached is independent of whether
+@@ -221,6 +226,7 @@
+   if (!self->external_) {
+     self->untrackInternalBuffer(runtime.getHeap());
+   } else {
++    runtime.getHeap().debitExternalMemory(*self, self->size_);
+     setExternalFinalizer(runtime, self, HandleRootOwner::getUndefinedValue());
+   }
+   self->data_ = nullptr;
+@@ -307,6 +313,8 @@
+   self->size_ = size;
+   self->external_ = true;
+   self->data_ = data;
++  // Count shared storage while this ArrayBuffer owns it, including after transfer.
++  runtime.getHeap().creditExternalMemory(*self, size);
+ }
+ 
+ PseudoHandle<NativeState> JSArrayBuffer::getExternalFinalizerNativeState(

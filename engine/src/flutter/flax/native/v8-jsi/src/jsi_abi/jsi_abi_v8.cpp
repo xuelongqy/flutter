@@ -3323,3 +3323,47 @@ JSI_API void JSI_CDECL v8_jsi_config_set_task_runner(
 }
 
 } // extern "C"
+
+#include "engine.h"
+
+#include "jsi_abi/JsiAbiRuntime.h"
+
+#ifdef V8_ENABLE_SANDBOX
+#error "Flax shared Dart buffers require a V8 SDK without sandbox"
+#endif
+
+namespace flax {
+class V8Buffer final : public facebook::jsi::MutableBuffer {
+ public:
+  explicit V8Buffer(std::shared_ptr<v8::BackingStore> storage)
+      : storage_(std::move(storage)) {}
+  size_t size() const override { return storage_->ByteLength(); }
+  uint8_t* data() override { return static_cast<uint8_t*>(storage_->Data()); }
+
+ private:
+  std::shared_ptr<v8::BackingStore> storage_;
+};
+
+Uint8View readUint8Array(facebook::jsi::Runtime& runtime,
+          const facebook::jsi::Object& object) {
+  auto* state = getState(jsi::abi::getAbiRuntime(runtime));
+  V8Scope scope(state);
+  auto local = toObjectHandle(jsi::abi::getAbiObject(runtime, object))
+                   ->get(state->isolate);
+  if (!local->IsUint8Array())
+    throw std::invalid_argument("Expected an actual Uint8Array");
+  auto array = local.As<v8::Uint8Array>();
+  auto buffer = array->Buffer();
+  if (!buffer->IsArrayBuffer() || buffer->WasDetached())
+    throw std::invalid_argument("Expected an attached, unshared ArrayBuffer");
+  auto storage = buffer->GetBackingStore();
+  if (storage->IsShared() || storage->IsResizableByUserJavaScript() ||
+      storage->IsImmutable())
+    throw std::invalid_argument("Expected fixed, mutable, unshared storage");
+  const size_t offset = array->ByteOffset(), length = array->ByteLength();
+  if (offset > storage->ByteLength() || length > storage->ByteLength() - offset)
+    throw std::invalid_argument("Uint8Array range is out of bounds");
+  return {std::make_shared<V8Buffer>(std::move(storage)), offset, length};
+}
+
+}  // namespace flax

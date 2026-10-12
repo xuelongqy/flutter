@@ -8,6 +8,12 @@
 
 namespace flax {
 struct JointCell;
+struct Uint8View {
+  std::shared_ptr<facebook::jsi::MutableBuffer> storage;
+  size_t offset;
+  size_t length;
+};
+Uint8View readUint8Array(facebook::jsi::Runtime&, const facebook::jsi::Object&);
 // Implemented once by the selected engine adapter, not by the shared runtime.
 std::unique_ptr<facebook::jsi::Runtime> createEngineRuntime(
     size_t* active_depth);

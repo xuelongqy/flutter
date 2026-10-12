@@ -1,6 +1,9 @@
+#include <dart_flax_api.h>
 #include "engine.h"
 #include "flax/engine_binding.h"
 #include "flax/engine_gc.h"
+#include "flutter/lib/ui/ui_dart_state.h"
+#include "third_party/tonic/scopes/dart_isolate_scope.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -802,9 +805,132 @@ int32_t bindingCall(FlaxRuntime* runtime,
   });
 }
 
-const FlaxEngineBindingApi bindingApi{
-    FLAX_ENGINE_BINDING_VERSION, sizeof(FlaxEngineBindingApi), registerMembers,
-    invokeMember, bindingCall};
+// Only Dart-backed stores need this index: re-importing them must return a
+// Dart heap view, since external typed data cannot point into the Dart heap.
+struct PinnedBytes {
+  std::weak_ptr<fbjsi::MutableBuffer> storage;
+  void* token;
+  Dart_Isolate owner;
+};
+thread_local std::unordered_map<void*, PinnedBytes> pinnedBytes;
+
+void checkDartBuffer(Dart_Handle result) {
+  if (Dart_IsError(result))
+    throw BridgeError(FLAX_ARGUMENT_ERROR, Dart_GetError(result));
+}
+
+class DartBuffer final : public fbjsi::MutableBuffer {
+ public:
+  explicit DartBuffer(const Dart_FlaxBuffer& buffer)
+      : data_(static_cast<uint8_t*>(buffer.data)),
+        size_(buffer.byte_length),
+        token_(buffer.token),
+        state_(flutter::UIDartState::Current()->GetWeakPtr()),
+        runner_(flutter::UIDartState::Current()
+                    ->GetTaskRunners()
+                    .GetUITaskRunner()) {}
+  ~DartBuffer() override {
+    // V8 may release backing stores on a GC thread. Dart roots belong to UI.
+    auto token = std::shared_ptr<void>(token_, Dart_FlaxReleaseBuffer);
+    runner_->PostTask(
+        [token = std::move(token), data = data_, weak = state_]() mutable {
+          auto found = pinnedBytes.find(data);
+          if (found != pinnedBytes.end() && found->second.token == token.get())
+            pinnedBytes.erase(found);
+          auto state = weak.lock();
+          if (state && !state->IsShuttingDown()) {
+            tonic::DartState::Scope scope(state);
+            token.reset();
+          } else {
+            // VM shutdown has already retired the persistent root.
+            token.reset();
+          }
+        });
+  }
+  size_t size() const override { return size_; }
+  uint8_t* data() override { return data_; }
+
+ private:
+  uint8_t* data_;
+  size_t size_;
+  void* token_;
+  std::weak_ptr<tonic::DartState> state_;
+  fml::RefPtr<fml::TaskRunner> runner_;
+};
+
+int32_t shareUint8(FlaxRuntime* runtime,
+                   Dart_Handle bytes,
+                   FlaxValueId* output,
+                   FlaxError* error) {
+  return enter(runtime, error, [&] {
+    if (!output)
+      throw BridgeError(FLAX_ARGUMENT_ERROR, "Null Uint8 output");
+    Dart_FlaxBuffer buffer{};
+    checkDartBuffer(Dart_FlaxPinUint8List(bytes, &buffer));
+    std::unique_ptr<void, void (*)(void*)> pin(buffer.token,
+                                               Dart_FlaxReleaseBuffer);
+    auto& saved = pinnedBytes[buffer.data];
+    auto storage =
+        saved.owner == runtime->owner ? saved.storage.lock() : nullptr;
+    if (storage && storage->size() != static_cast<size_t>(buffer.byte_length))
+      storage.reset();
+    if (!storage) {
+      storage = std::make_shared<DartBuffer>(buffer);
+      pin.release();
+      saved = {storage, buffer.token, runtime->owner};
+    }
+#if FLAX_ENGINE_ID == 1
+    if (storage->size() > UINT32_MAX)
+      throw BridgeError(FLAX_ARGUMENT_ERROR,
+                        "Hermes ArrayBuffer exceeds its 32-bit size limit");
+#endif
+    auto& js = *runtime->js;
+    fbjsi::ArrayBuffer arrayBuffer(js, storage);
+    *output = keep(runtime, fbjsi::Uint8Array(js, arrayBuffer, buffer.offset,
+                                              buffer.length));
+  });
+}
+
+Dart_Handle readUint8(FlaxRuntime* runtime, FlaxValueId id, FlaxError* error) {
+  Dart_Handle result = Dart_Null();
+  enter(runtime, error, [&] {
+    flax::Uint8View view;
+    try {
+      view = flax::readUint8Array(*runtime->js, object(runtime, id));
+    } catch (const std::invalid_argument& exception) {
+      throw BridgeError(FLAX_ARGUMENT_ERROR, exception.what());
+    }
+    auto found = pinnedBytes.find(view.storage->data());
+    if (found != pinnedBytes.end() && found->second.owner == runtime->owner) {
+      if (auto saved = found->second.storage.lock();
+          saved && saved->size() == view.storage->size()) {
+        result = Dart_FlaxUint8ListView(found->second.token, view.offset,
+                                        view.length);
+        checkDartBuffer(result);
+        return;
+      }
+    }
+    auto storage =
+        std::make_unique<std::shared_ptr<fbjsi::MutableBuffer>>(view.storage);
+    auto* data = view.storage->data();
+    result = Dart_NewExternalTypedDataWithFinalizer(
+        Dart_TypedData_kUint8, data ? data + view.offset : nullptr, view.length,
+        storage.get(), view.storage->size(), [](void*, void* peer) {
+          delete static_cast<std::shared_ptr<fbjsi::MutableBuffer>*>(peer);
+        });
+    checkDartBuffer(result);
+    storage.release();
+  });
+  return result;
+}
+
+const FlaxEngineBindingApi bindingApi{FLAX_ENGINE_BINDING_VERSION,
+                                      sizeof(FlaxEngineBindingApi),
+                                      registerMembers,
+                                      invokeMember,
+                                      bindingCall,
+                                      shareUint8,
+                                      readUint8};
 
 const FlaxApi api{
     FLAX_ABI_VERSION, sizeof(FlaxApi), create,    destroy,      evaluate,

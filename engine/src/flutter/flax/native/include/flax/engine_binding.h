@@ -1,10 +1,11 @@
 #ifndef FLUTTER_FLAX_NATIVE_INCLUDE_FLAX_ENGINE_BINDING_H_
 #define FLUTTER_FLAX_NATIVE_INCLUDE_FLAX_ENGINE_BINDING_H_
+#include "engine_gc.h"
 #include "runtime.h"
 #ifdef __cplusplus
 extern "C" {
 #endif
-#define FLAX_ENGINE_BINDING_VERSION 1
+#define FLAX_ENGINE_BINDING_VERSION 2
 
 /* Internal, synchronous engine extension. The public native ABI remains 2. */
 typedef struct FlaxBindingArgument {
@@ -37,6 +38,12 @@ typedef struct FlaxEngineBindingApi {
                   size_t count,
                   FlaxValueId* output,
                   FlaxError*);
+  /* Shares fixed, writable bytes. Neither operation copies the payload. */
+  int32_t (*share_uint8)(FlaxRuntime*,
+                         Dart_Handle,
+                         FlaxValueId* output,
+                         FlaxError*);
+  Dart_Handle (*read_uint8)(FlaxRuntime*, FlaxValueId, FlaxError*);
 } FlaxEngineBindingApi;
 const FlaxEngineBindingApi* flax_engine_get_binding_api(uint32_t version);
 #ifdef __cplusplus
