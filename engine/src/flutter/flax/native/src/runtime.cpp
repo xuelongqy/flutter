@@ -42,6 +42,9 @@ struct FlaxRuntime {
   // Declared after js so references are released before the engine.
   std::unique_ptr<fbjsi::Function> byteView;
   std::unique_ptr<fbjsi::Function> arrayBufferConstructor;
+  std::unique_ptr<fbjsi::Function> bigIntConstructor;
+  std::unique_ptr<fbjsi::Function> bigIntText;
+  std::unique_ptr<fbjsi::Function> bufferView;
   std::unique_ptr<fbjsi::Function> memberLookup;
   std::vector<std::unique_ptr<ProxyMember>> members;
   std::unordered_map<FlaxValueId, fbjsi::Value> values;
@@ -219,6 +222,63 @@ int32_t create(FlaxRuntime** output, FlaxError* error) {
     runtime->arrayBufferConstructor = std::make_unique<fbjsi::Function>(
         runtime->js->global().getPropertyAsFunction(*runtime->js,
                                                     "ArrayBuffer"));
+    runtime->bigIntConstructor = std::make_unique<fbjsi::Function>(
+        runtime->js->global().getPropertyAsFunction(*runtime->js, "BigInt"));
+    runtime->bigIntText = std::make_unique<fbjsi::Function>(
+        runtime->bigIntConstructor
+            ->getPropertyAsObject(*runtime->js, "prototype")
+            .getPropertyAsFunction(*runtime->js, "toString"));
+    // Reinterpret views over the existing byte lease; no payload copy or GC
+    // path.
+    auto views = std::make_shared<fbjsi::StringBuffer>(R"JS((() => {
+      const constructors = [null, Int8Array, Uint8Array, Uint8ClampedArray,
+        Int16Array, Uint16Array, Int32Array, Uint32Array, BigInt64Array,
+        BigUint64Array, Float32Array, Float64Array, DataView];
+      const names = ['', 'Int8Array', 'Uint8Array', 'Uint8ClampedArray',
+        'Int16Array', 'Uint16Array', 'Int32Array', 'Uint32Array', 'BigInt64Array',
+        'BigUint64Array', 'Float32Array', 'Float64Array', 'DataView'];
+      const widths = [1, 1, 1, 1, 2, 2, 4, 4, 8, 8, 4, 8, 1];
+      const apply = Reflect.apply;
+      const getter = (p, n) => Object.getOwnPropertyDescriptor(p, n).get;
+      const typed = Object.getPrototypeOf(Uint8Array.prototype);
+      const tag = getter(typed, Symbol.toStringTag);
+      const tb = getter(typed, 'buffer'), to = getter(typed, 'byteOffset');
+      const tl = getter(typed, 'byteLength');
+      const db = getter(DataView.prototype, 'buffer');
+      const dO = getter(DataView.prototype, 'byteOffset');
+      const dl = getter(DataView.prototype, 'byteLength');
+      const bl = getter(ArrayBuffer.prototype, 'byteLength');
+      const Uint8 = Uint8Array;
+      return (kind, value, offset, length) => {
+        if (kind < 0 || kind >= constructors.length || kind % 1 !== 0)
+          throw new TypeError('Unknown native buffer kind');
+        if (offset === undefined) {
+          let buffer;
+          if (kind === 0) {
+            buffer = value; offset = 0; length = apply(bl, value, []);
+          } else if (kind === 12) {
+            buffer = apply(db, value, []); offset = apply(dO, value, []);
+            length = apply(dl, value, []);
+          } else {
+            if (apply(tag, value, []) !== names[kind])
+              throw new TypeError('Expected an actual ' + names[kind]);
+            buffer = apply(tb, value, []); offset = apply(to, value, []);
+            length = apply(tl, value, []);
+          }
+          return new Uint8(buffer, offset, length);
+        }
+        if (kind === 0) {
+          if (offset !== 0 || length !== apply(bl, value, []))
+            throw new TypeError('Expected the complete ByteBuffer range');
+          return value;
+        }
+        return new constructors[kind](value, offset, length / widths[kind]);
+      };
+    })())JS");
+    runtime->bufferView = std::make_unique<fbjsi::Function>(
+        runtime->js->evaluateJavaScript(views, "flax:shared-buffers")
+            .getObject(*runtime->js)
+            .getFunction(*runtime->js));
     // Capture intrinsic getters: a view's own buffer/offset properties may lie.
     auto helper = std::make_shared<fbjsi::StringBuffer>(R"JS((() => {
       const getter = (p, n) => Object.getOwnPropertyDescriptor(p, n).get;
@@ -289,6 +349,9 @@ int32_t destroy(FlaxRuntime* runtime, FlaxError* error) {
       runtime->values.clear();
       runtime->byteView.reset();
       runtime->arrayBufferConstructor.reset();
+      runtime->bigIntConstructor.reset();
+      runtime->bigIntText.reset();
+      runtime->bufferView.reset();
       runtime->members.clear();
       runtime->memberLookup.reset();
       flax::closeEngineRuntime(*runtime->js);
@@ -354,6 +417,12 @@ int32_t makeValue(FlaxRuntime* runtime,
         *output = keep(runtime, fbjsi::String::createFromUtf16(
                                     *runtime->js, utf16(data, length)));
         break;
+      case FLAX_BIGINT:
+        *output = keep(
+            runtime, runtime->bigIntConstructor->call(
+                         *runtime->js, fbjsi::String::createFromUtf16(
+                                           *runtime->js, utf16(data, length))));
+        break;
       default:
         throw BridgeError(FLAX_ARGUMENT_ERROR, "Unsupported primitive kind");
     }
@@ -377,9 +446,13 @@ int32_t inspect(FlaxRuntime* runtime,
     } else if (v.isNumber()) {
       info->kind = FLAX_NUMBER;
       info->number = v.getNumber();
-    } else if (v.isString()) {
-      info->kind = FLAX_STRING;
-      auto string = v.getString(*runtime->js).utf16(*runtime->js);
+    } else if (v.isString() || v.isBigInt()) {
+      info->kind = v.isBigInt() ? FLAX_BIGINT : FLAX_STRING;
+      auto& js = *runtime->js;
+      auto string = v.isBigInt() ? js.call(*runtime->bigIntText, v, nullptr, 0)
+                                       .getString(js)
+                                       .utf16(js)
+                                 : v.getString(js).utf16(js);
       info->string_data = reinterpret_cast<uint16_t*>(
           copyBytes(reinterpret_cast<const uint8_t*>(string.data()),
                     string.size() * sizeof(char16_t)));
@@ -392,7 +465,7 @@ int32_t inspect(FlaxRuntime* runtime,
                        : FLAX_OBJECT;
     } else {
       throw BridgeError(FLAX_ARGUMENT_ERROR,
-                        "Symbol and BigInt conversion is not implemented");
+                        "Symbol conversion is not implemented");
     }
   });
 }
@@ -649,6 +722,10 @@ fbjsi::Value bindingArgument(FlaxRuntime* runtime,
     case FLAX_STRING:
       return fbjsi::String::createFromUtf16(js,
                                             utf16(input.text, input.length));
+    case FLAX_BIGINT:
+      return runtime->bigIntConstructor->call(
+          js,
+          fbjsi::String::createFromUtf16(js, utf16(input.text, input.length)));
     case FLAX_OBJECT:
     case FLAX_FUNCTION: {
       auto target = object(runtime, input.id);
@@ -858,13 +935,14 @@ class DartBuffer final : public fbjsi::MutableBuffer {
   fml::RefPtr<fml::TaskRunner> runner_;
 };
 
-int32_t shareUint8(FlaxRuntime* runtime,
-                   Dart_Handle bytes,
-                   FlaxValueId* output,
-                   FlaxError* error) {
+int32_t shareBuffer(FlaxRuntime* runtime,
+                    Dart_Handle bytes,
+                    uint32_t kind,
+                    FlaxValueId* output,
+                    FlaxError* error) {
   return enter(runtime, error, [&] {
     if (!output)
-      throw BridgeError(FLAX_ARGUMENT_ERROR, "Null Uint8 output");
+      throw BridgeError(FLAX_ARGUMENT_ERROR, "Null shared buffer output");
     Dart_FlaxBuffer buffer{};
     checkDartBuffer(Dart_FlaxPinUint8List(bytes, &buffer));
     std::unique_ptr<void, void (*)(void*)> pin(buffer.token,
@@ -886,17 +964,27 @@ int32_t shareUint8(FlaxRuntime* runtime,
 #endif
     auto& js = *runtime->js;
     fbjsi::ArrayBuffer arrayBuffer(js, storage);
-    *output = keep(runtime, fbjsi::Uint8Array(js, arrayBuffer, buffer.offset,
-                                              buffer.length));
+    *output = keep(runtime, runtime->bufferView->call(
+                                js, static_cast<double>(kind), arrayBuffer,
+                                static_cast<double>(buffer.offset),
+                                static_cast<double>(buffer.length)));
   });
 }
 
-Dart_Handle readUint8(FlaxRuntime* runtime, FlaxValueId id, FlaxError* error) {
+Dart_Handle readBuffer(FlaxRuntime* runtime,
+                       FlaxValueId id,
+                       uint32_t kind,
+                       FlaxError* error) {
   Dart_Handle result = Dart_Null();
   enter(runtime, error, [&] {
     flax::Uint8View view;
     try {
-      view = flax::readUint8Array(*runtime->js, object(runtime, id));
+      auto& js = *runtime->js;
+      auto bytes = runtime->bufferView->call(js, static_cast<double>(kind),
+                                             object(runtime, id));
+      view = flax::readUint8Array(js, bytes.getObject(js));
+    } catch (const fbjsi::JSError& exception) {
+      throw BridgeError(FLAX_ARGUMENT_ERROR, exception.getMessage().c_str());
     } catch (const std::invalid_argument& exception) {
       throw BridgeError(FLAX_ARGUMENT_ERROR, exception.what());
     }
@@ -929,8 +1017,8 @@ const FlaxEngineBindingApi bindingApi{FLAX_ENGINE_BINDING_VERSION,
                                       registerMembers,
                                       invokeMember,
                                       bindingCall,
-                                      shareUint8,
-                                      readUint8};
+                                      shareBuffer,
+                                      readBuffer};
 
 const FlaxApi api{
     FLAX_ABI_VERSION, sizeof(FlaxApi), create,    destroy,      evaluate,

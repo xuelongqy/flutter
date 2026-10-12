@@ -30,7 +30,8 @@ enum FlaxValueKind {
   FLAX_NUMBER = 3,
   FLAX_STRING = 4,
   FLAX_OBJECT = 5,
-  FLAX_FUNCTION = 6
+  FLAX_FUNCTION = 6,
+  FLAX_BIGINT = 7
 };
 
 /* Zero-initialize before a call. Errors belong to the caller, not the runtime.
@@ -45,6 +46,7 @@ typedef struct FlaxError {
 
 /* String values and property names use UTF-16 code units, including unpaired
  * surrogates. Source text, source URLs, and errors use UTF-8 bytes.
+ * BigInt uses exact decimal UTF-16 text in string_data, never number.
  * inspect allocates string_data; free it with buffer_free. */
 typedef struct FlaxValueInfo {
   int32_t kind;
