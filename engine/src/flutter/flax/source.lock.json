@@ -60,6 +60,10 @@
       {
         "file": "hermes-joint-gc.patch",
         "sha256": "2789608c130af121aba0c2daf58f8d5ceeb4e44d591248de298c3346a21f76a2"
+      },
+      {
+        "file": "hermes-shared-buffers.patch",
+        "sha256": "e11313c2d7392ad2ed68f2a7c9ca41ebd31aa5fdd511de84422a0818a301766f"
       }
     ]
   }

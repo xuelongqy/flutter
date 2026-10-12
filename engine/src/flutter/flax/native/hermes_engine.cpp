@@ -415,3 +415,23 @@ extern "C" __attribute__((visibility("default"))) const FlaxApi*
 flax_engine_get_api(uint32_t version) {
   return version == FLAX_ABI_VERSION ? flax::runtimeApi() : nullptr;
 }
+
+namespace flax {
+Uint8View readUint8Array(facebook::jsi::Runtime& runtime,
+          const facebook::jsi::Object& object) {
+  if (!object.isUint8Array(runtime))
+    throw std::invalid_argument("Expected an actual Uint8Array");
+  auto array = object.getUint8Array(runtime);
+  auto buffer = array.buffer(runtime);
+  if (buffer.detached(runtime))
+    throw std::invalid_argument("Expected an attached ArrayBuffer");
+  auto storage = buffer.tryGetMutableBuffer(runtime);
+  if (!storage)
+    throw std::invalid_argument("Hermes did not retain the backing storage");
+  auto offset = array.byteOffset(runtime), length = array.byteLength(runtime);
+  if (offset > storage->size() || length > storage->size() - offset)
+    throw std::invalid_argument("Uint8Array range is out of bounds");
+  return {std::move(storage), offset, length};
+}
+
+}  // namespace flax

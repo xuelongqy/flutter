@@ -28,24 +28,80 @@ index ecff06a6..467fad02 100644
      "//third_party/perfetto:libprotozero",  # for timeline_test
 +    "//third_party/zlib",  # for gzip.cc in the Flutter engine checkout
    ]
- 
+
    if (is_fuchsia) {
+diff --git a/runtime/include/dart_flax_api.h b/runtime/include/dart_flax_api.h
+new file mode 100644
+index 00000000..f782e676
+--- /dev/null
++++ b/runtime/include/dart_flax_api.h
+@@ -0,0 +1,42 @@
++// Experimental Flax cross-heap tracing. Not part of the public Dart API.
++#ifndef RUNTIME_INCLUDE_DART_FLAX_API_H_
++#define RUNTIME_INCLUDE_DART_FLAX_API_H_
++#include "dart_api.h"
++#ifdef __cplusplus
++extern "C" {
++#endif
++// Valid only during the collector callback, on its owning thread. No Dart
++// execution, heap allocation, ordinary Dart API calls, or retained context.
++typedef struct {
++  void* context;
++  bool (*is_marked)(void*, Dart_WeakPersistentHandle);
++  void (*mark)(void*, Dart_WeakPersistentHandle);
++  Dart_WeakPersistentHandle (*next_marked_origin)(void*);
++} Dart_FlaxGC;
++typedef void (*Dart_FlaxCollector)(void*, const Dart_FlaxGC*);
++DART_EXPORT bool Dart_FlaxSetCollector(Dart_FlaxCollector collector,
++                                       void* peer);
++DART_EXPORT bool Dart_FlaxRegisterHandle(Dart_WeakPersistentHandle handle,
++                                         bool is_origin);
++DART_EXPORT void Dart_FlaxSetCollectionRequest(void (*request)(void*));
++// Controlled GC for this experiment, separate from automatic allocation GC.
++DART_EXPORT void Dart_FlaxCollect(bool young, bool compact);
++// Pin a writable Uint8List (or view) until its last native buffer owner releases
++// it. Pin/view calls require the owning isolate. Release runs on that isolate,
++// or on any thread after isolate shutdown has retired the root.
++typedef struct {
++  void* token;
++  void* data;
++  intptr_t byte_length;
++  intptr_t offset;
++  intptr_t length;
++} Dart_FlaxBuffer;
++DART_EXPORT Dart_Handle Dart_FlaxPinUint8List(Dart_Handle, Dart_FlaxBuffer*);
++DART_EXPORT void Dart_FlaxReleaseBuffer(void* token);
++DART_EXPORT Dart_Handle Dart_FlaxUint8ListView(void* token,
++                                              intptr_t offset,
++                                              intptr_t length);
++#ifdef __cplusplus
++}
++#endif
++#endif
 diff --git a/runtime/vm/dart_api_impl.cc b/runtime/vm/dart_api_impl.cc
-index ac526ee0..ff9bc2c2 100644
+index ac526ee0..05bde968 100644
 --- a/runtime/vm/dart_api_impl.cc
 +++ b/runtime/vm/dart_api_impl.cc
 @@ -3,6 +3,7 @@
  // BSD-style license that can be found in the LICENSE file.
- 
+
  #include "include/dart_api.h"
 +#include "include/dart_flax_api.h"
  #include "include/dart_native_api.h"
- 
+
  #include <cstring>
-@@ -1071,6 +1072,41 @@ Dart_NewFinalizableHandle(Dart_Handle object,
+@@ -69,6 +70,7 @@
+ #endif  // !defined(DART_PRECOMPILED_RUNTIME)
+
+ namespace dart {
++void RetireFlaxBuffers(Thread*);
+
+ // Facilitate quick access to the current zone once we have the current thread.
+ #define Z (T->zone())
+@@ -1071,6 +1073,41 @@ Dart_NewFinalizableHandle(Dart_Handle object,
                                     callback);
  }
- 
+
 +DART_EXPORT bool Dart_FlaxSetCollector(Dart_FlaxCollector collector,
 +                                       void* peer) {
 +  Thread* T = Thread::Current();
@@ -84,6 +140,169 @@ index ac526ee0..ff9bc2c2 100644
  DART_EXPORT void Dart_DeletePersistentHandle(Dart_PersistentHandle object) {
    Thread* T = Thread::Current();
    IsolateGroup* isolate_group = T->isolate_group();
+@@ -1404,6 +1441,7 @@ DART_EXPORT void Dart_ShutdownIsolate() {
+     StackZone zone(T);
+     Dart::RunShutdownCallback();
+   }
++  RetireFlaxBuffers(T);
+   Dart::ShutdownIsolate(T);
+ }
+
+@@ -7258,3 +7296,154 @@ void ThrowCantRunWithoutIsolateError() {
+ }
+
+ }  // namespace dart
++
++
++#include <mutex>
++#include <unordered_map>
++#include <unordered_set>
++
++#include "vm/heap/page.h"
++
++namespace dart {
++namespace {
++struct Uint8Pin {
++  Isolate* owner;
++  ApiState* state;
++  PersistentHandle* root;
++  Page* page;
++};
++struct Uint8PinnedPage {
++  size_t users = 0;
++  bool originally_fixed;
++};
++std::mutex uint8_pin_mutex;
++std::unordered_map<Page*, Uint8PinnedPage> uint8_pinned_pages;
++std::unordered_set<Uint8Pin*> uint8_pins;
++
++void ReleaseUint8Pin(Uint8Pin* pin) {
++  if (pin->page) {
++    auto it = uint8_pinned_pages.find(pin->page);
++    RELEASE_ASSERT(it != uint8_pinned_pages.end());
++    if (--it->second.users == 0) {
++      pin->page->set_never_evacuate(it->second.originally_fixed);
++      uint8_pinned_pages.erase(it);
++    }
++  }
++  pin->state->FreePersistentHandle(pin->root);
++  uint8_pins.erase(pin);
++  pin->root = nullptr;
++  pin->page = nullptr;
++}
++}  // namespace
++
++void RetireFlaxBuffers(Thread* thread) {
++  NoSafepointScope no_safepoint(thread);
++  std::lock_guard<std::mutex> lock(uint8_pin_mutex);
++  for (auto it = uint8_pins.begin(); it != uint8_pins.end();) {
++    auto* pin = *it++;
++    if (pin->owner == thread->isolate()) ReleaseUint8Pin(pin);
++  }
++}
++
++DART_EXPORT Dart_Handle Dart_FlaxPinUint8List(Dart_Handle object,
++                                              Dart_FlaxBuffer* output) {
++  DARTSCOPE(Thread::Current());
++  if (!output) return Api::NewError("Null Uint8 buffer output");
++  *output = {};
++  auto cid = Api::ClassId(object);
++  if (IsUnmodifiableTypedDataViewClassId(cid) ||
++      (!IsTypedDataClassId(cid) && !IsExternalTypedDataClassId(cid) &&
++       !IsTypedDataViewClassId(cid)) ||
++      GetType(cid) != Dart_TypedData_kUint8)
++    return Api::NewError("Expected a writable Uint8List");
++
++  const auto& input = Object::Handle(Z, Api::UnwrapHandle(object));
++  auto& base = Object::Handle(Z, input.ptr());
++  output->offset = 0;
++  output->length = TypedDataBase::Cast(input).Length();
++  if (IsTypedDataViewClassId(cid)) {
++    const auto& view = TypedDataView::Cast(input);
++    output->offset = Smi::Value(view.offset_in_bytes());
++    base = view.typed_data();
++  }
++
++  if (base.IsTypedData() && base.ptr()->IsNewObject()) {
++    // Promote before publishing an address, so GC updates every existing alias.
++    T->heap()->CollectGarbage(T, GCType::kEvacuate, GCReason::kDebugging);
++    if (base.ptr()->IsNewObject())
++      return Api::NewError("Uint8List promotion failed");
++  }
++  // Resolve the page under the same guard that pins it; a safepoint between
++  // these operations could otherwise leave us pinning a stale page.
++  for (int attempt = 0; attempt < 2; ++attempt) {
++    {
++      NoSafepointScope no_safepoint(T);
++      Page* page = base.IsTypedData() ? Page::Of(base.ptr()) : nullptr;
++      if (!page || !page->is_evacuation_candidate()) {
++        auto* state = T->isolate_group()->api_state();
++        auto* root = state->AllocatePersistentHandle();
++        root->set_ptr(base);
++        auto* pin = new Uint8Pin{T->isolate(), state, root, page};
++        {
++          std::lock_guard<std::mutex> lock(uint8_pin_mutex);
++          if (page) {
++            auto [it, inserted] = uint8_pinned_pages.try_emplace(
++                page, Uint8PinnedPage{0, page->is_never_evacuate()});
++            ++it->second.users;
++            page->set_never_evacuate(true);
++          }
++          uint8_pins.insert(pin);
++        }
++        const auto& bytes = TypedDataBase::Cast(base);
++        output->data = bytes.DataAddr(0);
++        output->byte_length = bytes.LengthInBytes();
++        output->token = pin;
++        return Api::Success();
++      }
++    }
++    T->heap()->CollectAllGarbage(GCReason::kDebugging, false);
++  }
++  return Api::NewError("Uint8List evacuation did not finish");
++}
++
++DART_EXPORT void Dart_FlaxReleaseBuffer(void* token) {
++  auto* pin = static_cast<Uint8Pin*>(token);
++  Thread* thread = Thread::Current();
++  if (thread && thread->isolate() &&
++      thread->execution_state() == Thread::kThreadInNative) {
++    // Enter VM before locking: parking at a safepoint with this mutex held
++    // could block another isolate that needs it to reach the same safepoint.
++    TransitionToVM transition(thread);
++    NoSafepointScope no_safepoint(thread);
++    std::lock_guard<std::mutex> lock(uint8_pin_mutex);
++    if (pin->root) {
++      RELEASE_ASSERT(thread->isolate() == pin->owner);
++      ReleaseUint8Pin(pin);
++    }
++    delete pin;
++  } else {
++    std::lock_guard<std::mutex> lock(uint8_pin_mutex);
++    RELEASE_ASSERT(!pin->root);
++    delete pin;
++  }
++}
++
++DART_EXPORT Dart_Handle Dart_FlaxUint8ListView(void* token, intptr_t offset,
++                                               intptr_t length) {
++  DARTSCOPE(Thread::Current());
++  auto* pin = static_cast<Uint8Pin*>(token);
++  if (!pin || !pin->root || pin->owner != T->isolate())
++    return Api::NewError("Inactive Uint8 pin");
++  const auto& base = Object::Handle(Z, pin->root->ptr());
++  const auto& data = TypedDataBase::Cast(base);
++  if (offset < 0 || length < 0 || offset > data.LengthInBytes() ||
++      length > data.LengthInBytes() - offset)
++    return Api::NewError("Uint8 view range is out of bounds");
++  if (offset == 0 && length == data.Length() &&
++      GetType(base.GetClassId()) == Dart_TypedData_kUint8)
++    return Api::NewHandle(T, base.ptr());
++  return Api::NewHandle(
++      T, TypedDataView::New(kTypedDataUint8ArrayViewCid, data, offset, length));
++}
++
++}  // namespace dart
 diff --git a/runtime/vm/dart_api_state.h b/runtime/vm/dart_api_state.h
 index 394ac210..85524a4b 100644
 --- a/runtime/vm/dart_api_state.h
@@ -91,7 +310,7 @@ index 394ac210..85524a4b 100644
 @@ -5,7 +5,10 @@
  #ifndef RUNTIME_VM_DART_API_STATE_H_
  #define RUNTIME_VM_DART_API_STATE_H_
- 
+
 +#include <unordered_map>
 +
  #include "include/dart_api.h"
@@ -106,7 +325,7 @@ index 394ac210..85524a4b 100644
 +    flax_handles_.erase(weak_ref);
      weak_persistent_handles_.FreeHandle(weak_ref);
    }
- 
+
 +  // Experimental: minor collections retain bridge targets until a joint major
 +  // collection. Normal major root enumeration deliberately omits these handles.
 +  void VisitFlaxHandles(ObjectPointerVisitor* visitor) {
@@ -166,7 +385,7 @@ index 394ac210..85524a4b 100644
 +  void* flax_peer_ = nullptr;
 +  Thread* flax_owner_ = nullptr;
 +  void (*flax_request_)(void*) = nullptr;
- 
+
    DISALLOW_COPY_AND_ASSIGN(ApiState);
  };
 diff --git a/runtime/vm/heap/marker.cc b/runtime/vm/heap/marker.cc
@@ -174,9 +393,9 @@ index f58905a0..02246323 100644
 --- a/runtime/vm/heap/marker.cc
 +++ b/runtime/vm/heap/marker.cc
 @@ -4,6 +4,9 @@
- 
+
  #include "vm/heap/marker.h"
- 
+
 +#include <unordered_map>
 +#include <vector>
 +
@@ -186,7 +405,7 @@ index f58905a0..02246323 100644
 @@ -59,6 +62,54 @@ class MarkingVisitor : public ObjectPointerVisitor {
      return raw->untag()->IsMarked();
    }
- 
+
 +  void DrainFlaxMarking() {
 +    do {
 +      ProcessDeferredMarking();
@@ -248,7 +467,7 @@ index f58905a0..02246323 100644
          }
 @@ -632,6 +684,15 @@ class MarkingVisitor : public ObjectPointerVisitor {
    GCLinkedLists* delayed() { return &delayed_; }
- 
+
   private:
 +  void FlaxObjectMarked(ObjectPtr object) {
 +    if (flax_state_ == nullptr) return;
@@ -280,15 +499,15 @@ index f58905a0..02246323 100644
  #endif
 @@ -683,12 +746,18 @@ class MarkingVisitor : public ObjectPointerVisitor {
      }
- 
+
      if (obj->untag()->TryAcquireMarkBit()) {
 +      FlaxObjectMarked(obj);
        old_work_list_.Push(obj);
      }
- 
+
      return UntaggedObject::IsEvacuationCandidate(tags);
    }
- 
+
 +  ApiState* flax_state_ = nullptr;
 +  std::unordered_map<uword, std::vector<Dart_WeakPersistentHandle>>
 +      flax_origins_;
@@ -300,7 +519,7 @@ index f58905a0..02246323 100644
 @@ -970,6 +1039,14 @@ class ParallelMarkTask : public SafepointTask {
        visitor_->ProcessDeferredMarking();
        barrier_->Sync();
- 
+
 +      // The ordinary mark stays parallel. A registered foreign collector joins
 +      // on the safepoint owner before any weak references are cleared.
 +      if (thread->isolate_group()->api_state()->flax_collector() != nullptr) {
@@ -313,13 +532,13 @@ index f58905a0..02246323 100644
        visitor_->MournWeakProperties();
        visitor_->MournWeakReferences();
 @@ -1295,6 +1372,8 @@ void GCMarker::MarkObjects(PageSpace* page_space) {
- 
+
    const int num_tasks = FLAG_marker_tasks;
    RELEASE_ASSERT(num_tasks > 0);
 +  ApiState* api = isolate_group_->api_state();
 +  auto collector = api->flax_collector();
    ThreadBarrier* barrier = new ThreadBarrier(num_tasks, /*initial=*/1);
- 
+
    ResetSlices();
 @@ -1324,6 +1403,39 @@ void GCMarker::MarkObjects(PageSpace* page_space) {
    }
@@ -358,7 +577,7 @@ index f58905a0..02246323 100644
 +    IterateWeakRoots(thread);
 +    visitor->AddMicros(OS::GetCurrentMonotonicMicros() - start);
 +  }
- 
+
    for (intptr_t i = 0; i < num_tasks; i++) {
      MarkingVisitor* visitor = visitors_[i];
 diff --git a/runtime/vm/heap/scavenger.cc b/runtime/vm/heap/scavenger.cc
@@ -371,50 +590,16 @@ index 9fba03d6..269af227 100644
        visitor, ValidationPolicy::kDontValidateFrames);
 +  heap_->isolate_group()->api_state()->VisitFlaxHandles(visitor);
  }
- 
+
  void Scavenger::IterateStoreBuffers(ScavengerVisitor* visitor) {
 diff --git a/runtime/vm/visitor.cc b/runtime/vm/visitor.cc
 index 37806bb6..de8133f8 100644
 --- a/runtime/vm/visitor.cc
 +++ b/runtime/vm/visitor.cc
-@@ -5,6 +5,7 @@
+@@ -5,5 +5,6 @@
  #include "vm/visitor.h"
- 
+
  #include "vm/isolate.h"
 +#include "vm/raw_object.h"
- 
+
  namespace dart {
- 
-diff --git a/runtime/include/dart_flax_api.h b/runtime/include/dart_flax_api.h
-new file mode 100644
-index 00000000..80ddf43b
---- /dev/null
-+++ b/runtime/include/dart_flax_api.h
-@@ -0,0 +1,27 @@
-+// Experimental Flax cross-heap tracing. Not part of the public Dart API.
-+#ifndef RUNTIME_INCLUDE_DART_FLAX_API_H_
-+#define RUNTIME_INCLUDE_DART_FLAX_API_H_
-+#include "dart_api.h"
-+#ifdef __cplusplus
-+extern "C" {
-+#endif
-+// Valid only during the collector callback, on its owning thread. No Dart
-+// execution, heap allocation, ordinary Dart API calls, or retained context.
-+typedef struct {
-+  void* context;
-+  bool (*is_marked)(void*, Dart_WeakPersistentHandle);
-+  void (*mark)(void*, Dart_WeakPersistentHandle);
-+  Dart_WeakPersistentHandle (*next_marked_origin)(void*);
-+} Dart_FlaxGC;
-+typedef void (*Dart_FlaxCollector)(void*, const Dart_FlaxGC*);
-+DART_EXPORT bool Dart_FlaxSetCollector(Dart_FlaxCollector collector,
-+                                       void* peer);
-+DART_EXPORT bool Dart_FlaxRegisterHandle(Dart_WeakPersistentHandle handle,
-+                                         bool is_origin);
-+DART_EXPORT void Dart_FlaxSetCollectionRequest(void (*request)(void*));
-+// Controlled GC for this experiment, separate from automatic allocation GC.
-+DART_EXPORT void Dart_FlaxCollect(bool young, bool compact);
-+#ifdef __cplusplus
-+}
-+#endif
-+#endif
