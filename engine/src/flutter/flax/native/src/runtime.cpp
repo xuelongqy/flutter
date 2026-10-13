@@ -201,18 +201,18 @@ fbjsi::Object object(FlaxRuntime* runtime, FlaxValueId id) {
   return v.getObject(*runtime->js);
 }
 
-std::u16string utf16(const uint16_t* data, size_t length) {
+const char16_t* utf16(const uint16_t* data, size_t length) {
   if (!length)
-    return {};
+    return u"";
   if (!data)
     throw BridgeError(FLAX_ARGUMENT_ERROR, "Null UTF-16 buffer");
-  return {data, data + length};
+  return reinterpret_cast<const char16_t*>(data);
 }
 
 fbjsi::PropNameID propertyName(FlaxRuntime* runtime,
                                const uint16_t* name,
                                size_t length) {
-  return fbjsi::PropNameID::forUtf16(*runtime->js, utf16(name, length));
+  return fbjsi::PropNameID::forUtf16(*runtime->js, utf16(name, length), length);
 }
 
 int32_t create(FlaxRuntime** output, FlaxError* error) {
@@ -415,13 +415,14 @@ int32_t makeValue(FlaxRuntime* runtime,
         break;
       case FLAX_STRING:
         *output = keep(runtime, fbjsi::String::createFromUtf16(
-                                    *runtime->js, utf16(data, length)));
+                                    *runtime->js, utf16(data, length), length));
         break;
       case FLAX_BIGINT:
         *output = keep(
-            runtime, runtime->bigIntConstructor->call(
-                         *runtime->js, fbjsi::String::createFromUtf16(
-                                           *runtime->js, utf16(data, length))));
+            runtime,
+            runtime->bigIntConstructor->call(
+                *runtime->js, fbjsi::String::createFromUtf16(
+                                  *runtime->js, utf16(data, length), length)));
         break;
       default:
         throw BridgeError(FLAX_ARGUMENT_ERROR, "Unsupported primitive kind");
@@ -645,6 +646,21 @@ int32_t drainMicrotasks(FlaxRuntime* runtime,
   });
 }
 
+fbjsi::ArrayBuffer allocateBytes(FlaxRuntime* runtime, size_t length) {
+  if (length > 9007199254740991ULL)
+    throw BridgeError(FLAX_ARGUMENT_ERROR,
+                      "Byte length exceeds JS integer precision");
+  auto& js = *runtime->js;
+  // Engine-owned storage can transfer even when JS properties are frozen.
+  auto buffer = runtime->arrayBufferConstructor
+                    ->callAsConstructor(js, static_cast<double>(length))
+                    .getObject(js)
+                    .getArrayBuffer(js);
+  if (buffer.size(js) != length)
+    throw BridgeError(FLAX_STATE_ERROR, "ArrayBuffer allocation size mismatch");
+  return buffer;
+}
+
 int32_t makeBytes(FlaxRuntime* runtime,
                   const uint8_t* data,
                   size_t length,
@@ -653,21 +669,11 @@ int32_t makeBytes(FlaxRuntime* runtime,
   return enter(runtime, error, [&] {
     if (!data && length)
       throw BridgeError(FLAX_ARGUMENT_ERROR, "Null byte buffer");
-    if (length > 9007199254740991ULL)
-      throw BridgeError(FLAX_ARGUMENT_ERROR,
-                        "Byte length exceeds JS integer precision");
     auto& js = *runtime->js;
-    // Engine-owned storage can transfer even when JS properties are frozen.
-    auto object = runtime->arrayBufferConstructor
-                      ->callAsConstructor(js, static_cast<double>(length))
-                      .getObject(js);
-    auto buffer = object.getArrayBuffer(js);
-    if (buffer.size(js) != length)
-      throw BridgeError(FLAX_STATE_ERROR,
-                        "ArrayBuffer allocation size mismatch");
+    auto buffer = allocateBytes(runtime, length);
     if (length)
       std::memcpy(buffer.data(js), data, length);
-    *output = keep(runtime, std::move(object));
+    *output = keep(runtime, std::move(buffer));
   });
 }
 
@@ -720,12 +726,12 @@ fbjsi::Value bindingArgument(FlaxRuntime* runtime,
     case FLAX_NUMBER:
       return fbjsi::Value(input.number);
     case FLAX_STRING:
-      return fbjsi::String::createFromUtf16(js,
-                                            utf16(input.text, input.length));
+      return fbjsi::String::createFromUtf16(js, utf16(input.text, input.length),
+                                            input.length);
     case FLAX_BIGINT:
       return runtime->bigIntConstructor->call(
-          js,
-          fbjsi::String::createFromUtf16(js, utf16(input.text, input.length)));
+          js, fbjsi::String::createFromUtf16(
+                  js, utf16(input.text, input.length), input.length));
     case FLAX_OBJECT:
     case FLAX_FUNCTION: {
       auto target = object(runtime, input.id);
@@ -896,6 +902,38 @@ void checkDartBuffer(Dart_Handle result) {
     throw BridgeError(FLAX_ARGUMENT_ERROR, Dart_GetError(result));
 }
 
+int32_t copyBuffer(FlaxRuntime* runtime,
+                   Dart_Handle bytes,
+                   FlaxValueId* output,
+                   FlaxError* error) {
+  return enter(runtime, error, [&] {
+    if (!output)
+      throw BridgeError(FLAX_ARGUMENT_ERROR, "Null copied buffer output");
+    if (Dart_GetTypeOfTypedData(bytes) != Dart_TypedData_kUint8)
+      throw BridgeError(FLAX_ARGUMENT_ERROR, "Expected Uint8List");
+    intptr_t length = 0;
+    checkDartBuffer(Dart_ListLength(bytes, &length));
+    auto buffer = allocateBytes(runtime, length);
+    auto* destination = buffer.data(*runtime->js);
+    Dart_TypedData_Type type;
+    void* data = nullptr;
+    intptr_t acquiredLength = 0;
+    checkDartBuffer(
+        Dart_TypedDataAcquireData(bytes, &type, &data, &acquiredLength));
+    const bool compatible =
+        type == Dart_TypedData_kUint8 && acquiredLength == length;
+    // No JS or allocating Dart calls while the borrowed Dart address is
+    // acquired.
+    if (compatible && length)
+      std::memcpy(destination, data, length);
+    checkDartBuffer(Dart_TypedDataReleaseData(bytes));
+    if (!compatible)
+      throw BridgeError(FLAX_STATE_ERROR,
+                        "Uint8List range changed during copy");
+    *output = keep(runtime, std::move(buffer));
+  });
+}
+
 class DartBuffer final : public fbjsi::MutableBuffer {
  public:
   explicit DartBuffer(const Dart_FlaxBuffer& buffer)
@@ -1018,7 +1056,8 @@ const FlaxEngineBindingApi bindingApi{FLAX_ENGINE_BINDING_VERSION,
                                       invokeMember,
                                       bindingCall,
                                       shareBuffer,
-                                      readBuffer};
+                                      readBuffer,
+                                      copyBuffer};
 
 const FlaxApi api{
     FLAX_ABI_VERSION, sizeof(FlaxApi), create,    destroy,      evaluate,
