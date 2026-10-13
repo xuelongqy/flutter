@@ -10,9 +10,14 @@ UI isolate; each runtime owns an independent Context and microtask queue.
 engine-namespaced IDs without reuse or wraparound.
 
 Public C ABI 2 is unchanged. `engine_gc.h` defines the separate internal GC
-extension. `engine_binding.h` version 3 shares all primitive numeric typed lists,
+extension. `engine_binding.h` version 4 shares all primitive numeric typed lists,
 ByteData and ByteBuffer through the same byte lease. BigInt uses exact decimal text
 in the primitive ABI; native ABI 2 remains unchanged.
+The copying entry acquires a Dart Uint8List address only after allocating the destination
+ArrayBuffer, copies once and immediately releases it. It also accepts readonly sources.
+No JS or allocating Dart operation runs while that address is acquired. Copied JS byte
+ranges can be owned by external Dart data with `buffer_free` as its native finalizer;
+the allocator does not depend on runtime lifetime.
 `runtime.cpp` owns the common MutableBuffer leases: Dart storage is pinned through
 `dart_flax_api.h`, and JS-origin storage stays live through Dart external-data finalizers.
 Unpinning runs on the owning UI thread and VM shutdown retires remaining roots.
