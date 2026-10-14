@@ -94,6 +94,13 @@ development signing and provisioning, verifies Dart AOT and the embedded Hermes 
 and installs the relocated application after source removal. iOS requires no JS JIT
 entitlement. These gates do not establish release distribution or Hermes GC/frame performance.
 
+Internal binding extension 7 includes the VM fix for recursive function bounds under
+an enclosing generic declaration. The VM only resolves type-parameter bounds for its
+`Never` normalization; expanding a nominal F-bound such as `Comparable<T>` would
+recurse indefinitely. Flax rejects older engines before loading these bindings.
+The public native ABI remains 2. This update requires rebuilding the matching engine;
+it does not rebuild the V8 SDK or change its lock.
+
 ## Ownership
 
 Dart's ordinary parallel marking remains enabled. Conditional tracing then

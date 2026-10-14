@@ -5,7 +5,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-#define FLAX_ENGINE_BINDING_VERSION 6
+#define FLAX_ENGINE_BINDING_VERSION 7
 
 /* These indices match FlaxBufferType. All views share the same byte lease. */
 enum FlaxBufferKind {
