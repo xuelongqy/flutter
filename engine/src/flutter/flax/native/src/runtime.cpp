@@ -897,7 +897,7 @@ struct PinnedBytes {
 };
 thread_local std::unordered_map<void*, PinnedBytes> pinnedBytes;
 
-void checkDartBuffer(Dart_Handle result) {
+void checkDart(Dart_Handle result) {
   if (Dart_IsError(result))
     throw BridgeError(FLAX_ARGUMENT_ERROR, Dart_GetError(result));
 }
@@ -912,13 +912,13 @@ int32_t copyBuffer(FlaxRuntime* runtime,
     if (Dart_GetTypeOfTypedData(bytes) != Dart_TypedData_kUint8)
       throw BridgeError(FLAX_ARGUMENT_ERROR, "Expected Uint8List");
     intptr_t length = 0;
-    checkDartBuffer(Dart_ListLength(bytes, &length));
+    checkDart(Dart_ListLength(bytes, &length));
     auto buffer = allocateBytes(runtime, length);
     auto* destination = buffer.data(*runtime->js);
     Dart_TypedData_Type type;
     void* data = nullptr;
     intptr_t acquiredLength = 0;
-    checkDartBuffer(
+    checkDart(
         Dart_TypedDataAcquireData(bytes, &type, &data, &acquiredLength));
     const bool compatible =
         type == Dart_TypedData_kUint8 && acquiredLength == length;
@@ -926,7 +926,7 @@ int32_t copyBuffer(FlaxRuntime* runtime,
     // acquired.
     if (compatible && length)
       std::memcpy(destination, data, length);
-    checkDartBuffer(Dart_TypedDataReleaseData(bytes));
+    checkDart(Dart_TypedDataReleaseData(bytes));
     if (!compatible)
       throw BridgeError(FLAX_STATE_ERROR,
                         "Uint8List range changed during copy");
@@ -982,7 +982,7 @@ int32_t shareBuffer(FlaxRuntime* runtime,
     if (!output)
       throw BridgeError(FLAX_ARGUMENT_ERROR, "Null shared buffer output");
     Dart_FlaxBuffer buffer{};
-    checkDartBuffer(Dart_FlaxPinUint8List(bytes, &buffer));
+    checkDart(Dart_FlaxPinUint8List(bytes, &buffer));
     std::unique_ptr<void, void (*)(void*)> pin(buffer.token,
                                                Dart_FlaxReleaseBuffer);
     auto& saved = pinnedBytes[buffer.data];
@@ -1032,7 +1032,7 @@ Dart_Handle readBuffer(FlaxRuntime* runtime,
           saved && saved->size() == view.storage->size()) {
         result = Dart_FlaxUint8ListView(found->second.token, view.offset,
                                         view.length);
-        checkDartBuffer(result);
+        checkDart(result);
         return;
       }
     }
@@ -1044,10 +1044,48 @@ Dart_Handle readBuffer(FlaxRuntime* runtime,
         storage.get(), view.storage->size(), [](void*, void* peer) {
           delete static_cast<std::shared_ptr<fbjsi::MutableBuffer>*>(peer);
         });
-    checkDartBuffer(result);
+    checkDart(result);
     storage.release();
   });
   return result;
+}
+
+Dart_Handle instanceType(FlaxRuntime* runtime, Dart_Handle value,
+                         FlaxError* error) {
+  Dart_Handle result = Dart_Null();
+  enter(runtime, error, [&] {
+    result = Dart_InstanceGetType(value);
+    checkDart(result);
+  });
+  return error && error->code != FLAX_OK ? Dart_Null() : result;
+}
+
+Dart_Handle typeParts(FlaxRuntime* runtime, Dart_Handle type, FlaxError* error) {
+  Dart_Handle result = Dart_Null();
+  enter(runtime, error, [&] {
+    result = Dart_FlaxTypeParts(type);
+    checkDart(result);
+  });
+  return error && error->code != FLAX_OK ? Dart_Null() : result;
+}
+
+Dart_Handle nullableType(FlaxRuntime* runtime, Dart_Handle type, FlaxError* error) {
+  Dart_Handle result = Dart_Null();
+  enter(runtime, error, [&] {
+    result = Dart_FlaxNullableType(type);
+    checkDart(result);
+  });
+  return error && error->code != FLAX_OK ? Dart_Null() : result;
+}
+
+Dart_Handle instantiate(FlaxRuntime* runtime, Dart_Handle closure,
+                        Dart_Handle types, FlaxError* error) {
+  Dart_Handle result = Dart_Null();
+  enter(runtime, error, [&] {
+    result = Dart_FlaxInstantiate(closure, types);
+    checkDart(result);
+  });
+  return error && error->code != FLAX_OK ? Dart_Null() : result;
 }
 
 const FlaxEngineBindingApi bindingApi{FLAX_ENGINE_BINDING_VERSION,
@@ -1057,7 +1095,11 @@ const FlaxEngineBindingApi bindingApi{FLAX_ENGINE_BINDING_VERSION,
                                       bindingCall,
                                       shareBuffer,
                                       readBuffer,
-                                      copyBuffer};
+                                      copyBuffer,
+                                      instanceType,
+                                      typeParts,
+                                      nullableType,
+                                      instantiate};
 
 const FlaxApi api{
     FLAX_ABI_VERSION, sizeof(FlaxApi), create,    destroy,      evaluate,

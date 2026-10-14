@@ -76,16 +76,19 @@ def main() -> None:
     if args.mode == "debug":
         command += ["--unoptimized", "--dart-debug"]
     subprocess.run(command, cwd=source, env=env, check=True)
+    # Ninja may regenerate GN output once more before reading compile commands.
+    subprocess.run(["ninja", "-C", str(output), "build.ninja"],
+                   cwd=source, env=env, check=True)
     # Xcode 27's os_log macros carry an attribute ignored when stack protection
     # is forced. Keep protection and all other warning errors enabled.
     for path in output.rglob("*.ninja"):
         if path.name == "toolchain.ninja":
             continue
         source_text = path.read_text()
-        source_text = source_text.replace(
-            "-fstack-protector-all", "-fstack-protector-all -Wno-error=ignored-attributes"
-        )
-        path.write_text(source_text)
+        if "-fstack-protector-all" in source_text and "-Wno-error=ignored-attributes" not in source_text:
+            path.write_text(source_text.replace(
+                "-fstack-protector-all", "-fstack-protector-all -Wno-error=ignored-attributes"
+            ))
     if not args.configure_only:
         targets = ["flutter", "flutter_tester"] if platform == "mac" else ["flutter"]
         subprocess.run(["ninja", "-C", str(output), "-j", str(args.jobs),
