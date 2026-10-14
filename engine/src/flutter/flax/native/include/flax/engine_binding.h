@@ -5,7 +5,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-#define FLAX_ENGINE_BINDING_VERSION 4
+#define FLAX_ENGINE_BINDING_VERSION 6
 
 /* These indices match FlaxBufferType. All views share the same byte lease. */
 enum FlaxBufferKind {
@@ -64,6 +64,12 @@ typedef struct FlaxEngineBindingApi {
   Dart_Handle (*read_buffer)(FlaxRuntime*, FlaxValueId, uint32_t kind, FlaxError*);
   /* Copies Dart Uint8List bytes into an independent, engine-owned ArrayBuffer. */
   int32_t (*copy_buffer)(FlaxRuntime*, Dart_Handle, FlaxValueId*, FlaxError*);
+  /* Real Type references and first-use closure instantiation, on the UI isolate. */
+  Dart_Handle (*instance_type)(FlaxRuntime*, Dart_Handle value, FlaxError*);
+  Dart_Handle (*type_parts)(FlaxRuntime*, Dart_Handle type, FlaxError*);
+  Dart_Handle (*nullable_type)(FlaxRuntime*, Dart_Handle type, FlaxError*);
+  Dart_Handle (*instantiate)(FlaxRuntime*, Dart_Handle closure,
+                              Dart_Handle types, FlaxError*);
 } FlaxEngineBindingApi;
 const FlaxEngineBindingApi* flax_engine_get_binding_api(uint32_t version);
 #ifdef __cplusplus

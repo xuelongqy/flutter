@@ -28,80 +28,32 @@ index ecff06a6..467fad02 100644
      "//third_party/perfetto:libprotozero",  # for timeline_test
 +    "//third_party/zlib",  # for gzip.cc in the Flutter engine checkout
    ]
-
+ 
    if (is_fuchsia) {
-diff --git a/runtime/include/dart_flax_api.h b/runtime/include/dart_flax_api.h
-new file mode 100644
-index 00000000..f782e676
---- /dev/null
-+++ b/runtime/include/dart_flax_api.h
-@@ -0,0 +1,42 @@
-+// Experimental Flax cross-heap tracing. Not part of the public Dart API.
-+#ifndef RUNTIME_INCLUDE_DART_FLAX_API_H_
-+#define RUNTIME_INCLUDE_DART_FLAX_API_H_
-+#include "dart_api.h"
-+#ifdef __cplusplus
-+extern "C" {
-+#endif
-+// Valid only during the collector callback, on its owning thread. No Dart
-+// execution, heap allocation, ordinary Dart API calls, or retained context.
-+typedef struct {
-+  void* context;
-+  bool (*is_marked)(void*, Dart_WeakPersistentHandle);
-+  void (*mark)(void*, Dart_WeakPersistentHandle);
-+  Dart_WeakPersistentHandle (*next_marked_origin)(void*);
-+} Dart_FlaxGC;
-+typedef void (*Dart_FlaxCollector)(void*, const Dart_FlaxGC*);
-+DART_EXPORT bool Dart_FlaxSetCollector(Dart_FlaxCollector collector,
-+                                       void* peer);
-+DART_EXPORT bool Dart_FlaxRegisterHandle(Dart_WeakPersistentHandle handle,
-+                                         bool is_origin);
-+DART_EXPORT void Dart_FlaxSetCollectionRequest(void (*request)(void*));
-+// Controlled GC for this experiment, separate from automatic allocation GC.
-+DART_EXPORT void Dart_FlaxCollect(bool young, bool compact);
-+// Pin a writable Uint8List (or view) until its last native buffer owner releases
-+// it. Pin/view calls require the owning isolate. Release runs on that isolate,
-+// or on any thread after isolate shutdown has retired the root.
-+typedef struct {
-+  void* token;
-+  void* data;
-+  intptr_t byte_length;
-+  intptr_t offset;
-+  intptr_t length;
-+} Dart_FlaxBuffer;
-+DART_EXPORT Dart_Handle Dart_FlaxPinUint8List(Dart_Handle, Dart_FlaxBuffer*);
-+DART_EXPORT void Dart_FlaxReleaseBuffer(void* token);
-+DART_EXPORT Dart_Handle Dart_FlaxUint8ListView(void* token,
-+                                              intptr_t offset,
-+                                              intptr_t length);
-+#ifdef __cplusplus
-+}
-+#endif
-+#endif
 diff --git a/runtime/vm/dart_api_impl.cc b/runtime/vm/dart_api_impl.cc
-index ac526ee0..05bde968 100644
+index ac526ee0..50f4b178 100644
 --- a/runtime/vm/dart_api_impl.cc
 +++ b/runtime/vm/dart_api_impl.cc
 @@ -3,6 +3,7 @@
  // BSD-style license that can be found in the LICENSE file.
-
+ 
  #include "include/dart_api.h"
 +#include "include/dart_flax_api.h"
  #include "include/dart_native_api.h"
-
+ 
  #include <cstring>
 @@ -69,6 +70,7 @@
  #endif  // !defined(DART_PRECOMPILED_RUNTIME)
-
+ 
  namespace dart {
 +void RetireFlaxBuffers(Thread*);
-
+ 
  // Facilitate quick access to the current zone once we have the current thread.
  #define Z (T->zone())
 @@ -1071,6 +1073,41 @@ Dart_NewFinalizableHandle(Dart_Handle object,
                                     callback);
  }
-
+ 
 +DART_EXPORT bool Dart_FlaxSetCollector(Dart_FlaxCollector collector,
 +                                       void* peer) {
 +  Thread* T = Thread::Current();
@@ -147,10 +99,182 @@ index ac526ee0..05bde968 100644
 +  RetireFlaxBuffers(T);
    Dart::ShutdownIsolate(T);
  }
-
-@@ -7258,3 +7296,154 @@ void ThrowCantRunWithoutIsolateError() {
+ 
+@@ -5790,6 +5828,171 @@ static Dart_Handle GetTypeCommon(Dart_Handle library,
+   return Api::NewHandle(T, type.ptr());
  }
-
+ 
++// Real Type components; names are diagnostic/source identity, never type syntax.
++DART_EXPORT Dart_Handle Dart_FlaxTypeParts(Dart_Handle input) {
++  DARTSCOPE(Thread::Current());
++  CHECK_CALLBACK_STATE(T);
++  const auto& object = Object::Handle(Z, Api::UnwrapHandle(input));
++  if (!object.IsAbstractType()) return Api::NewArgumentError("Expected a Dart Type");
++  const auto& type = AbstractType::Cast(object);
++  if (!type.IsInstantiated()) return Api::NewArgumentError("Type must be instantiated");
++  const auto& result = Array::Handle(Z, Array::New(7));
++  result.SetAt(0, String::Handle(Z, type.UserVisibleName()));
++  result.SetAt(1, Bool::Get(type.IsNullable()));
++  // VM pseudo-types have no declaring library or superclass metadata.
++  if (type.IsDynamicType() || type.IsVoidType() || type.IsNeverType() ||
++      type.IsNullType()) {
++    const char* name = type.IsDynamicType() ? "dynamic"
++                       : type.IsVoidType() ? "void"
++                       : type.IsNeverType() ? "Never" : "Null";
++    result.SetAt(2, String::Handle(Z, String::New("dart:core")));
++    result.SetAt(3, String::Handle(Z, String::New(name)));
++    result.SetAt(4, Array::Handle(Z, Array::New(0)));
++    result.SetAt(6, Array::Handle(Z, Array::New(0)));
++    return Api::NewHandle(T, result.ptr());
++  }
++  if (type.IsType()) {
++    const auto& concrete = Type::Cast(type);
++    const auto& cls = Class::Handle(Z, concrete.type_class());
++    const auto& lib = Library::Handle(Z, cls.library());
++    result.SetAt(2, String::Handle(Z, lib.url()));
++    result.SetAt(3, String::Handle(Z, cls.UserVisibleName()));
++    const auto& args = TypeArguments::Handle(Z, concrete.arguments());
++    const intptr_t count = cls.NumTypeParameters();
++    if (!args.IsNull() && count != args.Length()) {
++      return Api::NewError("Invalid Type argument layout: %s (own=%" Pd ", length=%" Pd ")",
++                           String::Handle(Z, type.UserVisibleName()).ToCString(),
++                           count, args.Length());
++    }
++    const auto& children = Array::Handle(Z, Array::New(count));
++    auto& child = AbstractType::Handle(Z);
++    for (intptr_t i = 0; i < count; ++i) {
++      child = args.TypeAtNullSafe(i);
++      children.SetAt(i, child);
++    }
++    result.SetAt(4, children);
++    const auto& interfaces = Array::Handle(Z, cls.interfaces());
++    const intptr_t interface_count = interfaces.IsNull() ? 0 : interfaces.Length();
++    const auto& parent = Type::Handle(Z, cls.super_type());
++    const auto& parents = Array::Handle(Z, Array::New(interface_count + (parent.IsNull() ? 0 : 1)));
++    const auto& function_args = TypeArguments::Handle(Z, Object::empty_type_arguments().ptr());
++    // Type.arguments contains only its own parameters; superclass substitution
++    // uses the VM's flattened instance vector.
++    const auto& instance_args = TypeArguments::Handle(Z, concrete.GetInstanceTypeArguments(T));
++    intptr_t index = 0;
++    if (!parent.IsNull()) {
++      child = parent.IsInstantiated() ? parent.ptr() : parent.InstantiateFrom(instance_args, function_args, kAllFree, Heap::kOld);
++      parents.SetAt(index++, child);
++    }
++    for (intptr_t i = 0; i < interface_count; ++i) {
++      child ^= interfaces.At(i);
++      if (!child.IsInstantiated())
++        child = child.InstantiateFrom(instance_args, function_args, kAllFree, Heap::kOld);
++      parents.SetAt(index++, child);
++    }
++    result.SetAt(6, parents);
++  } else if (type.IsRecordType()) {
++    const auto& record = RecordType::Cast(type);
++    result.SetAt(2, String::Handle(Z, String::New("dart:core")));
++    result.SetAt(3, String::Handle(Z, String::New("Record")));
++    result.SetAt(4, Array::Handle(Z, record.field_types()));
++    result.SetAt(5, Array::Handle(Z, record.GetFieldNames(T)));
++  } else if (type.IsFunctionType()) {
++    const auto& function = FunctionType::Cast(type);
++    if (function.IsGeneric())
++      return Api::NewArgumentError("Unbound generic callback type");
++    const intptr_t offset = function.num_implicit_parameters();
++    const intptr_t fixed = function.num_fixed_parameters() - offset;
++    const intptr_t positional = fixed + function.NumOptionalPositionalParameters();
++    const intptr_t count = function.NumParameters() - offset;
++    const auto& children = Array::Handle(Z, Array::New(count + 1));
++    auto& child = AbstractType::Handle(Z);
++    for (intptr_t i = 0; i < count; ++i) {
++      child = function.ParameterTypeAt(offset + i);
++      children.SetAt(i, child);
++    }
++    child = function.result_type();
++    children.SetAt(count, child);
++    const intptr_t named = function.NumOptionalNamedParameters();
++    const auto& names = Array::Handle(Z, Array::New(named));
++    const auto& required = Array::Handle(Z, Array::New(named));
++    for (intptr_t i = 0; i < named; ++i) {
++      names.SetAt(i, String::Handle(Z, function.ParameterNameAt(offset + positional + i)));
++      required.SetAt(i, Bool::Get(function.IsRequiredAt(offset + positional + i)));
++    }
++    const auto& shape = Array::Handle(Z, Array::New(4));
++    shape.SetAt(0, Smi::Handle(Z, Smi::New(positional)));
++    shape.SetAt(1, Smi::Handle(Z, Smi::New(fixed)));
++    shape.SetAt(2, names);
++    shape.SetAt(3, required);
++    result.SetAt(2, String::Handle(Z, String::New("dart:core")));
++    result.SetAt(3, String::Handle(Z, String::New("Function")));
++    result.SetAt(4, children);
++    result.SetAt(5, shape);
++  } else {
++    return Api::NewArgumentError("Unsupported Dart Type representation");
++  }
++  return Api::NewHandle(T, result.ptr());
++}
++
++DART_EXPORT Dart_Handle Dart_FlaxNullableType(Dart_Handle input) {
++  DARTSCOPE(Thread::Current());
++  CHECK_CALLBACK_STATE(T);
++  const auto& object = Object::Handle(Z, Api::UnwrapHandle(input));
++  if (!object.IsAbstractType()) return Api::NewArgumentError("Expected a Dart Type");
++  const auto& type = AbstractType::Cast(object);
++  if (!type.IsInstantiated()) return Api::NewArgumentError("Type must be instantiated");
++  auto& result = AbstractType::Handle(Z);
++  if (type.IsType()) {
++    result = Type::Cast(type).ToNullability(Nullability::kNullable, Heap::kOld);
++  } else if (type.IsFunctionType()) {
++    result = FunctionType::Cast(type).ToNullability(Nullability::kNullable, Heap::kOld);
++  } else if (type.IsRecordType()) {
++    result = RecordType::Cast(type).ToNullability(Nullability::kNullable, Heap::kOld);
++  } else {
++    return Api::NewArgumentError("Unsupported Dart Type representation");
++  }
++  return Api::NewHandle(T, result.ptr());
++}
++
++DART_EXPORT Dart_Handle Dart_FlaxInstantiate(Dart_Handle callable,
++                                          Dart_Handle type_list) {
++  DARTSCOPE(Thread::Current());
++  CHECK_CALLBACK_STATE(T);
++  const auto& input = Object::Handle(Z, Api::UnwrapHandle(callable));
++  if (!input.IsClosure()) return Api::NewArgumentError("Expected a generic closure");
++  const auto& closure = Closure::Cast(input);
++  const auto& target = Function::Handle(Z, closure.function());
++  const intptr_t count = target.NumTypeParameters();
++  if (!target.IsGeneric() || closure.delayed_type_arguments() != Object::empty_type_arguments().ptr())
++    return Api::NewArgumentError("Closure must have unbound type parameters");
++  const auto& list = Object::Handle(Z, Api::UnwrapHandle(type_list));
++  if (!list.IsArray() && !list.IsGrowableObjectArray())
++    return Api::NewArgumentError("Expected a List<Type>");
++  const intptr_t length = list.IsArray() ? Array::Cast(list).Length()
++                                        : GrowableObjectArray::Cast(list).Length();
++  if (length != count) return Api::NewArgumentError("Wrong number of type arguments");
++  const auto& types = TypeArguments::Handle(Z, TypeArguments::New(count));
++  auto& item = Object::Handle(Z);
++  for (intptr_t i = 0; i < count; ++i) {
++    item = list.IsArray() ? Array::Cast(list).At(i) : GrowableObjectArray::Cast(list).At(i);
++    if (!item.IsAbstractType() || !AbstractType::Cast(item).IsInstantiated())
++      return Api::NewArgumentError("Expected an instantiated Dart Type");
++    types.SetTypeAt(i, AbstractType::Cast(item));
++  }
++  const auto& canonical = TypeArguments::Handle(Z, types.Canonicalize(T));
++  const auto& lib = Library::Handle(Z, Library::InternalLibrary());
++  const auto& name = String::Handle(Z, Symbols::New(T, "_instantiateClosure"));
++  const auto& factory = Function::Handle(Z, lib.LookupFunctionAllowPrivate(name));
++  if (factory.IsNull()) return Api::NewError("Missing retained closure instantiation entry point");
++  const auto& args = Array::Handle(Z, Array::New(2));
++  args.SetAt(0, closure);
++  args.SetAt(1, canonical);
++  const auto& result = Object::Handle(Z, DartEntry::InvokeFunction(factory, args));
++  return Api::NewHandle(T, result.ptr());
++}
++
++
+ DART_EXPORT Dart_Handle Dart_GetType(Dart_Handle library,
+                                      Dart_Handle class_name,
+                                      intptr_t number_of_type_arguments,
+@@ -7258,3 +7461,154 @@ void ThrowCantRunWithoutIsolateError() {
+ }
+ 
  }  // namespace dart
 +
 +
@@ -310,7 +434,7 @@ index 394ac210..85524a4b 100644
 @@ -5,7 +5,10 @@
  #ifndef RUNTIME_VM_DART_API_STATE_H_
  #define RUNTIME_VM_DART_API_STATE_H_
-
+ 
 +#include <unordered_map>
 +
  #include "include/dart_api.h"
@@ -325,7 +449,7 @@ index 394ac210..85524a4b 100644
 +    flax_handles_.erase(weak_ref);
      weak_persistent_handles_.FreeHandle(weak_ref);
    }
-
+ 
 +  // Experimental: minor collections retain bridge targets until a joint major
 +  // collection. Normal major root enumeration deliberately omits these handles.
 +  void VisitFlaxHandles(ObjectPointerVisitor* visitor) {
@@ -385,7 +509,7 @@ index 394ac210..85524a4b 100644
 +  void* flax_peer_ = nullptr;
 +  Thread* flax_owner_ = nullptr;
 +  void (*flax_request_)(void*) = nullptr;
-
+ 
    DISALLOW_COPY_AND_ASSIGN(ApiState);
  };
 diff --git a/runtime/vm/heap/marker.cc b/runtime/vm/heap/marker.cc
@@ -393,9 +517,9 @@ index f58905a0..02246323 100644
 --- a/runtime/vm/heap/marker.cc
 +++ b/runtime/vm/heap/marker.cc
 @@ -4,6 +4,9 @@
-
+ 
  #include "vm/heap/marker.h"
-
+ 
 +#include <unordered_map>
 +#include <vector>
 +
@@ -405,7 +529,7 @@ index f58905a0..02246323 100644
 @@ -59,6 +62,54 @@ class MarkingVisitor : public ObjectPointerVisitor {
      return raw->untag()->IsMarked();
    }
-
+ 
 +  void DrainFlaxMarking() {
 +    do {
 +      ProcessDeferredMarking();
@@ -467,7 +591,7 @@ index f58905a0..02246323 100644
          }
 @@ -632,6 +684,15 @@ class MarkingVisitor : public ObjectPointerVisitor {
    GCLinkedLists* delayed() { return &delayed_; }
-
+ 
   private:
 +  void FlaxObjectMarked(ObjectPtr object) {
 +    if (flax_state_ == nullptr) return;
@@ -499,15 +623,15 @@ index f58905a0..02246323 100644
  #endif
 @@ -683,12 +746,18 @@ class MarkingVisitor : public ObjectPointerVisitor {
      }
-
+ 
      if (obj->untag()->TryAcquireMarkBit()) {
 +      FlaxObjectMarked(obj);
        old_work_list_.Push(obj);
      }
-
+ 
      return UntaggedObject::IsEvacuationCandidate(tags);
    }
-
+ 
 +  ApiState* flax_state_ = nullptr;
 +  std::unordered_map<uword, std::vector<Dart_WeakPersistentHandle>>
 +      flax_origins_;
@@ -519,7 +643,7 @@ index f58905a0..02246323 100644
 @@ -970,6 +1039,14 @@ class ParallelMarkTask : public SafepointTask {
        visitor_->ProcessDeferredMarking();
        barrier_->Sync();
-
+ 
 +      // The ordinary mark stays parallel. A registered foreign collector joins
 +      // on the safepoint owner before any weak references are cleared.
 +      if (thread->isolate_group()->api_state()->flax_collector() != nullptr) {
@@ -532,13 +656,13 @@ index f58905a0..02246323 100644
        visitor_->MournWeakProperties();
        visitor_->MournWeakReferences();
 @@ -1295,6 +1372,8 @@ void GCMarker::MarkObjects(PageSpace* page_space) {
-
+ 
    const int num_tasks = FLAG_marker_tasks;
    RELEASE_ASSERT(num_tasks > 0);
 +  ApiState* api = isolate_group_->api_state();
 +  auto collector = api->flax_collector();
    ThreadBarrier* barrier = new ThreadBarrier(num_tasks, /*initial=*/1);
-
+ 
    ResetSlices();
 @@ -1324,6 +1403,39 @@ void GCMarker::MarkObjects(PageSpace* page_space) {
    }
@@ -577,7 +701,7 @@ index f58905a0..02246323 100644
 +    IterateWeakRoots(thread);
 +    visitor->AddMicros(OS::GetCurrentMonotonicMicros() - start);
 +  }
-
+ 
    for (intptr_t i = 0; i < num_tasks; i++) {
      MarkingVisitor* visitor = visitors_[i];
 diff --git a/runtime/vm/heap/scavenger.cc b/runtime/vm/heap/scavenger.cc
@@ -590,16 +714,659 @@ index 9fba03d6..269af227 100644
        visitor, ValidationPolicy::kDontValidateFrames);
 +  heap_->isolate_group()->api_state()->VisitFlaxHandles(visitor);
  }
-
+ 
  void Scavenger::IterateStoreBuffers(ScavengerVisitor* visitor) {
 diff --git a/runtime/vm/visitor.cc b/runtime/vm/visitor.cc
 index 37806bb6..de8133f8 100644
 --- a/runtime/vm/visitor.cc
 +++ b/runtime/vm/visitor.cc
-@@ -5,5 +5,6 @@
+@@ -5,6 +5,7 @@
  #include "vm/visitor.h"
-
+ 
  #include "vm/isolate.h"
 +#include "vm/raw_object.h"
-
+ 
  namespace dart {
+ 
+diff --git a/sdk/lib/_internal/vm/lib/async_patch.dart b/sdk/lib/_internal/vm/lib/async_patch.dart
+index f7a03957..93a0f8ca 100644
+--- a/sdk/lib/_internal/vm/lib/async_patch.dart
++++ b/sdk/lib/_internal/vm/lib/async_patch.dart
+@@ -40,6 +40,8 @@ void _asyncStarMoveNextHelper(stream) {
+ // async* generator functions.
+ @pragma("vm:entry-point")
+ class _AsyncStarStreamController<T> {
++  @pragma("vm:entry-point")
++  Object? _flaxPendingDependency;
+   @pragma("vm:entry-point")
+   StreamController<T> controller;
+   @pragma("vm:entry-point")
+@@ -162,7 +164,7 @@ class _AsyncStarStreamController<T> {
+       return null;
+     }
+     if (cancellationFuture == null) {
+-      cancellationFuture = _Future();
++      cancellationFuture = _Future().._flaxPendingDependency = this;
+       // Only resume the generator if it is suspended at a yield.
+       // Cancellation does not affect an async generator that is
+       // suspended at an await.
+@@ -199,11 +201,13 @@ class _SuspendState {
+ 
+     @pragma("vm:invisible")
+     thenCallback(value) {
++      suspendState._flaxRetainAwaited(null);
+       suspendState._resume(value, null, null);
+     }
+ 
+     @pragma("vm:invisible")
+     errorCallback(Object exception, StackTrace stackTrace) {
++      suspendState._flaxRetainAwaited(null);
+       suspendState._resume(null, exception, stackTrace);
+     }
+ 
+@@ -307,9 +311,19 @@ class _SuspendState {
+     );
+   }
+ 
++  void _flaxRetainAwaited(Object? source) {
++    final owner = _functionData;
++    if (owner is _Future) {
++      owner._flaxPendingDependency = source;
++    } else if (owner is _AsyncStarStreamController) {
++      owner._flaxPendingDependency = source;
++    }
++  }
++
+   @pragma("vm:entry-point", "call")
+   @pragma("vm:invisible")
+   Object? _await(Object? object) {
++    _flaxRetainAwaited(object is Future ? object : null);
+     if (_thenCallback == null) {
+       _createAsyncCallbacks();
+     }
+@@ -333,6 +347,7 @@ class _SuspendState {
+   @pragma("vm:entry-point", "call")
+   @pragma("vm:invisible")
+   Object? _awaitWithTypeCheck<T>(Object? object) {
++    _flaxRetainAwaited(object is Future<T> ? object : null);
+     if (_thenCallback == null) {
+       _createAsyncCallbacks();
+     }
+diff --git a/sdk/lib/async/broadcast_stream_controller.dart b/sdk/lib/async/broadcast_stream_controller.dart
+index eeaeeaf8..5216fcae 100644
+--- a/sdk/lib/async/broadcast_stream_controller.dart
++++ b/sdk/lib/async/broadcast_stream_controller.dart
+@@ -153,7 +153,8 @@ abstract class _BroadcastStreamController<T>
+ 
+   bool get _mayAddEvent => (_state < _STATE_CLOSED);
+ 
+-  _Future<void> _ensureDoneFuture() => _doneFuture ??= _Future<void>();
++  _Future<void> _ensureDoneFuture() =>
++      _doneFuture ??= (_Future<void>().._flaxPendingDependency = this);
+ 
+   // Linked list helpers
+ 
+diff --git a/sdk/lib/async/future.dart b/sdk/lib/async/future.dart
+index 490b12d0..16a80e55 100644
+--- a/sdk/lib/async/future.dart
++++ b/sdk/lib/async/future.dart
+@@ -521,6 +521,8 @@ abstract interface class Future<T> {
+   }) {
+     @pragma('vm:awaiter-link')
+     final _Future<List<T>> _future = _Future<List<T>>();
++    final dependencies = <Future?>[];
++    _future._flaxPendingDependency = dependencies;
+     List<T?>? values; // Collects the values. Set to null on error.
+     int remaining = 0; // How many futures are we waiting for.
+     Object? error; // The first error from a future.
+@@ -560,11 +562,13 @@ abstract interface class Future<T> {
+     }
+ 
+     try {
++      // Other Iterables may be single-use; only Lists have a reusable length.
++      if (futures is List) dependencies.length = futures.length;
+       // As each future completes, put its value into the corresponding
+       // position in the list of values.
+       for (var future in futures) {
+         int pos = remaining;
+-        future.then((T value) {
++        final dependency = future.then<Null>((T value) {
+           var remainingResults = --remaining;
+           List<T?>? valueList = values;
+           if (valueList != null) {
+@@ -590,6 +594,11 @@ abstract interface class Future<T> {
+             }
+           }
+         }, onError: handleError);
++        if (pos < dependencies.length) {
++          dependencies[pos] = dependency;
++        } else {
++          dependencies.add(dependency);
++        }
+         // Increment the 'remaining' after the call to 'then'.
+         // If that call throws, we don't expect any future callback from
+         // the future, and we also don't increment remaining.
+@@ -655,6 +664,8 @@ abstract interface class Future<T> {
+   /// ```
+   static Future<T> any<T>(Iterable<Future<T>> futures) {
+     var completer = Completer<T>.sync();
++    final dependencies = <Future>[];
++    (completer.future as _Future)._flaxPendingDependency = dependencies;
+     void onValue(T value) {
+       if (!completer.isCompleted) completer.complete(value);
+     }
+@@ -664,6 +675,7 @@ abstract interface class Future<T> {
+     }
+ 
+     for (var future in futures) {
++      dependencies.add(future);
+       future.then(onValue, onError: onError);
+     }
+     return completer.future;
+@@ -760,6 +772,7 @@ abstract interface class Future<T> {
+           return;
+         }
+         if (result is Future<bool>) {
++          doneSignal._flaxPendingDependency = result;
+           result.then(nextIteration, onError: doneSignal._completeError);
+           return;
+         }
+diff --git a/sdk/lib/async/future_extensions.dart b/sdk/lib/async/future_extensions.dart
+index 0d0d59b5..4881417a 100644
+--- a/sdk/lib/async/future_extensions.dart
++++ b/sdk/lib/async/future_extensions.dart
+@@ -35,7 +35,7 @@ extension FutureIterable<T> on Iterable<Future<T>> {
+     @pragma('vm:awaiter-link')
+     final c = Completer<List<T>>.sync();
+ 
+-    _FutureResult._waitAll(results, (errors) {
++    _FutureResult._waitAll(results, c.future as _Future, (errors) {
+       if (errors == 0) {
+         c.complete([for (var r in results) r.value]);
+       } else {
+@@ -85,7 +85,7 @@ extension FutureRecord2<T1, T2> on (Future<T1>, Future<T2>) {
+     final v1 = _FutureResult<T1>($1);
+     final v2 = _FutureResult<T2>($2);
+ 
+-    _FutureResult._waitAll([v1, v2], (int errors) {
++    _FutureResult._waitAll([v1, v2], c.future as _Future, (int errors) {
+       if (errors == 0) {
+         c.complete((v1.value, v2.value));
+       } else {
+@@ -114,7 +114,7 @@ extension FutureRecord3<T1, T2, T3> on (Future<T1>, Future<T2>, Future<T3>) {
+     final v2 = _FutureResult<T2>($2);
+     final v3 = _FutureResult<T3>($3);
+ 
+-    _FutureResult._waitAll([v1, v2, v3], (int errors) {
++    _FutureResult._waitAll([v1, v2, v3], c.future as _Future, (int errors) {
+       if (errors == 0) {
+         c.complete((v1.value, v2.value, v3.value));
+       } else {
+@@ -145,7 +145,7 @@ extension FutureRecord4<T1, T2, T3, T4>
+     final v3 = _FutureResult<T3>($3);
+     final v4 = _FutureResult<T4>($4);
+ 
+-    _FutureResult._waitAll([v1, v2, v3, v4], (int errors) {
++    _FutureResult._waitAll([v1, v2, v3, v4], c.future as _Future, (int errors) {
+       if (errors == 0) {
+         c.complete((v1.value, v2.value, v3.value, v4.value));
+       } else {
+@@ -181,7 +181,7 @@ extension FutureRecord5<T1, T2, T3, T4, T5>
+     final v4 = _FutureResult<T4>($4);
+     final v5 = _FutureResult<T5>($5);
+ 
+-    _FutureResult._waitAll([v1, v2, v3, v4, v5], (int errors) {
++    _FutureResult._waitAll([v1, v2, v3, v4, v5], c.future as _Future, (int errors) {
+       if (errors == 0) {
+         c.complete((v1.value, v2.value, v3.value, v4.value, v5.value));
+       } else {
+@@ -239,7 +239,7 @@ extension FutureRecord6<T1, T2, T3, T4, T5, T6>
+     final v5 = _FutureResult<T5>($5);
+     final v6 = _FutureResult<T6>($6);
+ 
+-    _FutureResult._waitAll([v1, v2, v3, v4, v5, v6], (int errors) {
++    _FutureResult._waitAll([v1, v2, v3, v4, v5, v6], c.future as _Future, (int errors) {
+       if (errors == 0) {
+         c.complete((
+           v1.value,
+@@ -309,7 +309,7 @@ extension FutureRecord7<T1, T2, T3, T4, T5, T6, T7>
+     final v6 = _FutureResult<T6>($6);
+     final v7 = _FutureResult<T7>($7);
+ 
+-    _FutureResult._waitAll([v1, v2, v3, v4, v5, v6, v7], (int errors) {
++    _FutureResult._waitAll([v1, v2, v3, v4, v5, v6, v7], c.future as _Future, (int errors) {
+       if (errors == 0) {
+         c.complete((
+           v1.value,
+@@ -385,7 +385,7 @@ extension FutureRecord8<T1, T2, T3, T4, T5, T6, T7, T8>
+     final v7 = _FutureResult<T7>($7);
+     final v8 = _FutureResult<T8>($8);
+ 
+-    _FutureResult._waitAll([v1, v2, v3, v4, v5, v6, v7, v8], (int errors) {
++    _FutureResult._waitAll([v1, v2, v3, v4, v5, v6, v7, v8], c.future as _Future, (int errors) {
+       if (errors == 0) {
+         c.complete((
+           v1.value,
+@@ -467,7 +467,7 @@ extension FutureRecord9<T1, T2, T3, T4, T5, T6, T7, T8, T9>
+     final v8 = _FutureResult<T8>($8);
+     final v9 = _FutureResult<T9>($9);
+ 
+-    _FutureResult._waitAll([v1, v2, v3, v4, v5, v6, v7, v8, v9], (int errors) {
++    _FutureResult._waitAll([v1, v2, v3, v4, v5, v6, v7, v8, v9], c.future as _Future, (int errors) {
+       if (errors == 0) {
+         c.complete((
+           v1.value,
+@@ -642,9 +642,11 @@ class _FutureResult<T> {
+   /// List must not be empty.
+   static void _waitAll(
+     List<_FutureResult> results,
++    _Future owner,
+     @pragma('vm:awaiter-link') void Function(int) whenReady,
+   ) {
+     assert(results.isNotEmpty);
++    owner._flaxPendingDependency = results;
+     var ready = 0;
+     var errors = 0;
+     void onReady(int error) {
+diff --git a/sdk/lib/async/future_impl.dart b/sdk/lib/async/future_impl.dart
+index bddb11da..615b74d1 100644
+--- a/sdk/lib/async/future_impl.dart
++++ b/sdk/lib/async/future_impl.dart
+@@ -332,6 +332,10 @@ class _Future<T> implements Future<T> {
+   /// listener callbacks used to create this future should be run in.
+   final _Zone _zone;
+ 
++  // A live consumer keeps its unresolved producer; settlement drops the edge.
++  @pragma("vm:entry-point")
++  Object? _flaxPendingDependency;
++
+   /// Either the result, a list of listeners or another future.
+   ///
+   /// The result of the future is either a value or an error.
+@@ -382,6 +386,7 @@ class _Future<T> implements Future<T> {
+ 
+   void _setChained(_Future source) {
+     assert(_mayAddListener);
++    _flaxPendingDependency = null;
+     _state = _stateChained | (_state & _stateIgnoreError);
+     _resultOrListeners = source;
+   }
+@@ -499,12 +504,14 @@ class _Future<T> implements Future<T> {
+   // This method is used by async/await.
+   void _setValue(T value) {
+     assert(!_isComplete); // But may have a completion pending.
++    _flaxPendingDependency = null;
+     _state = _stateValue;
+     _resultOrListeners = value;
+   }
+ 
+   void _setErrorObject(AsyncError error) {
+     assert(!_isComplete); // But may have a completion pending.
++    _flaxPendingDependency = null;
+     _state = _stateError | (_state & _stateIgnoreError);
+     _resultOrListeners = error;
+   }
+@@ -515,6 +522,7 @@ class _Future<T> implements Future<T> {
+   void _cloneResult(_Future source) {
+     assert(!_isComplete);
+     assert(source._isComplete);
++    _flaxPendingDependency = null;
+     _state =
+         (source._state & _completionStateMask) | (_state & _stateIgnoreError);
+     _resultOrListeners = source._resultOrListeners;
+@@ -522,6 +530,7 @@ class _Future<T> implements Future<T> {
+ 
+   void _addListener(_FutureListener listener) {
+     assert(listener._nextListener == null);
++    if (!_isComplete) listener.result._flaxPendingDependency = this;
+     if (_mayAddListener) {
+       listener._nextListener = _resultOrListeners;
+       _resultOrListeners = listener;
+@@ -610,6 +619,7 @@ class _Future<T> implements Future<T> {
+   void _chainForeignFuture(Future source) {
+     assert(!_isComplete);
+     assert(source is! _Future);
++    _flaxPendingDependency = source;
+ 
+     // Mark the target as chained (and as such half-completed).
+     _setPendingComplete();
+@@ -1033,6 +1043,7 @@ class _Future<T> implements Future<T> {
+     if (_isComplete) return _Future.immediate(this);
+     @pragma('vm:awaiter-link')
+     _Future<T> _future = _Future<T>();
++    _future._flaxPendingDependency = this;
+     Timer timer;
+     if (onTimeout == null) {
+       timer = Timer(timeLimit, () {
+diff --git a/sdk/lib/async/stream.dart b/sdk/lib/async/stream.dart
+index f400c841..e76a3361 100644
+--- a/sdk/lib/async/stream.dart
++++ b/sdk/lib/async/stream.dart
+@@ -247,12 +247,16 @@ abstract mixin class Stream<T> {
+       null,
+       null,
+     );
++    controller._flaxPendingDependency = future;
++    controller.onCancel = () => controller._flaxPendingDependency = null;
+     future.then(
+       (value) {
++        controller._flaxPendingDependency = null;
+         controller._add(value);
+         controller._closeUnchecked();
+       },
+       onError: (error, stackTrace) {
++        controller._flaxPendingDependency = null;
+         controller._addError(error, stackTrace);
+         controller._closeUnchecked();
+       },
+@@ -301,6 +305,9 @@ abstract mixin class Stream<T> {
+       null,
+       null,
+     );
++    final dependencies = <Future?>[];
++    controller._flaxPendingDependency = dependencies;
++    controller.onCancel = () => controller._flaxPendingDependency = null;
+     int count = 0;
+     // Declare these as variables holding closures instead of as
+     // function declarations.
+@@ -308,23 +315,37 @@ abstract mixin class Stream<T> {
+     void onValue(T value) {
+       if (!controller.isClosed) {
+         controller._add(value);
+-        if (--count == 0) controller._closeUnchecked();
++        if (--count == 0) {
++          controller._flaxPendingDependency = null;
++          controller._closeUnchecked();
++        }
+       }
+     }
+ 
+     void onError(Object error, StackTrace stack) {
+       if (!controller.isClosed) {
+         controller._addError(error, stack);
+-        if (--count == 0) controller._closeUnchecked();
++        if (--count == 0) {
++          controller._flaxPendingDependency = null;
++          controller._closeUnchecked();
++        }
+       }
+     }
+ 
+     // The futures are already running, so start listening to them immediately
+     // (instead of waiting for the stream to be listened on).
+     // If we wait, we might not catch errors in the futures in time.
++    if (futures is List) dependencies.length = futures.length;
++    var dependencyIndex = 0;
+     for (var future in futures) {
+       count++;
+-      future.then(onValue, onError: onError);
++      final dependency = future.then<void>(onValue, onError: onError);
++      if (dependencyIndex < dependencies.length) {
++        dependencies[dependencyIndex] = dependency;
++      } else {
++        dependencies.add(dependency);
++      }
++      dependencyIndex++;
+     }
+     // Use schedule microtask since controller is sync.
+     if (count == 0) scheduleMicrotask(controller.close);
+@@ -1066,6 +1087,7 @@ abstract mixin class Stream<T> {
+   Future<T> reduce(T combine(T previous, T element)) {
+     @pragma('vm:awaiter-link')
+     _Future<T> result = _Future<T>();
++    result._flaxPendingDependency = this;
+     bool seenFirst = false;
+     late T value;
+     StreamSubscription<T> subscription = this.listen(
+@@ -1120,6 +1142,7 @@ abstract mixin class Stream<T> {
+   /// ```
+   Future<S> fold<S>(S initialValue, S combine(S previous, T element)) {
+     _Future<S> result = _Future<S>();
++    result._flaxPendingDependency = this;
+     S value = initialValue;
+     StreamSubscription<T> subscription = this.listen(
+       null,
+@@ -1158,6 +1181,7 @@ abstract mixin class Stream<T> {
+   /// ```
+   Future<String> join([String separator = ""]) {
+     _Future<String> result = _Future<String>();
++    result._flaxPendingDependency = this;
+     StringBuffer buffer = StringBuffer();
+     bool first = true;
+     StreamSubscription<T> subscription = this.listen(
+@@ -1211,6 +1235,7 @@ abstract mixin class Stream<T> {
+   /// ```
+   Future<bool> contains(Object? needle) {
+     _Future<bool> future = _Future<bool>();
++    future._flaxPendingDependency = this;
+     StreamSubscription<T> subscription = this.listen(
+       null,
+       onError: future._completeError,
+@@ -1280,6 +1305,7 @@ abstract mixin class Stream<T> {
+   /// ```
+   Future<bool> every(bool test(T element)) {
+     _Future<bool> future = _Future<bool>();
++    future._flaxPendingDependency = this;
+     StreamSubscription<T> subscription = this.listen(
+       null,
+       onError: future._completeError,
+@@ -1322,6 +1348,7 @@ abstract mixin class Stream<T> {
+   /// ```
+   Future<bool> any(bool test(T element)) {
+     _Future<bool> future = _Future<bool>();
++    future._flaxPendingDependency = this;
+     StreamSubscription<T> subscription = this.listen(
+       null,
+       onError: future._completeError,
+@@ -1353,6 +1380,7 @@ abstract mixin class Stream<T> {
+   /// be reused after finding its length.
+   Future<int> get length {
+     _Future<int> future = _Future<int>();
++    future._flaxPendingDependency = this;
+     int count = 0;
+     this.listen(
+       (_) {
+@@ -1381,6 +1409,7 @@ abstract mixin class Stream<T> {
+   /// be reused after checking whether it is empty.
+   Future<bool> get isEmpty {
+     _Future<bool> future = _Future<bool>();
++    future._flaxPendingDependency = this;
+     StreamSubscription<T> subscription = this.listen(
+       null,
+       onError: future._completeError,
+@@ -1413,6 +1442,7 @@ abstract mixin class Stream<T> {
+   Future<List<T>> toList() {
+     List<T> result = <T>[];
+     _Future<List<T>> future = _Future<List<T>>();
++    future._flaxPendingDependency = this;
+     this.listen(
+       (T data) {
+         result.add(data);
+@@ -1444,6 +1474,7 @@ abstract mixin class Stream<T> {
+   Future<Set<T>> toSet() {
+     Set<T> result = Set<T>();
+     _Future<Set<T>> future = _Future<Set<T>>();
++    future._flaxPendingDependency = this;
+     this.listen(
+       (T data) {
+         result.add(data);
+@@ -1646,6 +1677,7 @@ abstract mixin class Stream<T> {
+   Future<T> get first {
+     @pragma('vm:awaiter-link')
+     _Future<T> future = _Future<T>();
++    future._flaxPendingDependency = this;
+     StreamSubscription<T> subscription = this.listen(
+       null,
+       onError: future._completeError,
+@@ -1674,6 +1706,7 @@ abstract mixin class Stream<T> {
+   Future<T> get last {
+     @pragma('vm:awaiter-link')
+     _Future<T> future = _Future<T>();
++    future._flaxPendingDependency = this;
+     late T result;
+     bool foundResult = false;
+     listen(
+@@ -1708,6 +1741,7 @@ abstract mixin class Stream<T> {
+   Future<T> get single {
+     @pragma('vm:awaiter-link')
+     _Future<T> future = _Future<T>();
++    future._flaxPendingDependency = this;
+     late T result;
+     bool foundResult = false;
+     StreamSubscription<T> subscription = this.listen(
+@@ -1779,6 +1813,7 @@ abstract mixin class Stream<T> {
+   Future<T> firstWhere(bool test(T element), {T orElse()?}) {
+     @pragma('vm:awaiter-link')
+     _Future<T> future = _Future();
++    future._flaxPendingDependency = this;
+     StreamSubscription<T> subscription = this.listen(
+       null,
+       onError: future._completeError,
+@@ -1833,6 +1868,7 @@ abstract mixin class Stream<T> {
+   Future<T> lastWhere(bool test(T element), {T orElse()?}) {
+     @pragma('vm:awaiter-link')
+     _Future<T> future = _Future();
++    future._flaxPendingDependency = this;
+     late T result;
+     bool foundResult = false;
+     StreamSubscription<T> subscription = this.listen(
+@@ -1901,6 +1937,7 @@ abstract mixin class Stream<T> {
+   Future<T> singleWhere(bool test(T element), {T orElse()?}) {
+     @pragma('vm:awaiter-link')
+     _Future<T> future = _Future<T>();
++    future._flaxPendingDependency = this;
+     late T result;
+     bool foundResult = false;
+     StreamSubscription<T> subscription = this.listen(
+@@ -1959,6 +1996,7 @@ abstract mixin class Stream<T> {
+     RangeError.checkNotNegative(index, "index");
+     @pragma('vm:awaiter-link')
+     _Future<T> result = _Future<T>();
++    result._flaxPendingDependency = this;
+     int elementIndex = 0;
+     StreamSubscription<T> subscription;
+     subscription = this.listen(
+diff --git a/sdk/lib/async/stream_controller.dart b/sdk/lib/async/stream_controller.dart
+index 23068cbe..819ab33c 100644
+--- a/sdk/lib/async/stream_controller.dart
++++ b/sdk/lib/async/stream_controller.dart
+@@ -426,6 +426,8 @@ abstract class _StreamControllerBase<T>
+ ///
+ /// Controls a stream that only supports a single controller.
+ abstract class _StreamController<T> implements _StreamControllerBase<T> {
++  @pragma("vm:entry-point")
++  Object? _flaxPendingDependency;
+   // The states are bit-flags. More than one can be set at a time.
+   //
+   // The "subscription state" goes through the states:
+@@ -610,7 +612,9 @@ abstract class _StreamController<T> implements _StreamControllerBase<T> {
+   Future<void> get done => _ensureDoneFuture();
+ 
+   Future<void> _ensureDoneFuture() =>
+-      _doneFuture ??= _isCanceled ? Future._nullFuture : _Future<void>();
++      _doneFuture ??= _isCanceled
++          ? Future._nullFuture
++          : (_Future<void>().._flaxPendingDependency = this);
+ 
+   /// Send or enqueue a data event.
+   void add(T value) {
+@@ -930,7 +934,9 @@ class _AddStreamState<T> {
+             : controller._addError,
+         onDone: controller._close,
+         cancelOnError: cancelOnError,
+-      );
++      ) {
++    addStreamFuture._flaxPendingDependency = this;
++  }
+ 
+   static makeErrorHandler(_EventSink controller) => (Object e, StackTrace s) {
+     controller._addError(e, s);
+diff --git a/sdk/lib/async/stream_impl.dart b/sdk/lib/async/stream_impl.dart
+index 9bb5a9a9..80eca234 100644
+--- a/sdk/lib/async/stream_impl.dart
++++ b/sdk/lib/async/stream_impl.dart
+@@ -252,6 +252,7 @@ class _BufferingStreamSubscription<T>
+     }
+     // Overwrite the onDone and onError handlers.
+     _Future<E> result = new _Future<E>();
++    result._flaxPendingDependency = this;
+     _onDone = () {
+       result._complete(resultValue);
+     };
+@@ -791,6 +792,7 @@ class _DoneStreamSubscription<T> implements StreamSubscription<T> {
+       resultValue = futureValue;
+     }
+     _Future<E> result = _Future<E>();
++    result._flaxPendingDependency = this;
+     if (!_isDone(_state)) {
+       _onDone = _zone.registerCallback(() {
+         result._completeWithValue(resultValue);
+@@ -1043,6 +1045,7 @@ class _StreamIterator<T> implements StreamIterator<T> {
+     if (subscription != null) {
+       if (_hasValue) {
+         var future = new _Future<bool>();
++        future._flaxPendingDependency = this;
+         _stateData = future;
+         _hasValue = false;
+         subscription.resume();
+@@ -1064,6 +1067,7 @@ class _StreamIterator<T> implements StreamIterator<T> {
+     if (stateData != null) {
+       Stream<T> stream = stateData as dynamic;
+       var future = new _Future<bool>();
++      future._flaxPendingDependency = this;
+       _stateData = future;
+       // The `listen` call may invoke user code, and it might try to emit
+       // events.
+diff --git a/runtime/include/dart_flax_api.h b/runtime/include/dart_flax_api.h
+new file mode 100644
+index 00000000..554668f1
+--- /dev/null
++++ b/runtime/include/dart_flax_api.h
+@@ -0,0 +1,47 @@
++// Experimental Flax cross-heap tracing. Not part of the public Dart API.
++#ifndef RUNTIME_INCLUDE_DART_FLAX_API_H_
++#define RUNTIME_INCLUDE_DART_FLAX_API_H_
++#include "dart_api.h"
++#ifdef __cplusplus
++extern "C" {
++#endif
++// Valid only during the collector callback, on its owning thread. No Dart
++// execution, heap allocation, ordinary Dart API calls, or retained context.
++typedef struct {
++  void* context;
++  bool (*is_marked)(void*, Dart_WeakPersistentHandle);
++  void (*mark)(void*, Dart_WeakPersistentHandle);
++  Dart_WeakPersistentHandle (*next_marked_origin)(void*);
++} Dart_FlaxGC;
++typedef void (*Dart_FlaxCollector)(void*, const Dart_FlaxGC*);
++DART_EXPORT bool Dart_FlaxSetCollector(Dart_FlaxCollector collector,
++                                       void* peer);
++DART_EXPORT bool Dart_FlaxRegisterHandle(Dart_WeakPersistentHandle handle,
++                                         bool is_origin);
++DART_EXPORT void Dart_FlaxSetCollectionRequest(void (*request)(void*));
++// Controlled GC for this experiment, separate from automatic allocation GC.
++DART_EXPORT void Dart_FlaxCollect(bool young, bool compact);
++// Pin a writable Uint8List (or view) until its last native buffer owner releases
++// it. Pin/view calls require the owning isolate. Release runs on that isolate,
++// or on any thread after isolate shutdown has retired the root.
++typedef struct {
++  void* token;
++  void* data;
++  intptr_t byte_length;
++  intptr_t offset;
++  intptr_t length;
++} Dart_FlaxBuffer;
++DART_EXPORT Dart_Handle Dart_FlaxPinUint8List(Dart_Handle, Dart_FlaxBuffer*);
++DART_EXPORT void Dart_FlaxReleaseBuffer(void* token);
++DART_EXPORT Dart_Handle Dart_FlaxUint8ListView(void* token,
++                                              intptr_t offset,
++                                              intptr_t length);
++// Owning-isolate APIs. Errors are ordinary Dart API error handles.
++// Type parts: [display, nullable, library, declaration, children, shape, parents].
++DART_EXPORT Dart_Handle Dart_FlaxTypeParts(Dart_Handle type);
++DART_EXPORT Dart_Handle Dart_FlaxNullableType(Dart_Handle type);
++DART_EXPORT Dart_Handle Dart_FlaxInstantiate(Dart_Handle closure, Dart_Handle types);
++#ifdef __cplusplus
++}
++#endif
++#endif
