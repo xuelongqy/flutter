@@ -94,7 +94,7 @@ development signing and provisioning, verifies Dart AOT and the embedded Hermes 
 and installs the relocated application after source removal. iOS requires no JS JIT
 entitlement. These gates do not establish release distribution or Hermes GC/frame performance.
 
-Internal binding extension 7 includes the VM fix for recursive function bounds under
+Internal binding extension 8 includes the VM fix for recursive function bounds under
 an enclosing generic declaration. The VM only resolves type-parameter bounds for its
 `Never` normalization; expanding a nominal F-bound such as `Comparable<T>` would
 recurse indefinitely. Flax rejects older engines before loading these bindings.
@@ -136,3 +136,12 @@ property does not make the Dart assignment asynchronous. Native ABI 2 is unchang
 `experiments/cross_heap_gc` is the preserved standalone experiment. It is not
 the engine implementation or proof of real application acceptance. Real Flax
 regressions and acceptance evidence belong to the Flax checkout.
+
+
+Record transfer uses common VM `Dart_FlaxRecordFields` and `Dart_FlaxNewRecord`
+operations, independent of V8/Hermes. Typed construction validates the real field Types;
+a null target creates a runtime layout from sorted public field names. No per-layout
+Dart constructor or business Record peer is needed. The maintained Dart patch also marks
+referenced Record shapes as externally allocatable and synthetic fields as externally
+populated during AOT type-flow analysis. Compile the frontend from this source when
+building local engine tools; an old frontend may prune a native-only field getter.
