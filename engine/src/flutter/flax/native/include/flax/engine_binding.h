@@ -5,7 +5,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-#define FLAX_ENGINE_BINDING_VERSION 7
+#define FLAX_ENGINE_BINDING_VERSION 8
 
 /* These indices match FlaxBufferType. All views share the same byte lease. */
 enum FlaxBufferKind {
@@ -70,6 +70,10 @@ typedef struct FlaxEngineBindingApi {
   Dart_Handle (*nullable_type)(FlaxRuntime*, Dart_Handle type, FlaxError*);
   Dart_Handle (*instantiate)(FlaxRuntime*, Dart_Handle closure,
                               Dart_Handle types, FlaxError*);
+  /* Copies Record fields. A null type constructs a runtime-only named layout. */
+  Dart_Handle (*record_fields)(FlaxRuntime*, Dart_Handle record, FlaxError*);
+  Dart_Handle (*new_record)(FlaxRuntime*, Dart_Handle type, Dart_Handle names,
+                            Dart_Handle fields, FlaxError*);
 } FlaxEngineBindingApi;
 const FlaxEngineBindingApi* flax_engine_get_binding_api(uint32_t version);
 #ifdef __cplusplus

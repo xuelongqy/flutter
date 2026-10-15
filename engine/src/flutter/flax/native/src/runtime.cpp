@@ -1088,6 +1088,30 @@ Dart_Handle instantiate(FlaxRuntime* runtime, Dart_Handle closure,
   return error && error->code != FLAX_OK ? Dart_Null() : result;
 }
 
+Dart_Handle recordFields(FlaxRuntime* runtime,
+                         Dart_Handle value,
+                         FlaxError* error) {
+  Dart_Handle result = Dart_Null();
+  enter(runtime, error, [&] {
+    result = Dart_FlaxRecordFields(value);
+    checkDart(result);
+  });
+  return error && error->code != FLAX_OK ? Dart_Null() : result;
+}
+
+Dart_Handle newRecord(FlaxRuntime* runtime,
+                      Dart_Handle type,
+                      Dart_Handle names,
+                      Dart_Handle fields,
+                      FlaxError* error) {
+  Dart_Handle result = Dart_Null();
+  enter(runtime, error, [&] {
+    result = Dart_FlaxNewRecord(type, names, fields);
+    checkDart(result);
+  });
+  return error && error->code != FLAX_OK ? Dart_Null() : result;
+}
+
 const FlaxEngineBindingApi bindingApi{FLAX_ENGINE_BINDING_VERSION,
                                       sizeof(FlaxEngineBindingApi),
                                       registerMembers,
@@ -1099,7 +1123,9 @@ const FlaxEngineBindingApi bindingApi{FLAX_ENGINE_BINDING_VERSION,
                                       instanceType,
                                       typeParts,
                                       nullableType,
-                                      instantiate};
+                                      instantiate,
+                                      recordFields,
+                                      newRecord};
 
 const FlaxApi api{
     FLAX_ABI_VERSION, sizeof(FlaxApi), create,    destroy,      evaluate,
