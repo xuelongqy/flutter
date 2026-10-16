@@ -1290,7 +1290,7 @@ Future<String> _getDiffBaseRevision(ProcessManager processManager, Directory rep
 void _usage(ArgParser parser, {int exitCode = 1}) {
   stderr.writeln(
     'format.dart [--help] [--fix] [--all-files] '
-    '[--check <${formatCheckNames().join('|')}>]',
+    '[--base <git-ref>] [--check <${formatCheckNames().join('|')}>]',
   );
   stderr.writeln(parser.usage);
   exit(exitCode);
@@ -1347,13 +1347,14 @@ Future<int> main(List<String> arguments) async {
         'May be specified more than once to perform multiple types of checks. ',
   );
   parser.addFlag('verbose', help: 'Print verbose output.', defaultsTo: verbose);
+  parser.addOption('base', help: 'Compare the working tree to this Git revision without fetching.');
 
   late final ArgResults options;
   try {
     options = parser.parse(arguments);
   } on FormatException catch (e) {
     stderr.writeln('ERROR: $e');
-    _usage(parser, exitCode: 0);
+    _usage(parser);
   }
 
   verbose = options['verbose'] as bool;
@@ -1382,7 +1383,8 @@ Future<int> main(List<String> arguments) async {
   }
 
   const ProcessManager processManager = LocalProcessManager();
-  final String baseGitRef = await _getDiffBaseRevision(processManager, repoDir);
+  final String baseGitRef =
+      (options['base'] as String?) ?? await _getDiffBaseRevision(processManager, repoDir);
 
   var result = true;
   final checks = options['check'] as List<String>;
@@ -1412,6 +1414,7 @@ Future<int> main(List<String> arguments) async {
     }
   } on FormattingException catch (e) {
     message('ERROR: $e', type: MessageType.error);
+    result = false;
   }
 
   exit(result ? 0 : 1);
