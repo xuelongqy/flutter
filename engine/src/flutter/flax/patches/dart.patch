@@ -645,7 +645,7 @@ index 394ac210..85524a4b 100644
    DISALLOW_COPY_AND_ASSIGN(ApiState);
  };
 diff --git a/runtime/vm/heap/marker.cc b/runtime/vm/heap/marker.cc
-index f58905a0..02246323 100644
+index f58905a0..02f8f57c 100644
 --- a/runtime/vm/heap/marker.cc
 +++ b/runtime/vm/heap/marker.cc
 @@ -4,6 +4,9 @@
@@ -796,7 +796,7 @@ index f58905a0..02246323 100644
    ThreadBarrier* barrier = new ThreadBarrier(num_tasks, /*initial=*/1);
  
    ResetSlices();
-@@ -1324,6 +1403,39 @@ void GCMarker::MarkObjects(PageSpace* page_space) {
+@@ -1324,6 +1403,40 @@ void GCMarker::MarkObjects(PageSpace* page_space) {
    }
    visitors_[0]->Adopt(&global_list_);
    isolate_group_->safepoint_handler()->RunTasks(&tasks);
@@ -823,6 +823,7 @@ index f58905a0..02246323 100644
 +      // Never enter a JS isolate from another Dart thread. This conservative
 +      // fallback defers cross-heap cycle collection to an owning-thread major.
 +      api->VisitFlaxHandles(visitor);
++      visitor->FinishedRoots();
 +      visitor->DrainFlaxMarking();
 +      api->RequestFlaxCollection();
 +    }
