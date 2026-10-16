@@ -80,10 +80,18 @@ class PrePushCommand extends Command<bool> {
     io.stdout.writeln('Starting formatting checks.');
     final sw = Stopwatch()..start();
     final ext = io.Platform.isWindows ? '.bat' : '.sh';
+    final io.ProcessResult tracking = await io.Process.run('git', <String>[
+      'rev-parse',
+      '--verify',
+      '@{upstream}^{commit}',
+    ], workingDirectory: flutterRoot);
     final bool result = await _runCheck(
       flutterRoot,
       path.join(flutterRoot, 'ci', 'format$ext'),
-      <String>[],
+      <String>[
+        // Fork pushes should not recheck every change since upstream main.
+        if (tracking.exitCode == 0) '--base=${(tracking.stdout as String).trim()}',
+      ],
       'Formatting check',
       verbose: verbose,
     );

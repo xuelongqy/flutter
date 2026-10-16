@@ -15,14 +15,29 @@ are the implementation of the different hooks, for example
 `bin/main.dart pre-push ...`. Since the Dart program itself isn't an executable,
 these commands are invoked by small Python wrapper scripts. These wrapper
 scripts have the names that `git` will look for.
+The pre-push wrapper uses standard Python 3 and needs no `vpython3` on PATH.
 
 ## pre-push
 
 This hooks runs when pushing commits to a remote branch, for example to
 create or update a pull request: `git push origin my-local-branch`.
 
-The `pre-push` hook runs `ci/clang_tidy.sh`, `ci/pylint.sh` and `ci/format.sh`.
-`ci/analyze.sh` and `ci/licenses.sh` are more expensive and are not run.
+The `pre-push` hook runs `ci/format.sh`. It checks Dart, C++/Objective-C/shader,
+GN, Java and Python formatting, trailing whitespace and header guards. Clang-tidy
+is optional and enabled with `PRE_PUSH_CLANG_TIDY`; analysis and license checks
+are not run.
+
+When the current branch has a remote-tracking upstream, the hook passes that
+revision as the formatter's `--base`. For a maintained fork such as `flax/main`,
+this checks changes since `origin/flax/main` instead of the entire fork history
+since Flutter's upstream `main`. The hook uses the local tracking ref; ordinary
+fetches and successful pushes keep it current. Without a tracking branch, the
+formatter retains its original upstream-main fallback.
+
+Formatting still checks the working tree, including staged and unstaged changes.
+Run the same scope manually with `ci/format.sh --base <git-ref>`. An explicit base
+does not fetch from the network; an unknown revision or failed check blocks the
+push. No formatter check is disabled for maintained branches.
 
 ### Adding new pre-push checks
 

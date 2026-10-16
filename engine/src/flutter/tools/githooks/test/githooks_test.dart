@@ -5,9 +5,76 @@
 import 'dart:io' as io;
 
 import 'package:githooks/githooks.dart';
+import 'package:path/path.dart' as path;
 import 'package:test/test.dart';
 
 void main() {
+  group('pre-push formatting scope', () {
+    late io.Directory checkout;
+    late io.File arguments;
+
+    void git(List<String> args) {
+      final io.ProcessResult result = io.Process.runSync(
+        'git',
+        args,
+        workingDirectory: checkout.path,
+      );
+      expect(result.exitCode, 0, reason: '${result.stdout}\n${result.stderr}');
+    }
+
+    setUp(() {
+      checkout = io.Directory.systemTemp.createTempSync('githooks push ');
+      arguments = io.File(path.join(checkout.path, 'arguments.txt'));
+      git(['init', '--initial-branch=topic']);
+      git([
+        '-c',
+        'user.name=Hook test',
+        '-c',
+        'user.email=hook@example.invalid',
+        'commit',
+        '--allow-empty',
+        '-m',
+        'base',
+      ]);
+      final script = io.File(
+        path.join(checkout.path, 'ci', io.Platform.isWindows ? 'format.bat' : 'format.sh'),
+      );
+      script.parent.createSync();
+      script.writeAsStringSync(
+        io.Platform.isWindows
+            ? '@echo off\r\n>arguments.txt echo(%*\r\nif exist fail exit /b 1\r\nexit /b 0\r\n'
+            : '#!/bin/sh\nprintf \'%s\\n\' "\$@" > arguments.txt\n[ ! -f fail ]\n',
+      );
+      if (!io.Platform.isWindows) {
+        expect(io.Process.runSync('chmod', ['+x', script.path]).exitCode, 0);
+      }
+    });
+
+    tearDown(() => checkout.deleteSync(recursive: true));
+
+    test('uses the tracked fork branch instead of upstream main', () async {
+      git(['remote', 'add', 'origin', '.']);
+      git(['update-ref', 'refs/remotes/origin/flax/main', 'HEAD']);
+      git(['branch', '--set-upstream-to=origin/flax/main']);
+      final String base = io.Process.runSync('git', [
+        'rev-parse',
+        'HEAD',
+      ], workingDirectory: checkout.path).stdout.toString().trim();
+      expect(await run(['pre-push', '--flutter', checkout.path]), 0);
+      expect(arguments.readAsStringSync().trim(), '--base=$base');
+    });
+
+    test('retains the formatter default without a tracking branch', () async {
+      expect(await run(['pre-push', '--flutter', checkout.path]), 0);
+      expect(arguments.readAsStringSync().trim(), isEmpty);
+    });
+
+    test('a formatting failure still blocks a push', () async {
+      io.File(path.join(checkout.path, 'fail')).writeAsStringSync('');
+      expect(await run(['pre-push', '--flutter', checkout.path]), 1);
+    });
+  });
+
   test('Fails gracefully without a command', () async {
     int? result;
     try {
