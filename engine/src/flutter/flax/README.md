@@ -113,7 +113,9 @@ collection; Flutter
 idle notifications check Dart ownership without marking the JS heap changed.
 Requests are batched on the UI thread. GC callbacks never invoke business code.
 Closing a Context releases only its edges; isolate shutdown cleans remaining
-runtimes before Dart handles become invalid.
+runtimes before Dart handles become invalid. A Dart origin may expire while its JS
+peer still retains another Dart target. Conditional marking ignores finalized, still
+registered weak handles; it never resurrects them or accepts unregistered handles.
 
 Hermes has no V8-style Context API. Each session therefore owns a Hermes VM, while one
 UI-isolate coordinator follows conditional references across all of them to a fixed
