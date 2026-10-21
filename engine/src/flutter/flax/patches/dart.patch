@@ -2497,3 +2497,82 @@ index 00000000..371a80ea
 +    changedStructureNotifier: changedStructureNotifier,
 +  ).run();
 +}
+diff --git a/pkg/kernel/lib/const_finder.dart b/pkg/kernel/lib/const_finder.dart
+index 6a6576ad..ab9d3dcf 100644
+--- a/pkg/kernel/lib/const_finder.dart
++++ b/pkg/kernel/lib/const_finder.dart
+@@ -12,6 +12,7 @@ class _ConstVisitor extends RecursiveVisitor {
+     this.className,
+     this.annotationClassLibraryUri,
+     this.annotationClassName,
++    this.nonConstantFactoryPragma,
+   ) : _visitedInstances = <String>{},
+       constantInstances = <Map<String, dynamic>>[],
+       nonConstantLocations = <Map<String, dynamic>>[];
+@@ -28,6 +29,8 @@ class _ConstVisitor extends RecursiveVisitor {
+   final List<Map<String, dynamic>> nonConstantLocations;
+
+   bool inIgnoredClass = false;
++  final String? nonConstantFactoryPragma;
++  bool inNonConstantFactory = false;
+
+   /// Whether or not we are currently within the declaration of the target
+   /// class.
+@@ -89,6 +92,26 @@ class _ConstVisitor extends RecursiveVisitor {
+
+   @override
+   void visitProcedure(Procedure node) {
++    final bool previousFactory = inNonConstantFactory;
++    inNonConstantFactory =
++        nonConstantFactoryPragma != null &&
++        node.annotations.any((Expression annotation) {
++          if (annotation is! ConstantExpression ||
++              annotation.constant is! InstanceConstant)
++            return false;
++          final InstanceConstant value =
++              annotation.constant as InstanceConstant;
++          return value.classNode.name == 'pragma' &&
++              value.classNode.enclosingLibrary.importUri.toString() ==
++                  'dart:core' &&
++              value.fieldValues.entries.any(
++                (entry) =>
++                    entry.key.asField.name.text == 'name' &&
++                    entry.value is StringConstant &&
++                    (entry.value as StringConstant).value ==
++                        nonConstantFactoryPragma,
++              );
++        });
+     // TODO(johnniwinther): Use lowering predicates.
+     final bool isTearOff =
+         node.isStatic &&
+@@ -98,6 +121,7 @@ class _ConstVisitor extends RecursiveVisitor {
+       inTargetTearOff = true;
+     }
+     super.visitProcedure(node);
++    inNonConstantFactory = previousFactory;
+     inTargetTearOff = false;
+   }
+
+@@ -116,7 +140,7 @@ class _ConstVisitor extends RecursiveVisitor {
+   @override
+   void visitConstructorInvocation(ConstructorInvocation node) {
+     final Class parentClass = node.target.parent! as Class;
+-    if (!inTargetTearOff && _matches(parentClass)) {
++    if (!inTargetTearOff && !inNonConstantFactory && _matches(parentClass)) {
+       final Location location = node.location!;
+       nonConstantLocations.add(<String, dynamic>{
+         'file': location.file.toString(),
+@@ -193,11 +217,13 @@ class ConstFinder {
+     required String className,
+     String? annotationClassLibraryUri,
+     String? annotationClassName,
++    String? nonConstantFactoryPragma,
+   }) : _visitor = _ConstVisitor(
+          classLibraryUri,
+          className,
+          annotationClassLibraryUri,
+          annotationClassName,
++         nonConstantFactoryPragma,
+        );
+
+   final _ConstVisitor _visitor;

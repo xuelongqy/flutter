@@ -16,6 +16,7 @@
 namespace flutter {
 
 class Paragraph;
+class FlaxFontCollection;
 
 class ParagraphBuilder : public RefCountedDartWrappable<ParagraphBuilder> {
   DEFINE_WRAPPERTYPEINFO();
@@ -30,7 +31,8 @@ class ParagraphBuilder : public RefCountedDartWrappable<ParagraphBuilder> {
                      double fontSize,
                      double height,
                      const std::u16string& ellipsis,
-                     const std::string& locale);
+                     const std::string& locale,
+                     Dart_Handle font_collection_handle);
 
   ~ParagraphBuilder() override;
 
@@ -76,7 +78,8 @@ class ParagraphBuilder : public RefCountedDartWrappable<ParagraphBuilder> {
                             double fontSize,
                             double height,
                             const std::u16string& ellipsis,
-                            const std::string& locale);
+                            const std::string& locale,
+                            FlaxFontCollection* font_collection);
 
   std::unique_ptr<txt::ParagraphBuilder> m_paragraph_builder_;
 };

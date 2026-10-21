@@ -6,7 +6,15 @@
 library;
 
 import 'dart:math' as math;
-import 'dart:ui' as ui show BoxHeightStyle, BoxWidthStyle, LineMetrics, SemanticsInputType, TextBox;
+import 'dart:ui'
+    as ui
+    show
+        BoxHeightStyle,
+        BoxWidthStyle,
+        FlaxFontCollection,
+        LineMetrics,
+        SemanticsInputType,
+        TextBox;
 
 import 'package:characters/characters.dart';
 import 'package:flutter/foundation.dart';
@@ -288,6 +296,7 @@ class RenderEditable extends RenderBox
     TextAlign textAlign = TextAlign.start,
     Color? cursorColor,
     Color? backgroundCursorColor,
+    ui.FlaxFontCollection? fontCollection,
     ValueNotifier<bool>? showCursor,
     bool? hasFocus,
     required LayerLink startHandleLayerLink,
@@ -349,6 +358,7 @@ class RenderEditable extends RenderBox
        assert(cursorWidth >= 0.0),
        assert(cursorHeight == null || cursorHeight >= 0.0),
        _textPainter = TextPainter(
+         fontCollection: fontCollection,
          text: text,
          textAlign: textAlign,
          textDirection: textDirection,
@@ -778,6 +788,25 @@ class RenderEditable extends RenderBox
   ///
   /// In order to get the plain text representation, use [plainText].
   InlineSpan? get text => _textPainter.text;
+
+  /// Private font domain supplied by the embedding resource scope.
+  @internal
+  ui.FlaxFontCollection? get fontCollection => _textPainter.fontCollection;
+  int? _fontCollectionRevision;
+
+  /// Updates layout when the domain or its registered fonts change.
+  @internal
+  set fontCollection(ui.FlaxFontCollection? value) {
+    final int revision = value?.revision ?? 0;
+    if (identical(value, _textPainter.fontCollection) && _fontCollectionRevision == revision) {
+      return;
+    }
+    _fontCollectionRevision = revision;
+    _textPainter.fontCollection = value;
+    _textIntrinsicsCache?.fontCollection = value;
+    markNeedsLayout();
+  }
+
   final TextPainter _textPainter;
   AttributedString? _cachedAttributedValue;
   List<InlineSpanSemanticsInformation>? _cachedCombinedSemanticsInfos;
@@ -796,6 +825,7 @@ class RenderEditable extends RenderBox
   TextPainter? _textIntrinsicsCache;
   TextPainter get _textIntrinsics {
     return (_textIntrinsicsCache ??= TextPainter())
+      ..fontCollection = _textPainter.fontCollection
       ..text = _textPainter.text
       ..textAlign = _textPainter.textAlign
       ..textDirection = _textPainter.textDirection

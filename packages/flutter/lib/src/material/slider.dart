@@ -11,6 +11,7 @@ library;
 
 import 'dart:async';
 import 'dart:math' as math;
+import 'dart:ui' as ui show FlaxFontCollection;
 
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/foundation.dart';
@@ -1127,12 +1128,13 @@ class _SliderRenderObjectWidget extends LeafRenderObjectWidget {
       hovering: hovering,
       gestureSettings: MediaQuery.gestureSettingsOf(context),
       allowedInteraction: allowedInteraction,
-    );
+    ).._setFontCollection(DefaultFontCollection.maybeOf(context));
   }
 
   @override
   void updateRenderObject(BuildContext context, _RenderSlider renderObject) {
     renderObject
+      .._setFontCollection(DefaultFontCollection.maybeOf(context))
       // We should update the `divisions` ahead of `value`, because the `value`
       // setter dependent on the `divisions`.
       ..divisions = divisions
@@ -1515,6 +1517,17 @@ class _RenderSlider extends RenderBox with RelayoutWhenSystemFontsChangeMixin {
         // Matches Android implementation of material slider.
         return 0.05;
     }
+  }
+
+  int _fontCollectionRevision = 0;
+  void _setFontCollection(ui.FlaxFontCollection? value) {
+    final int revision = value?.revision ?? 0;
+    if (identical(value, _labelPainter.fontCollection) && revision == _fontCollectionRevision) {
+      return;
+    }
+    _fontCollectionRevision = revision;
+    _labelPainter.fontCollection = value;
+    _updateLabelPainter();
   }
 
   void _updateLabelPainter() {

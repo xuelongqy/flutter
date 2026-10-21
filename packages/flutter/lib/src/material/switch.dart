@@ -1017,9 +1017,10 @@ class _MaterialSwitchState extends State<_MaterialSwitch>
         widget.focusColor ??
         switchTheme.overlayColor?.resolve(focusedStates) ??
         (applyCupertinoTheme
-            ? HSLColor.fromColor(
-                cupertinoPrimaryColor.withOpacity(0.80),
-              ).withLightness(0.69).withSaturation(0.835).toColor()
+            ? HSLColor.fromColor(cupertinoPrimaryColor.withOpacity(0.80))
+                  .withLightness(0.69)
+                  .withSaturation(0.835)
+                  .toColor()
             : null) ??
         defaults.overlayColor!.resolve(focusedStates)!;
 
@@ -1088,6 +1089,7 @@ class _MaterialSwitchState extends State<_MaterialSwitch>
             autofocus: widget.autofocus,
             size: widget.size,
             painter: _painter
+              .._textPainter.fontCollection = DefaultFontCollection.maybeOf(context)
               ..position = position
               ..reaction = reaction
               ..reactionFocusFade = reactionFocusFade

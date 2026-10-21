@@ -703,15 +703,16 @@ class _SnackBarState extends State<SnackBar> {
             icon: const Icon(Icons.close),
             iconSize: 24.0,
             color: widget.closeIconColor ?? snackBarTheme.closeIconColor ?? defaults.closeIconColor,
-            onPressed: () => ScaffoldMessenger.of(
-              context,
-            ).hideCurrentSnackBar(reason: SnackBarClosedReason.dismiss),
+            onPressed: () =>
+                ScaffoldMessenger.of(context)
+                    .hideCurrentSnackBar(reason: SnackBarClosedReason.dismiss),
             tooltip: MaterialLocalizations.of(context).closeButtonTooltip,
           )
         : null;
 
     // Calculate combined width of Action, Icon, and their padding, if they are present.
     final actionTextPainter = TextPainter(
+      fontCollection: DefaultFontCollection.maybeOf(context),
       text: TextSpan(
         text: widget.action?.label ?? '',
         style: Theme.of(context).textTheme.labelLarge,

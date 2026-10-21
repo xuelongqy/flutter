@@ -11,6 +11,7 @@ import 'dart:ui'
     show
         BoxHeightStyle,
         BoxWidthStyle,
+        FlaxFontCollection,
         GlyphInfo,
         LineMetrics,
         Paragraph,
@@ -32,6 +33,7 @@ import 'text_span.dart';
 import 'text_style.dart';
 
 export 'dart:ui' show LineMetrics;
+
 export 'package:flutter/services.dart' show TextRange, TextSelection;
 
 /// The default font size if none is specified.
@@ -610,6 +612,7 @@ class TextPainter {
     StrutStyle? strutStyle,
     TextWidthBasis textWidthBasis = TextWidthBasis.parent,
     TextHeightBehavior? textHeightBehavior,
+    ui.FlaxFontCollection? fontCollection,
   }) : assert(text == null || text.debugAssertIsValid()),
        assert(maxLines == null || maxLines > 0),
        assert(
@@ -627,8 +630,28 @@ class TextPainter {
        _locale = locale,
        _strutStyle = strutStyle,
        _textWidthBasis = textWidthBasis,
-       _textHeightBehavior = textHeightBehavior {
+       _textHeightBehavior = textHeightBehavior,
+       _fontCollection = fontCollection,
+       _fontCollectionRevision = fontCollection?.revision ?? 0 {
     assert(debugMaybeDispatchCreated('painting', 'TextPainter', this));
+  }
+
+  /// Private font lookup domain. Null uses the host's public fonts.
+  @internal
+  ui.FlaxFontCollection? get fontCollection => _fontCollection;
+  ui.FlaxFontCollection? _fontCollection;
+  int _fontCollectionRevision;
+  @internal
+  set fontCollection(ui.FlaxFontCollection? value) {
+    final int revision = value?.revision ?? 0;
+    if (identical(value, _fontCollection) && revision == _fontCollectionRevision) {
+      return;
+    }
+    _fontCollection = value;
+    _fontCollectionRevision = revision;
+    _layoutTemplate?.dispose();
+    _layoutTemplate = null;
+    markNeedsLayout();
   }
 
   /// Computes the width of a configured [TextPainter].
@@ -656,6 +679,7 @@ class TextPainter {
     StrutStyle? strutStyle,
     TextWidthBasis textWidthBasis = TextWidthBasis.parent,
     TextHeightBehavior? textHeightBehavior,
+    ui.FlaxFontCollection? fontCollection,
     double minWidth = 0.0,
     double maxWidth = double.infinity,
   }) {
@@ -676,6 +700,7 @@ class TextPainter {
       strutStyle: strutStyle,
       textWidthBasis: textWidthBasis,
       textHeightBehavior: textHeightBehavior,
+      fontCollection: fontCollection,
     )..layout(minWidth: minWidth, maxWidth: maxWidth);
 
     try {
@@ -710,6 +735,7 @@ class TextPainter {
     StrutStyle? strutStyle,
     TextWidthBasis textWidthBasis = TextWidthBasis.parent,
     TextHeightBehavior? textHeightBehavior,
+    ui.FlaxFontCollection? fontCollection,
     double minWidth = 0.0,
     double maxWidth = double.infinity,
   }) {
@@ -730,6 +756,7 @@ class TextPainter {
       strutStyle: strutStyle,
       textWidthBasis: textWidthBasis,
       textHeightBehavior: textHeightBehavior,
+      fontCollection: fontCollection,
     )..layout(minWidth: minWidth, maxWidth: maxWidth);
 
     try {
@@ -1103,6 +1130,7 @@ class TextPainter {
   ui.Paragraph _createLayoutTemplate() {
     final builder = ui.ParagraphBuilder(
       _createParagraphStyle(TextAlign.left),
+      fontCollection: _fontCollection,
     ); // direction doesn't matter, text is just a space
     final ui.TextStyle? textStyle = text?.style?.getTextStyle(textScaler: textScaler);
     if (textStyle != null) {
@@ -1199,7 +1227,7 @@ class TextPainter {
   // Creates a ui.Paragraph using the current configurations in this class and
   // assign it to _paragraph.
   ui.Paragraph _createParagraph(InlineSpan text) {
-    final builder = ui.ParagraphBuilder(_createParagraphStyle());
+    final builder = ui.ParagraphBuilder(_createParagraphStyle(), fontCollection: _fontCollection);
     text.build(builder, textScaler: textScaler, dimensions: _placeholderDimensions);
     assert(() {
       _debugMarkNeedsLayoutCallStack = null;
@@ -1578,10 +1606,7 @@ class TextPainter {
     }
 
     final (int offset, bool anchorToLeadingEdge) = switch (position) {
-      TextPosition(offset: 0) => (
-        0,
-        true,
-      ), // As a special case, always anchor to the leading edge of the first grapheme regardless of the affinity.
+      TextPosition(offset: 0) => (0, true), // As a special case, always anchor to the leading edge of the first grapheme regardless of the affinity.
       TextPosition(:final int offset, affinity: TextAffinity.downstream) => (offset, true),
       TextPosition(:final int offset, affinity: TextAffinity.upstream)
           when _isNewlineAtOffset(offset - 1) =>

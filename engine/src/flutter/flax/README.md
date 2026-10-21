@@ -33,7 +33,11 @@ Use the official local-engine flow from an application checkout:
 ```
 
 For profile or release, build the matching mode and select `flax_mac_profile_arm64`
-or `flax_mac_release_arm64` for both engine flags. The macOS SDK uses system libc++;
+or `flax_mac_release_arm64` for both engine flags. The macOS build also produces the
+matching const-finder snapshot. Its managed `flax:runtime-icon-data` factory exception
+keeps business-owned icon fonts separate from host constant-font subsetting; ordinary
+unmarked dynamic IconData is still rejected. Rebuild this helper and refresh the Flutter
+tools snapshot after changing their sources. The macOS SDK uses system libc++;
 `flax_system_cxx` makes the engine use matching headers and ABI. The build
 GN selects Xcode's linker for its SDK's TAPI format. Tool pins remain intact.
 Framework dependencies are copied into `FlutterMacOS.framework/Versions/A/Libraries`;
@@ -174,3 +178,29 @@ Dart constructor or business Record peer is needed. The maintained Dart patch al
 referenced Record shapes as externally allocatable and synthetic fields as externally
 populated during AOT type-flow analysis. Compile the frontend from this source when
 building local engine tools; an old frontend may prune a native-only field getter.
+
+## Session-private fonts
+
+The host-only dart:ui extension `FlaxFontCollection` owns a private dynamic provider
+and SkParagraph collection. `addFont(bytes, family: name)` registers a logical name in
+that domain. Pass it to `ParagraphBuilder(..., fontCollection: domain)`; ordinary host
+ParagraphBuilder and FontLoader keep their public behavior. Public asset, test and
+system managers are reused, and later host registrations refresh private lookup caches.
+
+The root FontCollection keeps weak content-cache entries. A checksum bucket plus an
+exact byte comparison shares parsed typefaces for equal private font files. Family
+registrations remain private. Disposing a Dart collection releases its owner; live
+Paragraphs/providers retain the source until their final retirement. The embedding
+runtime must retain a domain for native subtrees that outlive their JS Session.
+
+Final source retirement marks Impeller glyph atlases stale. A raster boundary replaces
+atlases and purges unused strike/typeface caches without invalidating in-flight draws.
+Closing one owner of still-shared source data does not retire that source. Other live
+fonts can require glyph cache warmup after retirement of a different source. This is
+not an immediate resident-memory purge. `flaxScopedFontStats` reports private
+collections, aliases, unique source objects and source bytes.
+
+The superseded global managed-font registration API is removed. Host family names have
+no reserved Flax prefix. The build helper installs generated sky_engine declarations
+for analyzer/Pub. Rebuild matching Debug/Release engines whenever the dart:ui interface
+changes.

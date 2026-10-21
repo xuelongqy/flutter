@@ -247,9 +247,8 @@ class _DialTimePickerHeader extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     assert(_debugDialTimePickerEntryMode(context));
-    final TimeOfDayFormat timeOfDayFormat = MaterialLocalizations.of(
-      context,
-    ).timeOfDayFormat(alwaysUse24HourFormat: _TimePickerModel.use24HourFormatOf(context));
+    final TimeOfDayFormat timeOfDayFormat = MaterialLocalizations.of(context)
+        .timeOfDayFormat(alwaysUse24HourFormat: _TimePickerModel.use24HourFormatOf(context));
 
     final _TimePickerDefaults defaultTheme = _TimePickerModel.defaultThemeOf(context);
     final Orientation orientation = _TimePickerModel.orientationOf(context);
@@ -1504,6 +1503,7 @@ class _DialState extends State<_Dial> with SingleTickerProviderStateMixin {
       value: value,
       inner: inner,
       painter: TextPainter(
+        fontCollection: DefaultFontCollection.maybeOf(context),
         text: TextSpan(style: textStyle, text: label),
         textDirection: TextDirection.ltr,
         textScaler: MediaQuery.textScalerOf(context).clamp(maxScaleFactor: 2.0),
@@ -1870,9 +1870,8 @@ class _TimePickerInputState extends State<_TimePickerInput> with RestorationMixi
   @override
   Widget build(BuildContext context) {
     assert(debugCheckHasMediaQuery(context));
-    final TimeOfDayFormat timeOfDayFormat = MaterialLocalizations.of(
-      context,
-    ).timeOfDayFormat(alwaysUse24HourFormat: _TimePickerModel.use24HourFormatOf(context));
+    final TimeOfDayFormat timeOfDayFormat = MaterialLocalizations.of(context)
+        .timeOfDayFormat(alwaysUse24HourFormat: _TimePickerModel.use24HourFormatOf(context));
     final use24HourDials = hourFormat(of: timeOfDayFormat) != HourFormat.h;
     final ThemeData theme = Theme.of(context);
     final TimePickerThemeData timePickerTheme = _TimePickerModel.themeOf(context);

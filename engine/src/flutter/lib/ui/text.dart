@@ -3463,7 +3463,8 @@ base class _NativeParagraph extends NativeFieldWrapperClass1 implements Paragrap
 abstract class ParagraphBuilder {
   /// Creates a new [ParagraphBuilder] object, which is used to create a
   /// [Paragraph].
-  factory ParagraphBuilder(ParagraphStyle style) = _NativeParagraphBuilder;
+  factory ParagraphBuilder(ParagraphStyle style, {FlaxFontCollection? fontCollection}) =
+      _NativeParagraphBuilder;
 
   /// The number of placeholders currently in the paragraph.
   int get placeholderCount;
@@ -3554,8 +3555,9 @@ abstract class ParagraphBuilder {
 }
 
 base class _NativeParagraphBuilder extends NativeFieldWrapperClass1 implements ParagraphBuilder {
-  _NativeParagraphBuilder(ParagraphStyle style)
+  _NativeParagraphBuilder(ParagraphStyle style, {FlaxFontCollection? fontCollection})
     : _defaultLeadingDistribution = style._leadingDistribution {
+    fontCollection?._checkActive();
     List<String>? strutFontFamilies;
     final StrutStyle? strutStyle = style._strutStyle;
     final ByteData? encodedStrutStyle;
@@ -3582,12 +3584,13 @@ base class _NativeParagraphBuilder extends NativeFieldWrapperClass1 implements P
       style._height ?? 0,
       style._ellipsis ?? '',
       _encodeLocale(style._locale),
+      fontCollection,
     );
   }
 
-  @Native<Void Function(Handle, Handle, Handle, Handle, Handle, Double, Double, Handle, Handle)>(
-    symbol: 'ParagraphBuilder::Create',
-  )
+  @Native<
+    Void Function(Handle, Handle, Handle, Handle, Handle, Double, Double, Handle, Handle, Handle)
+  >(symbol: 'ParagraphBuilder::Create')
   external void _constructor(
     Int32List encoded,
     ByteData? strutData,
@@ -3597,6 +3600,7 @@ base class _NativeParagraphBuilder extends NativeFieldWrapperClass1 implements P
     double height,
     String ellipsis,
     String locale,
+    FlaxFontCollection? fontCollection,
   );
 
   @override
@@ -3817,3 +3821,48 @@ FutureOr<void> _sendFontChangeMessage() async {
 
 @Native<Void Function(Handle, Handle, Handle)>(symbol: 'FontCollection::LoadFontFromList')
 external void _loadFontFromList(Uint8List list, _Callback<void> callback, String fontFamily);
+
+/// A native font lookup domain. Host fonts remain public; registrations are private.
+/// Existing Paragraphs keep their domain alive after this owner is disposed.
+final class FlaxFontCollection extends NativeFieldWrapperClass1 {
+  FlaxFontCollection() {
+    _constructor();
+  }
+  bool _disposed = false;
+  int _revision = 0;
+  int get revision => _revision;
+  void Function()? onChanged;
+
+  void _checkActive() {
+    if (_disposed) throw StateError('Font collection is disposed');
+  }
+
+  bool addFont(Uint8List bytes, {required String family}) {
+    _checkActive();
+    final added = _addFont(bytes, family);
+    if (added) {
+      _revision++;
+      onChanged?.call();
+    }
+    return added;
+  }
+
+  void dispose() {
+    if (_disposed) return;
+    _disposed = true;
+    onChanged = null;
+    _dispose();
+  }
+
+  @Native<Void Function(Handle)>(symbol: 'FlaxFontCollection::Create')
+  external void _constructor();
+  @Native<Bool Function(Pointer<Void>, Handle, Handle)>(symbol: 'FlaxFontCollection::addFont')
+  external bool _addFont(Uint8List bytes, String family);
+  @Native<Void Function(Pointer<Void>)>(symbol: 'FlaxFontCollection::dispose')
+  external void _dispose();
+}
+
+/// Live private collections, aliases, shared source typefaces and source bytes.
+List<int> get flaxScopedFontStats => _flaxScopedFontStats();
+@Native<Handle Function()>(symbol: 'FontCollection::ScopedFontStats')
+external List<int> _flaxScopedFontStats();

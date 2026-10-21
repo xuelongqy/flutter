@@ -3,6 +3,7 @@
 
 import argparse
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -90,9 +91,12 @@ def main() -> None:
                 "-fstack-protector-all", "-fstack-protector-all -Wno-error=ignored-attributes"
             ))
     if not args.configure_only:
-        targets = ["flutter", "flutter_tester"] if platform == "mac" else ["flutter"]
+        targets = ["flutter", "flutter_tester", "const_finder"] if platform == "mac" else ["flutter"]
         subprocess.run(["ninja", "-C", str(output), "-j", str(args.jobs),
                         *targets], cwd=source, env=env, check=True)
+        # Pub/analyzer resolve dart:ui through this SDK package, not engine flags.
+        shutil.copytree(output / "gen/dart-pkg/sky_engine",
+                        checkout / "bin/cache/pkg/sky_engine", dirs_exist_ok=True)
     host = output.name if platform == "mac" else f"flax_mac_{args.mode}_arm64"
     print(f"Local engine: --local-engine={output.name} --local-engine-host={host}")
 
