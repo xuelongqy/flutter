@@ -5,6 +5,7 @@
 import 'package:convert/convert.dart';
 import 'package:crypto/crypto.dart';
 
+import 'artifacts.dart';
 import 'base/config.dart';
 import 'base/file_system.dart';
 import 'build_info.dart';
@@ -30,8 +31,19 @@ String getDefaultCachedKernelPath({
   required FileSystem fileSystem,
   TargetModel? targetModel,
   List<String> extraFrontEndOptions = const <String>[],
+  Artifacts? artifacts,
 }) {
   final buffer = StringBuffer();
+  // Local SDKs can change without changing the Flutter revision or their paths.
+  if (artifacts?.usesLocalArtifacts ?? false) {
+    for (final artifact in const <Artifact>[
+      Artifact.frontendServerSnapshotForEngineDartSdk,
+      Artifact.platformKernelDill,
+    ]) {
+      final File input = fileSystem.file(artifacts!.getArtifactPath(artifact));
+      buffer.write('$artifact:${sha256.convert(input.readAsBytesSync())};');
+    }
+  }
   final List<String> cacheFrontEndOptions = extraFrontEndOptions.toList()
     ..removeWhere((String arg) => arg.startsWith('--enable-experiment='));
   if (targetModel != null) {

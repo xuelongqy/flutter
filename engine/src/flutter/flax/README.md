@@ -101,6 +101,33 @@ recurse indefinitely. Flax rejects older engines before loading these bindings.
 The public native ABI remains 2. This update requires rebuilding the matching engine;
 it does not rebuild the V8 SDK or change its lock.
 
+## Generated default calls
+
+The maintained Dart compiler lowers `flaxInvokeWithDefaults` markers from generated
+bindings to fixed entries. Slots and 32-bit presence words become scalar arguments;
+the marker lists are removed. The entry uses native defaults, including private values,
+and preserves generic scopes, virtual overrides and lexical `super`. Dynamic callback
+values retain Flax's ordinary shared invocation path.
+
+The transformation is part of the revision-checked Dart patch and runs in the ordinary
+platform compiler and frontend server. SDK virtual entries are generated before the
+JIT core snapshot. Rebuild the matching host and target modes with `build_engine.py`;
+an old precompiled SDK is rejected instead of silently missing entries. Applications
+need no compiler override. Verify the built compiler and SDK with:
+
+```sh
+python3 engine/src/flutter/flax/tools/check_default_calls.py --mode debug
+python3 engine/src/flutter/flax/tools/check_default_calls.py --mode release
+```
+
+Flutter's application build already tracks compiler and SDK artifact contents. Local
+engine resident/test Kernel cache keys also include those contents, so rebuilding in
+the same output directory cannot select a stale initial Kernel cache. Restart the tool
+and application after rebuilding the compiler or SDK. Compatible source hot reload
+keeps fixed-entry identities stable and preserves existing Dart/JS instances; SDK and
+unsupported class-shape changes still require a restart. This compiler extension does
+not change the native ABI, UI protocol or joint-GC ownership.
+
 ## Ownership
 
 Dart's ordinary parallel marking remains enabled. Conditional tracing then
