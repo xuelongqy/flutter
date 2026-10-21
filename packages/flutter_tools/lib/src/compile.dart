@@ -733,6 +733,7 @@ class DefaultResidentCompiler implements ResidentCompiler {
        initializeFromDill =
            buildInfo.initializeFromDill ??
            getDefaultCachedKernelPath(
+             artifacts: artifacts,
              config: config,
              fileSystem: fileSystem,
              trackWidgetCreation: buildInfo.trackWidgetCreation,

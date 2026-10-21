@@ -1,3 +1,30 @@
+diff --git a/pkg/vm/lib/modular/target/vm.dart b/pkg/vm/lib/modular/target/vm.dart
+index 7d91430c..1ad5d3d5 100644
+--- a/pkg/vm/lib/modular/target/vm.dart
++++ b/pkg/vm/lib/modular/target/vm.dart
+@@ -13,6 +13,7 @@ import 'package:kernel/transformations/track_widget_constructor_locations.dart';
+
+ import '../transformations/call_site_annotator.dart' as callSiteAnnotator;
+ import '../transformations/deeply_immutable.dart' as deeply_immutable;
++import '../transformations/flax_default_calls.dart';
+ import '../transformations/lowering.dart'
+     as lowering
+     show transformLibraries, transformProcedure;
+@@ -188,6 +189,14 @@ class VmTarget extends Target {
+     void Function(String msg)? logger,
+     ChangedStructureNotifier? changedStructureNotifier,
+   }) {
++    transformFlaxDefaultCalls(
++      component,
++      coreTypes,
++      libraries,
++      hierarchy,
++      referenceFromIndex,
++      changedStructureNotifier,
++    );
+     transformMixins.transformLibraries(
+       this,
+       coreTypes,
 diff --git a/pkg/vm/lib/transformations/type_flow/analysis.dart b/pkg/vm/lib/transformations/type_flow/analysis.dart
 index 0fbd6cd4..95d32e3a 100644
 --- a/pkg/vm/lib/transformations/type_flow/analysis.dart
@@ -1522,3 +1549,951 @@ index 00000000..f8a90c6f
 +}
 +#endif
 +#endif
+diff --git a/pkg/vm/lib/modular/transformations/flax_default_calls.dart b/pkg/vm/lib/modular/transformations/flax_default_calls.dart
+new file mode 100644
+index 00000000..371a80ea
+--- /dev/null
++++ b/pkg/vm/lib/modular/transformations/flax_default_calls.dart
+@@ -0,0 +1,942 @@
++// Copyright (c) 2026, the Dart project authors. Please see the AUTHORS file
++// for details. All rights reserved. Use of this source code is governed by a
++// BSD-style license that can be found in the LICENSE file.
++
++import 'dart:convert';
++
++import 'package:crypto/crypto.dart';
++import 'package:kernel/ast.dart';
++import 'package:kernel/class_hierarchy.dart';
++import 'package:kernel/clone.dart';
++import 'package:kernel/core_types.dart';
++import 'package:kernel/type_algebra.dart';
++import 'package:kernel/reference_from_index.dart';
++import 'package:kernel/target/changed_structure_notifier.dart';
++
++class _GeneratedLocations extends RecursiveVisitor {
++  _GeneratedLocations(this.offset);
++  final int offset;
++  @override
++  void defaultNode(Node node) {
++    if (node is TreeNode && node.fileOffset == TreeNode.noOffset) {
++      node.fileOffset = offset;
++    }
++    node.visitChildren(this);
++  }
++}
++
++class _FixedCalls extends Transformer {
++  _FixedCalls(
++    this.component,
++    this.core,
++    this.libraries,
++    this.hierarchy, {
++    this.buildSdk = false,
++    this.referenceFromIndex,
++    this.changedStructureNotifier,
++  });
++  final Component component;
++  final CoreTypes core;
++  final List<Library> libraries;
++  final ClassHierarchy hierarchy;
++  final bool buildSdk;
++  final ReferenceFromIndex? referenceFromIndex;
++  final ChangedStructureNotifier? changedStructureNotifier;
++  Reference? priorReference(Library library, Class? owner, Name name) {
++    final index = referenceFromIndex?.lookupLibrary(library);
++    return (owner == null ? index : index?.lookupIndexedClass(owner.name))
++        ?.lookupGetterReference(name);
++  }
++
++  Member? current;
++  final entries = <Object, Procedure>{};
++  late final extensionTargets = <Reference, Procedure>{
++    for (final library in component.libraries)
++      for (final descriptor in [
++        for (final extension in library.extensions)
++          for (final member in extension.memberDescriptors)
++            if (!member.isStatic &&
++                member.tearOffReference != null &&
++                member.memberReference != null)
++              (member.tearOffReference!, member.memberReference!),
++        for (final extension in library.extensionTypeDeclarations)
++          for (final member in extension.memberDescriptors)
++            if (!member.isStatic &&
++                member.tearOffReference != null &&
++                member.memberReference != null)
++              (member.tearOffReference!, member.memberReference!),
++      ])
++        descriptor.$1: descriptor.$2.asProcedure,
++  };
++  bool sameLayout(List<String> a, List<String> b) {
++    if (a.length != b.length) return false;
++    for (var i = 0; i < a.length; i++) {
++      if (a[i] != b[i]) return false;
++    }
++    return true;
++  }
++
++  void checkLayout(Member target, List<String> names) {
++    final fn = target.function!;
++    final positional = names.takeWhile((name) => name.isEmpty).length;
++    final named = names.skip(positional).toList();
++    if (positional > fn.positionalParameters.length ||
++        named.any(
++          (name) =>
++              name.isEmpty ||
++              !fn.namedParameters.any((p) => p.parameterName == name),
++        ) ||
++        named.toSet().length != named.length) {
++      throw StateError('Fixed layout does not match ${target.name.text}');
++    }
++  }
++
++  List<String> layout(Member member) => [
++    for (final _ in member.function!.positionalParameters) '',
++    ...([for (final p in member.function!.namedParameters) p.parameterName]
++      ..sort()),
++  ];
++  String entryName(
++    Member target,
++    List<String> names, {
++    Class? owner,
++    bool superCall = false,
++  }) {
++    final identity = jsonEncode([
++      'mask32-v1',
++      target.enclosingLibrary.importUri.toString(),
++      target.enclosingClass?.name,
++      target.name.text,
++      if (superCall)
++        [owner?.enclosingLibrary.importUri.toString(), owner?.name],
++      names,
++    ]);
++    return r'_flaxFixed#' +
++        target.name.text +
++        r'$' +
++        sha256.convert(utf8.encode(identity)).toString().substring(0, 24);
++  }
++
++  void run() {
++    if (buildSdk) {
++      final targets = [
++        for (final l in libraries)
++          if (l.importUri.isScheme('dart'))
++            for (final c in l.classes)
++              if (!c.name.startsWith('_'))
++                for (final p in c.procedures)
++                  if (!p.name.isPrivate &&
++                      !p.isStatic &&
++                      p.kind == ProcedureKind.Method &&
++                      !p.name.text.startsWith(r'_flaxFixed#') &&
++                      (p.function.namedParameters.isNotEmpty ||
++                          p.function.positionalParameters.length >
++                              p.function.requiredParameterCount))
++                    p,
++      ];
++      for (final target in targets) {
++        current = target;
++        virtualEntry(target, layout(target));
++      }
++    }
++    for (final library in libraries) {
++      for (final field in library.fields.toList()) {
++        current = field;
++        field.transformChildren(this);
++      }
++      for (final p in library.procedures.toList()) {
++        current = p;
++        p.transformChildren(this);
++      }
++      for (final c in library.classes.toList()) {
++        for (final field in c.fields.toList()) {
++          current = field;
++          field.transformChildren(this);
++        }
++        for (final constructor in c.constructors.toList()) {
++          current = constructor;
++          constructor.transformChildren(this);
++        }
++        for (final p in c.procedures.toList()) {
++          current = p;
++          p.transformChildren(this);
++        }
++      }
++    }
++  }
++
++  Procedure validator(Library library) {
++    const name = r'$flaxValidateFixedMask#v1';
++    if (library.procedures.where((p) => p.name.text == name).firstOrNull
++        case final previous?) {
++      return previous;
++    }
++    final provided = PositionalParameter(
++      cosmeticName: 'provided',
++      type: core.intNonNullableRawType,
++    );
++    final required = PositionalParameter(
++      cosmeticName: 'required',
++      type: core.intNonNullableRawType,
++    );
++    final length = PositionalParameter(
++      cosmeticName: 'length',
++      type: core.intNonNullableRawType,
++    );
++    final positional = PositionalParameter(
++      cosmeticName: 'positional',
++      type: core.intNonNullableRawType,
++    );
++    Expression op(Expression value, String name, Expression other) =>
++        invokeCore(value, 'int', name, [other]);
++    Expression equals(Expression a, Expression b) => EqualsCall(
++      a,
++      b,
++      functionType: core.index
++          .getProcedure('dart:core', 'Object', '==')
++          .function
++          .computeFunctionType(Nullability.nonNullable),
++      interfaceTarget: core.index.getProcedure('dart:core', 'Object', '=='),
++    );
++    final bits = SyntheticVariable(
++      initializer: op(
++        VariableGet(provided),
++        '&',
++        op(
++          op(IntLiteral(1), '<<', VariableGet(positional)),
++          '-',
++          IntLiteral(1),
++        ),
++      ),
++      type: core.intNonNullableRawType,
++    );
++    final invalid = LogicalExpression(
++      LogicalExpression(
++        op(VariableGet(provided), '<', IntLiteral(0)),
++        LogicalExpressionOperator.OR,
++        Not(
++          equals(
++            op(VariableGet(provided), '>>', VariableGet(length)),
++            IntLiteral(0),
++          ),
++        ),
++      ),
++      LogicalExpressionOperator.OR,
++      LogicalExpression(
++        Not(
++          equals(
++            op(VariableGet(provided), '&', VariableGet(required)),
++            VariableGet(required),
++          ),
++        ),
++        LogicalExpressionOperator.OR,
++        Not(
++          equals(
++            op(
++              VariableGet(bits),
++              '&',
++              op(VariableGet(bits), '+', IntLiteral(1)),
++            ),
++            IntLiteral(0),
++          ),
++        ),
++      ),
++    );
++    final result = Procedure(
++      Name(name),
++      ProcedureKind.Method,
++      FunctionNode(
++        Block([
++          IfStatement(
++            Let(bits, invalid),
++            ExpressionStatement(
++              Throw(
++                ConstructorInvocation(
++                  core.index.getConstructor('dart:core', 'ArgumentError', ''),
++                  Arguments([StringLiteral('Invalid fixed arguments')]),
++                ),
++              ),
++            ),
++            null,
++          ),
++        ]),
++        positionalParameters: [provided, required, length, positional],
++        requiredParameterCount: 4,
++        returnType: const VoidType(),
++      ),
++      isStatic: true,
++      fileUri: library.fileUri,
++      reference: priorReference(library, null, Name(name)),
++    );
++    result.accept(_GeneratedLocations(0));
++    library.addProcedure(result);
++    return result;
++  }
++
++  Expression invokeCore(
++    Expression receiver,
++    String owner,
++    String name,
++    List<Expression> args,
++  ) {
++    final target =
++        hierarchy.getInterfaceMember(
++              core.index.getClass('dart:core', owner),
++              Name(name),
++            )
++            as Procedure;
++    return InstanceInvocation(
++      InstanceAccessKind.Instance,
++      receiver,
++      Name(name),
++      Arguments(args),
++      interfaceTarget: target,
++      functionType: owner == 'List'
++          ? FunctionType(
++              [core.intNonNullableRawType],
++              core.objectNullableRawType,
++              Nullability.nonNullable,
++            )
++          : target.function
++                .computeFunctionType(Nullability.nonNullable)
++                .withoutTypeParameters,
++    );
++  }
++
++  Expression present(List<PositionalParameter> masks, int index) => Not(
++    EqualsCall(
++      invokeCore(VariableGet(masks[index ~/ 32]), 'int', '&', [
++        IntLiteral(1 << (index % 32)),
++      ]),
++      IntLiteral(0),
++      functionType: core.index
++          .getProcedure('dart:core', 'Object', '==')
++          .function
++          .computeFunctionType(Nullability.nonNullable),
++      interfaceTarget: core.index.getProcedure('dart:core', 'Object', '=='),
++    ),
++  );
++  List<String> readNames(Expression e) {
++    if (e is ConstantExpression && e.constant is ListConstant) {
++      return (e.constant as ListConstant).entries
++          .map((v) => (v as StringConstant).value)
++          .toList();
++    }
++    if (e is ListLiteral) {
++      return e.expressions.map((v) => (v as StringLiteral).value).toList();
++    }
++    throw StateError('Fixed layout must be constant: $e');
++  }
++
++  List<NominalParameter> cloneParameters(
++    List<TypeParameter> source,
++    Map<TypeParameter, DartType> substitutions,
++  ) {
++    final result = [for (final p in source) NominalParameter(p.name)];
++    for (var i = 0; i < source.length; i++) {
++      substitutions[source[i]] = TypeParameterType(
++        result[i],
++        Nullability.nonNullable,
++      );
++    }
++    for (var i = 0; i < source.length; i++) {
++      result[i].bound = substitute(source[i].bound, substitutions);
++      result[i].defaultType = substitute(source[i].defaultType, substitutions);
++    }
++    return result;
++  }
++
++  Procedure entry(
++    Member target,
++    List<String> names, {
++    Class? owner,
++    bool superCall = false,
++    Name? sharedName,
++  }) {
++    checkLayout(target, names);
++    final key = (target, owner, superCall, sharedName, jsonEncode(names));
++    final previous = entries[key];
++    if (previous != null) return previous;
++    final library =
++        owner?.enclosingLibrary ??
++        (target.enclosingLibrary.importUri.isScheme('dart')
++            ? current!.enclosingLibrary
++            : target.enclosingLibrary);
++    final name =
++        sharedName ??
++        Name(
++          entryName(target, names, owner: owner, superCall: superCall),
++          library,
++        );
++    final existing = owner == null ? library.procedures : owner.procedures;
++    if (existing.where((p) => p.name == name).firstOrNull
++        case final previous?) {
++      entries[key] = previous;
++      return previous;
++    }
++    if (!buildSdk && library.importUri.isScheme('dart')) {
++      throw StateError(
++        'Fixed entry is absent from the precompiled SDK: ${target.name.text}; build a matching fixed-entry SDK',
++      );
++    }
++    final fn = target.function!;
++    final substitutions = <TypeParameter, DartType>{};
++    if (owner != null &&
++        target.enclosingClass != null &&
++        owner != target.enclosingClass) {
++      final parent = hierarchy.getClassAsInstanceOf(
++        owner,
++        target.enclosingClass!,
++      );
++      if (parent == null) throw StateError('Bad super owner');
++      substitutions.addAll(getSubstitutionMap(parent));
++    }
++    final originalParameters = target is Constructor
++        ? target.enclosingClass.typeParameters
++        : fn.typeParameters;
++    final types = cloneParameters(originalParameters, substitutions);
++    final slots = [
++      for (var i = 0; i < names.length; i++)
++        PositionalParameter(
++          cosmeticName: 'slot$i',
++          type: core.objectNullableRawType,
++        ),
++    ];
++    final masks = [
++      for (var i = 0; i < (names.length + 31) ~/ 32; i++)
++        PositionalParameter(
++          cosmeticName: 'provided$i',
++          type: core.intNonNullableRawType,
++        ),
++    ];
++    final positional = <Expression>[];
++    final named = <NamedExpression>[];
++    final positionalCount = names.takeWhile((name) => name.isEmpty).length;
++    final requiredMasks = List<int>.filled(masks.length, 0);
++    Expression argument(
++      FunctionParameter p,
++      int index, {
++      bool positionalRequired = false,
++    }) {
++      final required = p.isRequired || positionalRequired;
++      final type = substitute(p.type, substitutions);
++      if (index < 0) {
++        if (required) {
++          throw StateError('Required parameter missing from fixed layout');
++        }
++        return p.defaultValue == null
++            ? NullLiteral()
++            : CloneVisitorNotMembers(
++                typeSubstitution: substitutions,
++              ).clone(p.defaultValue!);
++      }
++      final actual = AsExpression(VariableGet(slots[index]), type)
++        ..isTypeError = true;
++      if (required) {
++        requiredMasks[index ~/ 32] |= 1 << (index % 32);
++        return actual;
++      }
++      final fallback = p.defaultValue == null
++          ? NullLiteral()
++          : CloneVisitorNotMembers(
++              typeSubstitution: substitutions,
++            ).clone(p.defaultValue!);
++      return ConditionalExpression(
++        present(masks, index),
++        actual,
++        fallback,
++        type,
++      );
++    }
++
++    for (var i = 0; i < fn.positionalParameters.length; i++) {
++      positional.add(
++        argument(
++          fn.positionalParameters[i],
++          i < positionalCount ? i : -1,
++          positionalRequired: i < fn.requiredParameterCount,
++        ),
++      );
++    }
++    for (final p in fn.namedParameters) {
++      named.add(
++        NamedExpression(
++          p.parameterName,
++          argument(p, names.indexOf(p.parameterName)),
++        ),
++      );
++    }
++    named.sort((a, b) => a.name.compareTo(b.name));
++    final args = Arguments(
++      positional,
++      named: named,
++      types: [
++        for (final p in types) TypeParameterType(p, Nullability.nonNullable),
++      ],
++    );
++    Expression call;
++    DartType result;
++    if (target is Constructor) {
++      call = ConstructorInvocation(target, args);
++      result = InterfaceType(target.enclosingClass, Nullability.nonNullable, [
++        for (final p in types) TypeParameterType(p, Nullability.nonNullable),
++      ]);
++    } else {
++      final p = target as Procedure;
++      result = substitute(fn.returnType, substitutions);
++      if (owner == null) {
++        call = StaticInvocation(p, args);
++      } else if (superCall) {
++        call = SuperMethodInvocation(ThisExpression(), p.name, args, p);
++      } else {
++        call = InstanceInvocation(
++          InstanceAccessKind.Instance,
++          ThisExpression(),
++          p.name,
++          args,
++          interfaceTarget: p,
++          functionType: FunctionType(
++            [
++              for (final v in fn.positionalParameters)
++                substitute(v.type, substitutions),
++            ],
++            result,
++            Nullability.nonNullable,
++            namedParameters: ([
++              for (final v in fn.namedParameters)
++                NamedType(
++                  v.parameterName,
++                  substitute(v.type, substitutions),
++                  isRequired: v.isRequired,
++                ),
++            ]..sort((a, b) => a.name.compareTo(b.name))),
++            requiredParameterCount: fn.requiredParameterCount,
++          ),
++        );
++      }
++    }
++    final marker = validator(library);
++    final statements = <Statement>[
++      for (var i = 0; i < masks.length; i++)
++        ExpressionStatement(
++          StaticInvocation(
++            marker,
++            Arguments([
++              VariableGet(masks[i]),
++              IntLiteral(requiredMasks[i]),
++              IntLiteral((names.length - i * 32).clamp(0, 32)),
++              IntLiteral((positionalCount - i * 32).clamp(0, 32)),
++            ]),
++          ),
++        ),
++      for (var i = 1; i < masks.length && i * 32 < positionalCount; i++)
++        IfStatement(
++          Not(
++            EqualsCall(
++              VariableGet(masks[i - 1]),
++              IntLiteral(0xffffffff),
++              functionType: core.index
++                  .getProcedure('dart:core', 'Object', '==')
++                  .function
++                  .computeFunctionType(Nullability.nonNullable),
++              interfaceTarget: core.index.getProcedure(
++                'dart:core',
++                'Object',
++                '==',
++              ),
++            ),
++          ),
++          ExpressionStatement(
++            StaticInvocation(
++              marker,
++              Arguments([
++                VariableGet(masks[i]),
++                IntLiteral(0),
++                IntLiteral(0),
++                IntLiteral(0),
++              ]),
++            ),
++          ),
++          null,
++        ),
++      ReturnStatement(call),
++    ];
++    final procedure = Procedure(
++      name,
++      ProcedureKind.Method,
++      FunctionNode(
++        Block(statements),
++        positionalParameters: [...slots, ...masks],
++        requiredParameterCount: slots.length + masks.length,
++        typeParameters: types,
++        returnType: result,
++      ),
++      isStatic: owner == null,
++      fileUri: target.fileUri,
++      reference: priorReference(library, owner, name),
++    );
++    if (superCall) procedure.containsSuperCalls = true;
++    procedure.accept(
++      _GeneratedLocations(target.fileOffset < 0 ? 0 : target.fileOffset),
++    );
++    if (owner == null) {
++      library.addProcedure(procedure);
++    } else {
++      owner.addProcedure(procedure);
++      changedStructureNotifier?.registerClassMemberChange(owner);
++    }
++    entries[key] = procedure;
++    return procedure;
++  }
++
++  Procedure virtualEntry(Procedure target, List<String> names) {
++    final owner = target.enclosingClass!;
++    final key = ('virtual', target, jsonEncode(names));
++    if (entries[key] case final previous?) return previous;
++    final name = Name(entryName(target, names), target.enclosingLibrary);
++    final base = entry(target, names, owner: owner, sharedName: name);
++    entries[key] = base;
++    for (final c
++        in hierarchy.knownLibraries.expand((l) => l.classes).toList()) {
++      if (c == owner || hierarchy.getClassAsInstanceOf(c, owner) == null) {
++        continue;
++      }
++      var declared = false;
++      for (final p in c.procedures.toList()) {
++        if (p.name == target.name &&
++            !p.isStatic &&
++            !p.isAbstract &&
++            p.kind == ProcedureKind.Method &&
++            (buildSdk || !c.enclosingLibrary.importUri.isScheme('dart'))) {
++          entry(p, names, owner: c, sharedName: name);
++          declared = true;
++        }
++      }
++      if (!declared &&
++          (buildSdk || !c.enclosingLibrary.importUri.isScheme('dart')) &&
++          (c.superclass == null ||
++              hierarchy.getClassAsInstanceOf(c.superclass!, owner) == null)) {
++        final inherited = hierarchy.getDispatchTarget(c, target.name);
++        if (inherited is Procedure && !inherited.isAbstract) {
++          entry(inherited, names, owner: c, sharedName: name);
++        }
++      }
++    }
++    return base;
++  }
++
++  @override
++  TreeNode visitStaticInvocation(StaticInvocation node) {
++    if (node.target.name.text != 'flaxInvokeWithDefaults' ||
++        node.target.enclosingLibrary.importUri.toString() !=
++            'package:flax/bindings.dart') {
++      return super.visitStaticInvocation(node);
++    }
++    final original = node.arguments.positional;
++    if (original.length != 4) throw StateError('Wrong fixed marker');
++    var names = readNames(original[3]);
++    final vector = original[1];
++    if (vector is! ListLiteral || vector.expressions.length != names.length) {
++      throw StateError(
++        'Fixed call must have a literal argument vector matching its layout',
++      );
++    }
++    var values = [...vector.expressions];
++    var provided = original[2] is ListLiteral
++        ? [...(original[2] as ListLiteral).expressions]
++        : [original[2]];
++    if (provided.length != (names.length + 31) ~/ 32) {
++      throw StateError('Fixed mask word count does not match its layout');
++    }
++    final originalTarget = original[0];
++    Expression target = originalTarget;
++    List<DartType> typeArgs = [];
++    var requiresTargetCheck = false;
++    while (target is AsExpression) {
++      requiresTargetCheck = true;
++      target = target.operand;
++    }
++    if (target is Instantiation) {
++      typeArgs = target.typeArguments;
++      target = target.expression;
++    }
++    while (target is AsExpression) {
++      requiresTargetCheck = true;
++      target = target.operand;
++    }
++    final locals = <SyntheticVariable>[];
++    final maskChecks = <Statement>[];
++    SyntheticVariable? receiver;
++    Member? boundMember;
++    if (target is StaticInvocation &&
++        (target.target.isExtensionMember ||
++            target.target.isExtensionTypeMember)) {
++      boundMember = extensionTargets[target.target.reference];
++      if (boundMember != null) {
++        if (target.arguments.positional.length != 1 ||
++            target.arguments.named.isNotEmpty) {
++          throw StateError('Invalid bound extension tear-off');
++        }
++        // The synthesized tear-off only captures this receiver. Preserve its
++        // evaluation order without allocating the temporary bound closure.
++        final bound = target.target.function;
++        final receiverType =
++            substitute(bound.positionalParameters.single.type, {
++              for (var i = 0; i < bound.typeParameters.length; i++)
++                bound.typeParameters[i]: target.arguments.types[i],
++            });
++        receiver = SyntheticVariable(
++          initializer: AsExpression(
++            target.arguments.positional.single,
++            receiverType,
++          )..isTypeError = true,
++          type: core.objectNullableRawType,
++        );
++        target.arguments.positional[0] = VariableGet(receiver)
++          ..parent = target.arguments;
++        typeArgs = [...target.arguments.types, ...typeArgs];
++        final slots = [
++          for (final expression in values)
++            SyntheticVariable(
++              initializer: expression,
++              type: core.objectNullableRawType,
++            ),
++        ];
++        final words = [
++          for (final expression in provided)
++            SyntheticVariable(
++              initializer: expression,
++              type: core.intNonNullableRawType,
++            ),
++        ];
++        locals.addAll([...slots, ...words]);
++        final positional = names.takeWhile((name) => name.isEmpty).length;
++        for (var i = 0; i < words.length; i++) {
++          maskChecks.add(
++            ExpressionStatement(
++              StaticInvocation(
++                validator(current!.enclosingLibrary),
++                Arguments([
++                  VariableGet(words[i]),
++                  IntLiteral(0),
++                  IntLiteral((names.length - i * 32).clamp(0, 32)),
++                  IntLiteral((positional - i * 32).clamp(0, 32)),
++                ]),
++              ),
++            ),
++          );
++        }
++        Expression op(Expression value, String name, int operand) =>
++            invokeCore(value, 'int', name, [IntLiteral(operand)]);
++        names = ['', ...names];
++        values = [
++          VariableGet(receiver),
++          for (final slot in slots) VariableGet(slot),
++        ];
++        provided = [
++          for (var i = 0; i < (names.length + 31) ~/ 32; i++)
++            invokeCore(
++              i < words.length
++                  ? op(op(VariableGet(words[i]), '&', 0x7fffffff), '<<', 1)
++                  : IntLiteral(0),
++              'int',
++              '|',
++              [
++                i == 0
++                    ? IntLiteral(1)
++                    : op(op(VariableGet(words[i - 1]), '>>', 31), '&', 1),
++              ],
++            ),
++        ];
++      }
++    }
++    final canonical =
++        target is InstanceTearOff &&
++            target.interfaceTarget.enclosingLibrary.importUri.isScheme('dart')
++        ? layout(target.interfaceTarget)
++        : null;
++    if (canonical != null && !sameLayout(names, canonical)) {
++      checkLayout((target as InstanceTearOff).interfaceTarget, names);
++      for (final expression in [...values, ...provided]) {
++        locals.add(
++          SyntheticVariable(
++            initializer: expression,
++            type: core.objectNullableRawType,
++          ),
++        );
++      }
++      final oldNames = names;
++      for (var word = 0; word < provided.length; word++) {
++        maskChecks.add(
++          ExpressionStatement(
++            StaticInvocation(
++              validator(current!.enclosingLibrary),
++              Arguments([
++                AsExpression(
++                  VariableGet(locals[oldNames.length + word]),
++                  core.intNonNullableRawType,
++                )..isTypeError = true,
++                IntLiteral(0),
++                IntLiteral((oldNames.length - word * 32).clamp(0, 32)),
++                IntLiteral(
++                  (oldNames.takeWhile((name) => name.isEmpty).length -
++                          word * 32)
++                      .clamp(0, 32),
++                ),
++              ]),
++            ),
++          ),
++        );
++      }
++      final positions = oldNames.takeWhile((n) => n.isEmpty).length;
++      final count = canonical.takeWhile((n) => n.isEmpty).length;
++      final indices = [
++        for (var i = 0; i < canonical.length; i++)
++          i < count ? (i < positions ? i : -1) : oldNames.indexOf(canonical[i]),
++      ];
++      values = [
++        for (final index in indices)
++          index < 0 ? NullLiteral() : VariableGet(locals[index]),
++      ];
++      provided = [
++        for (var word = 0; word < (canonical.length + 31) ~/ 32; word++)
++          IntLiteral(0),
++      ];
++      for (var index = 0; index < indices.length; index++) {
++        final source = indices[index];
++        if (source < 0) continue;
++        final input = AsExpression(
++          VariableGet(locals[oldNames.length + source ~/ 32]),
++          core.intNonNullableRawType,
++        )..isTypeError = true;
++        final bit = invokeCore(input, 'int', '&', [
++          IntLiteral(1 << (source % 32)),
++        ]);
++        final shifted = index % 32 >= source % 32
++            ? invokeCore(bit, 'int', '<<', [
++                IntLiteral(index % 32 - source % 32),
++              ])
++            : invokeCore(bit, 'int', '>>', [
++                IntLiteral(source % 32 - index % 32),
++              ]);
++        provided[index ~/ 32] = invokeCore(provided[index ~/ 32], 'int', '|', [
++          shifted,
++        ]);
++      }
++      names = canonical;
++    }
++    final actuals = [...values, ...provided];
++    final entryType = FunctionType(
++      [
++        for (final _ in names) core.objectNullableRawType,
++        for (final _ in provided) core.intNonNullableRawType,
++      ],
++      const DynamicType(),
++      Nullability.nonNullable,
++    );
++    Member? member = boundMember;
++    if (target is ConstantExpression) {
++      Constant c = target.constant;
++      if (c is InstantiationConstant) {
++        typeArgs = c.types;
++        c = c.tearOffConstant;
++      }
++      if (c is TearOffConstant) member = c.target;
++    } else if (target is ConstructorTearOff) {
++      member = target.target;
++    } else if (target is StaticTearOff) {
++      member = target.target;
++    }
++    Expression replacement;
++    if (member != null) {
++      final helper = entry(member, names);
++      replacement = StaticInvocation(
++        helper,
++        Arguments(actuals, types: typeArgs),
++      );
++    } else if (target is InstanceTearOff) {
++      final helper = virtualEntry(target.interfaceTarget, names);
++      receiver = SyntheticVariable(
++        initializer: target.receiver,
++        type: InterfaceType(
++          target.interfaceTarget.enclosingClass!,
++          Nullability.nonNullable,
++          [
++            for (
++              var i = 0;
++              i < target.interfaceTarget.enclosingClass!.typeParameters.length;
++              i++
++            )
++              const DynamicType(),
++          ],
++        ),
++      );
++      target.receiver = VariableGet(receiver)..parent = target;
++      replacement = InstanceInvocation(
++        InstanceAccessKind.Instance,
++        VariableGet(receiver),
++        helper.name,
++        Arguments(actuals, types: typeArgs),
++        interfaceTarget: helper,
++        functionType: entryType,
++        resultType: const DynamicType(),
++      );
++    } else if (target is SuperPropertyGet) {
++      final helper = entry(
++        target.interfaceTarget,
++        names,
++        owner: current!.enclosingClass!,
++        superCall: true,
++      );
++      replacement = InstanceInvocation(
++        InstanceAccessKind.Instance,
++        ThisExpression(),
++        helper.name,
++        Arguments(actuals, types: typeArgs),
++        interfaceTarget: helper,
++        functionType: entryType,
++        resultType: const DynamicType(),
++      );
++    } else {
++      throw StateError('Flax default calls require a statically known target');
++    }
++    if (maskChecks.isNotEmpty) {
++      replacement = BlockExpression(Block(maskChecks), replacement);
++    }
++    for (final variable in locals.reversed) {
++      replacement = Let(variable, replacement);
++    }
++    if (requiresTargetCheck) {
++      replacement = BlockExpression(
++        Block([ExpressionStatement(originalTarget)]),
++        replacement,
++      );
++    }
++    if (receiver != null) replacement = Let(receiver, replacement);
++    replacement.fileOffset = node.fileOffset;
++    replacement.accept(
++      _GeneratedLocations(node.fileOffset < 0 ? 0 : node.fileOffset),
++    );
++    return replacement;
++  }
++}
++
++/// Lower generated Flax calls before mixin and FFI transformations.
++void transformFlaxDefaultCalls(
++  Component component,
++  CoreTypes core,
++  List<Library> libraries,
++  ClassHierarchy hierarchy,
++  ReferenceFromIndex? referenceFromIndex,
++  ChangedStructureNotifier? changedStructureNotifier,
++) {
++  _FixedCalls(
++    component,
++    core,
++    libraries,
++    hierarchy,
++    buildSdk: libraries.any((library) => library.importUri.isScheme('dart')),
++    referenceFromIndex: referenceFromIndex,
++    changedStructureNotifier: changedStructureNotifier,
++  ).run();
++}

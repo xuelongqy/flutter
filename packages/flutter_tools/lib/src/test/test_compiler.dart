@@ -116,6 +116,7 @@ class TestCompiler {
              getBuildDirectory(),
              'test_cache',
              getDefaultCachedKernelPath(
+               artifacts: globals.artifacts,
                config: globals.config,
                fileSystem: globals.fs,
                trackWidgetCreation: buildInfo.trackWidgetCreation,

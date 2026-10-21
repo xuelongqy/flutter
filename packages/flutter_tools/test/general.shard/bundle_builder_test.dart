@@ -267,6 +267,32 @@ void main() {
     );
   });
 
+  testWithoutContext('Local compiler and SDK contents isolate cached kernels', () {
+    final FileSystem fileSystem = MemoryFileSystem.test();
+    final config = Config.test();
+    final artifacts = _LocalCompilerArtifacts();
+    final File compiler = fileSystem.file('/compiler')..writeAsStringSync('aaaa');
+    final File platform = fileSystem.file('/platform')..writeAsStringSync('bbbb');
+    String path() => getDefaultCachedKernelPath(
+      artifacts: artifacts,
+      trackWidgetCreation: true,
+      dartDefines: <String>[],
+      fileSystem: fileSystem,
+      config: config,
+      targetModel: TargetModel.flutter,
+    );
+    final String original = path();
+    expect(path(), original);
+    final DateTime modified = compiler.lastModifiedSync();
+    compiler.writeAsStringSync('cccc');
+    compiler.setLastModifiedSync(modified);
+    expect(path(), isNot(original));
+    compiler.writeAsStringSync('aaaa');
+    expect(path(), original);
+    platform.writeAsStringSync('dddd');
+    expect(path(), isNot(original));
+  });
+
   testWithoutContext('TargetModel isolates getDefaultCachedKernelPath hash', () {
     final FileSystem fileSystem = MemoryFileSystem.test();
     final config = Config.test();
@@ -327,6 +353,19 @@ void main() {
       ProcessManager: () => FakeProcessManager.any(),
     },
   );
+}
+
+class _LocalCompilerArtifacts extends Fake implements Artifacts {
+  @override
+  bool get usesLocalArtifacts => true;
+
+  @override
+  String getArtifactPath(
+    Artifact artifact, {
+    TargetPlatform? platform,
+    BuildMode? mode,
+    EnvironmentType? environmentType,
+  }) => artifact == Artifact.platformKernelDill ? '/platform' : '/compiler';
 }
 
 class FakeAssetBundle extends Fake implements AssetBundle {
