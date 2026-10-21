@@ -77,8 +77,11 @@ const Widget _endSelectionOverlay = CupertinoPickerDefaultSelectionOverlay(capSt
 
 /// Defines a function signature for creating a widget that serves as a selection overlay,
 /// given the current context, the selected item's index, and the total number of columns.
-typedef SelectionOverlayBuilder =
-    Widget? Function(BuildContext context, {required int columnCount, required int selectedIndex});
+typedef SelectionOverlayBuilder = Widget? Function(
+  BuildContext context, {
+  required int columnCount,
+  required int selectedIndex,
+});
 
 // Lays out the date picker based on how much space each single column needs.
 //
@@ -616,6 +619,7 @@ class CupertinoDatePicker extends StatefulWidget {
     return texts
         .map(
           (String text) => TextPainter.computeMaxIntrinsicWidth(
+            fontCollection: DefaultFontCollection.maybeOf(context),
             text: TextSpan(style: textStyle ?? _themeTextStyle(context), text: text),
             textDirection: Directionality.of(context),
           ),
@@ -624,12 +628,11 @@ class CupertinoDatePicker extends StatefulWidget {
   }
 }
 
-typedef _ColumnBuilder =
-    Widget Function(
-      double offAxisFraction,
-      TransitionBuilder itemPositioningBuilder,
-      Widget? selectionOverlay,
-    );
+typedef _ColumnBuilder = Widget Function(
+  double offAxisFraction,
+  TransitionBuilder itemPositioningBuilder,
+  Widget? selectionOverlay,
+);
 
 class _CupertinoDatePickerDateTimeState extends State<CupertinoDatePicker> {
   // Fraction of the farthest column's vanishing point vs its width. Eyeballed
@@ -2396,6 +2399,7 @@ class _CupertinoTimerPickerState extends State<CupertinoTimerPicker> {
   }
 
   void _measureLabelMetrics() {
+    textPainter.fontCollection = DefaultFontCollection.maybeOf(context);
     textPainter.textDirection = textDirection;
     final TextStyle textStyle = _textStyleFrom(context, _kTimerPickerMagnification);
 

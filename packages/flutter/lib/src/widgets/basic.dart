@@ -11,7 +11,13 @@ library;
 import 'dart:math' as math;
 import 'dart:ui'
     as ui
-    show Image, ImageFilter, SemanticsHitTestBehavior, SemanticsInputType, TextHeightBehavior;
+    show
+        FlaxFontCollection,
+        Image,
+        ImageFilter,
+        SemanticsHitTestBehavior,
+        SemanticsInputType,
+        TextHeightBehavior;
 
 import 'package:flutter/animation.dart';
 import 'package:flutter/foundation.dart';
@@ -23,6 +29,7 @@ import 'binding.dart';
 import 'debug.dart';
 import 'framework.dart';
 import 'indexed_stack.dart';
+import 'inherited_notifier.dart';
 import 'localizations.dart';
 import 'media_query.dart';
 import 'view.dart';
@@ -6652,6 +6659,7 @@ class RichText extends MultiChildRenderObjectWidget {
       registrar: selectionRegistrar,
       selectionColor: selectionColor,
       devicePixelRatio: _getDevicePixelRatio(context),
+      fontCollection: DefaultFontCollection.maybeOf(context),
     );
   }
 
@@ -6672,7 +6680,8 @@ class RichText extends MultiChildRenderObjectWidget {
       ..locale = locale ?? Localizations.maybeLocaleOf(context)
       ..registrar = selectionRegistrar
       ..selectionColor = selectionColor
-      ..devicePixelRatio = _getDevicePixelRatio(context);
+      ..devicePixelRatio = _getDevicePixelRatio(context)
+      ..fontCollection = DefaultFontCollection.maybeOf(context);
   }
 
   @override
@@ -7053,6 +7062,36 @@ class DefaultAssetBundle extends InheritedWidget {
 
   @override
   bool updateShouldNotify(DefaultAssetBundle oldWidget) => bundle != oldWidget.bundle;
+}
+
+/// Supplies a private font lookup domain without changing resource loading.
+class DefaultFontCollection extends InheritedNotifier<Listenable>
+    implements FlaxFontResourceBoundary {
+  /// Creates a font domain and listens for private registrations.
+  const DefaultFontCollection({
+    super.key,
+    required this.fontCollection,
+    this.fontResources,
+    super.notifier,
+    required super.child,
+  });
+
+  /// Native collection used by descendant text.
+  final ui.FlaxFontCollection fontCollection;
+
+  @override
+  final FlaxFontResources? fontResources;
+
+  /// Finds the closest private domain; null selects public host fonts.
+  static ui.FlaxFontCollection? maybeOf(BuildContext context) {
+    final FlaxFontResources? resources = (context as Element).dependOnFlaxFontResources();
+    return resources?.collection ??
+        context.dependOnInheritedWidgetOfExactType<DefaultFontCollection>()?.fontCollection;
+  }
+
+  @override
+  bool updateShouldNotify(DefaultFontCollection oldWidget) =>
+      !identical(fontCollection, oldWidget.fontCollection) || super.updateShouldNotify(oldWidget);
 }
 
 /// An adapter for placing a specific [RenderBox] in the widget tree.

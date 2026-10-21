@@ -84,6 +84,8 @@ typedef CanvasPath Path;
   V(SemanticsUpdateBuilder::Create)                                \
   /* Other */                                                      \
   V(FontCollection::LoadFontFromList)                              \
+  V(FontCollection::ScopedFontStats)                               \
+  V(FlaxFontCollection::Create)                                    \
   V(ImageDescriptor::initEncoded)                                  \
   V(Image::decodeImageFromPixelsSync)                              \
   V(ImageFilter::equals)                                           \
@@ -180,6 +182,8 @@ typedef CanvasPath Path;
   V(Canvas, skew)                                \
   V(Canvas, transform)                           \
   V(Canvas, translate)                           \
+  V(FlaxFontCollection, addFont)                 \
+  V(FlaxFontCollection, dispose)                 \
   V(Codec, dispose)                              \
   V(Codec, frameCount)                           \
   V(Codec, getNextFrame)                         \

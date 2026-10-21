@@ -299,6 +299,8 @@ class IconTreeShaker {
       'IconData',
       '--annotation-class-name',
       '_StaticIconProvider',
+      '--non-constant-factory-pragma',
+      'flax:runtime-icon-data',
       '--annotation-class-library-uri',
       'package:flutter/src/widgets/icon_data.dart',
     ];

@@ -57,6 +57,26 @@ void FontCollection::SetTestFontManager(sk_sp<SkFontMgr> font_manager) {
   skt_collection_.reset();
 }
 
+std::shared_ptr<FontCollection> FontCollection::CreateScopedCollection(
+    sk_sp<SkFontMgr> dynamic_font_manager) const {
+  auto result = std::make_shared<FontCollection>();
+  result->default_font_manager_ = default_font_manager_;
+  result->asset_font_manager_ = asset_font_manager_;
+  result->test_font_manager_ = test_font_manager_;
+  result->dynamic_font_manager_ = std::move(dynamic_font_manager);
+  result->enable_font_fallback_ = enable_font_fallback_;
+  return result;
+}
+
+void FontCollection::RefreshPublicFonts(const FontCollection& parent) {
+  ClearFontFamilyCache();
+  default_font_manager_ = parent.default_font_manager_;
+  asset_font_manager_ = parent.asset_font_manager_;
+  test_font_manager_ = parent.test_font_manager_;
+  enable_font_fallback_ = parent.enable_font_fallback_;
+  skt_collection_.reset();
+}
+
 // Return the available font managers in the order they should be queried.
 std::vector<sk_sp<SkFontMgr>> FontCollection::GetFontManagerOrder() const {
   std::vector<sk_sp<SkFontMgr>> order;

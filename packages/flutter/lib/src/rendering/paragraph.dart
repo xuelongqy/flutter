@@ -13,6 +13,7 @@ import 'dart:ui'
     show
         BoxHeightStyle,
         BoxWidthStyle,
+        FlaxFontCollection,
         Gradient,
         LineMetrics,
         PlaceholderAlignment,
@@ -352,6 +353,7 @@ class RenderParagraph extends RenderBox
     StrutStyle? strutStyle,
     TextWidthBasis textWidthBasis = TextWidthBasis.parent,
     ui.TextHeightBehavior? textHeightBehavior,
+    ui.FlaxFontCollection? fontCollection,
     List<RenderBox>? children,
     Color? selectionColor,
     SelectionRegistrar? registrar,
@@ -367,6 +369,7 @@ class RenderParagraph extends RenderBox
        _devicePixelRatio = devicePixelRatio,
        _selectionColor = selectionColor,
        _textPainter = TextPainter(
+         fontCollection: fontCollection,
          text: text,
          textAlign: textAlign,
          textDirection: textDirection,
@@ -388,6 +391,24 @@ class RenderParagraph extends RenderBox
     PlaceholderSpan.placeholderCodeUnit,
   );
 
+  /// Private font domain supplied by the embedding resource scope.
+  @internal
+  ui.FlaxFontCollection? get fontCollection => _textPainter.fontCollection;
+  int? _fontCollectionRevision;
+
+  /// Updates layout when the domain or its registered fonts change.
+  @internal
+  set fontCollection(ui.FlaxFontCollection? value) {
+    final int revision = value?.revision ?? 0;
+    if (identical(value, _textPainter.fontCollection) && _fontCollectionRevision == revision) {
+      return;
+    }
+    _fontCollectionRevision = revision;
+    _textPainter.fontCollection = value;
+    _textIntrinsicsCache?.fontCollection = value;
+    markNeedsLayout();
+  }
+
   final TextPainter _textPainter;
 
   // Currently, computing min/max intrinsic width/height will destroy state
@@ -400,6 +421,7 @@ class RenderParagraph extends RenderBox
 
   TextPainter get _textIntrinsics {
     return (_textIntrinsicsCache ??= TextPainter())
+      ..fontCollection = _textPainter.fontCollection
       ..text = _textPainter.text
       ..textAlign = _textPainter.textAlign
       ..textDirection = _textPainter.textDirection
@@ -989,6 +1011,7 @@ class RenderParagraph extends RenderBox
         case TextOverflow.fade:
           _needsClipping = true;
           final fadeSizePainter = TextPainter(
+            fontCollection: _textPainter.fontCollection,
             text: TextSpan(style: _textPainter.text!.style, text: '\u2026'),
             textDirection: textDirection,
             textScaler: textScaler,

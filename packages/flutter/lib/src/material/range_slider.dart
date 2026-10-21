@@ -869,12 +869,13 @@ class _RangeSliderRenderObjectWidget extends LeafRenderObjectWidget {
       platform: Theme.of(context).platform,
       hovering: hovering,
       gestureSettings: MediaQuery.gestureSettingsOf(context),
-    );
+    ).._setFontCollection(DefaultFontCollection.maybeOf(context));
   }
 
   @override
   void updateRenderObject(BuildContext context, _RenderRangeSlider renderObject) {
     renderObject
+      .._setFontCollection(DefaultFontCollection.maybeOf(context))
       // We should update the `divisions` ahead of `values`, because the `values`
       // setter dependent on the `divisions`.
       ..divisions = divisions
@@ -1235,6 +1236,19 @@ class _RenderRangeSlider extends RenderBox with RelayoutWhenSystemFontsChangeMix
         // Matches Android implementation of material slider.
         return 0.05;
     }
+  }
+
+  int _fontCollectionRevision = 0;
+  void _setFontCollection(ui.FlaxFontCollection? value) {
+    final int revision = value?.revision ?? 0;
+    if (identical(value, _startLabelPainter.fontCollection) &&
+        revision == _fontCollectionRevision) {
+      return;
+    }
+    _fontCollectionRevision = revision;
+    _startLabelPainter.fontCollection = value;
+    _endLabelPainter.fontCollection = value;
+    _updateLabelPainters();
   }
 
   void _updateLabelPainters() {

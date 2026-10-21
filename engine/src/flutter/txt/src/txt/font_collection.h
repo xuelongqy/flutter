@@ -34,6 +34,13 @@ class FontCollection : public std::enable_shared_from_this<FontCollection> {
   void SetDynamicFontManager(sk_sp<SkFontMgr> font_manager);
   void SetTestFontManager(sk_sp<SkFontMgr> font_manager);
 
+  // Shares public font managers, with an independent dynamic manager and
+  // caches.
+  std::shared_ptr<FontCollection> CreateScopedCollection(
+      sk_sp<SkFontMgr> dynamic_font_manager) const;
+
+  void RefreshPublicFonts(const FontCollection& parent);
+
   // Do not provide alternative fonts that can match characters which are
   // missing from the requested font family.
   void DisableFontFallback();

@@ -4,14 +4,20 @@
 
 #include "flutter/lib/ui/text/font_collection.h"
 
+#include <algorithm>
+#include <atomic>
+#include <cstring>
 #include <mutex>
+#include <string_view>
 
 #include "flutter/lib/ui/text/asset_manager_font_provider.h"
 #include "flutter/lib/ui/ui_dart_state.h"
 #include "flutter/lib/ui/window/platform_configuration.h"
 #include "flutter/runtime/test_font_data.h"
+#include "impeller/typographer/typographer_context.h"
 #include "rapidjson/document.h"
 #include "rapidjson/rapidjson.h"
+#include "third_party/skia/include/core/SkData.h"
 #include "third_party/skia/include/core/SkFontMgr.h"
 #include "third_party/skia/include/core/SkGraphics.h"
 #include "third_party/skia/include/core/SkStream.h"
@@ -29,6 +35,201 @@
 #endif
 
 namespace flutter {
+
+struct FlaxFontData {
+  uint64_t key;
+  sk_sp<SkData> bytes;
+  sk_sp<SkTypeface> typeface;
+};
+
+// Keeping sources in the provider also retains them for live Paragraphs.
+class ScopedFontAssetProvider : public txt::TypefaceFontAssetProvider {
+ public:
+  explicit ScopedFontAssetProvider(std::shared_ptr<FontCollection> parent)
+      : parent_(std::move(parent)) {
+    parent_->scoped_collections_++;
+  }
+
+  ~ScopedFontAssetProvider() override {
+    parent_->scoped_families_ -= families_.size();
+    parent_->scoped_collections_--;
+    bool retired_source = false;
+    // Drop expired keys as owners retire, even if nobody requests diagnostics.
+    {
+      std::lock_guard<std::mutex> lock(parent_->font_data_mutex_);
+      for (auto& [family, faces] : families_) {
+        for (auto& source : faces) {
+          const auto key = source->key;
+          source.reset();
+          auto found = parent_->font_data_.find(key);
+          if (found != parent_->font_data_.end()) {
+            retired_source |=
+                std::erase_if(found->second, [](const auto& entry) {
+                  return entry.expired();
+                }) > 0;
+            if (found->second.empty())
+              parent_->font_data_.erase(found);
+          }
+        }
+      }
+    }
+    if (retired_source) {
+      impeller::TypographerContext::InvalidateFontCaches();
+    }
+  }
+
+  bool Add(const std::string& family, std::shared_ptr<FlaxFontData> source) {
+    const auto key = CanonicalFamilyName(family);
+    auto& faces = families_[key];
+    if (std::find(faces.begin(), faces.end(), source) != faces.end()) {
+      return false;
+    }
+    if (faces.empty()) {
+      parent_->scoped_families_++;
+    }
+    RegisterTypeface(source->typeface, family);
+    faces.push_back(std::move(source));
+    return true;
+  }
+
+  sk_sp<SkFontStyleSet> MatchFamily(const std::string& family) override {
+    auto match = txt::TypefaceFontAssetProvider::MatchFamily(family);
+    return match ? match
+                 : parent_->dynamic_font_manager_->font_provider().MatchFamily(
+                       family);
+  }
+
+ private:
+  std::shared_ptr<FontCollection> parent_;
+  std::unordered_map<std::string, std::vector<std::shared_ptr<FlaxFontData>>>
+      families_;
+};
+
+std::shared_ptr<FlaxFontData> FontCollection::AcquireFontData(
+    Dart_Handle bytes,
+    std::string& error) {
+  tonic::Uint8List input(bytes);
+  const auto length = static_cast<size_t>(input.num_elements());
+  const auto key = std::hash<std::string_view>{}(
+      std::string_view(reinterpret_cast<const char*>(input.data()), length));
+  std::lock_guard<std::mutex> lock(font_data_mutex_);
+  auto& bucket = font_data_[key];
+  for (const auto& entry : bucket) {
+    if (auto source = entry.lock()) {
+      // The checksum selects a bucket; exact bytes establish identity.
+      if (source->bytes->size() == length &&
+          std::memcmp(source->bytes->data(), input.data(), length) == 0) {
+        return source;
+      }
+    }
+  }
+  auto data = SkData::MakeWithCopy(input.data(), input.num_elements());
+  input.Release();
+  auto typeface = txt::GetDefaultFontManager()->makeFromData(data);
+  if (!typeface) {
+    if (bucket.empty())
+      font_data_.erase(key);
+    error = "Invalid module font data";
+    return nullptr;
+  }
+  auto source = std::make_shared<FlaxFontData>();
+  source->key = key;
+  source->bytes = std::move(data);
+  source->typeface = std::move(typeface);
+  bucket.push_back(source);
+  return source;
+}
+
+IMPLEMENT_WRAPPERTYPEINFO(ui, FlaxFontCollection);
+
+void FlaxFontCollection::Create(Dart_Handle wrapper) {
+  UIDartState::ThrowIfUIOperationsProhibited();
+  auto parent = UIDartState::Current()
+                    ->platform_configuration()
+                    ->client()
+                    ->GetFontCollection()
+                    .shared_from_this();
+  auto result = fml::MakeRefCounted<FlaxFontCollection>(std::move(parent));
+  result->AssociateWithDartWrapper(wrapper);
+}
+
+FlaxFontCollection::FlaxFontCollection(std::shared_ptr<FontCollection> parent)
+    : parent_(std::move(parent)) {
+  public_font_revision_ = parent_->public_font_revision_;
+  auto provider = std::make_unique<ScopedFontAssetProvider>(parent_);
+  provider_ = provider.get();
+  collection_ = parent_->collection_->CreateScopedCollection(
+      sk_make_sp<txt::AssetFontManager>(std::move(provider)));
+}
+
+FlaxFontCollection::~FlaxFontCollection() = default;
+
+bool FlaxFontCollection::addFont(Dart_Handle bytes, const std::string& family) {
+  UIDartState::ThrowIfUIOperationsProhibited();
+  if (family.find('\0') != std::string::npos) {
+    Dart_ThrowException(tonic::ToDart("Invalid font family"));
+    return false;
+  }
+  std::string error;
+  auto source = parent_->AcquireFontData(bytes, error);
+  if (!source) {
+    Dart_ThrowException(tonic::ToDart(error));
+    return false;
+  }
+  SkString intrinsic_family;
+  if (family.empty())
+    source->typeface->getFamilyName(&intrinsic_family);
+  const auto added = provider_->Add(
+      family.empty() ? intrinsic_family.c_str() : family, std::move(source));
+  if (added) {
+    collection_->ClearFontFamilyCache();
+  }
+  return added;
+}
+
+std::shared_ptr<txt::FontCollection> FlaxFontCollection::GetFontCollection() {
+  if (public_font_revision_ != parent_->public_font_revision_) {
+    collection_->RefreshPublicFonts(*parent_->collection_);
+    public_font_revision_ = parent_->public_font_revision_;
+  }
+  return collection_;
+}
+
+void FlaxFontCollection::dispose() {
+  collection_.reset();
+  provider_ = nullptr;
+  parent_.reset();
+  ClearDartWrapper();
+}
+
+Dart_Handle FontCollection::ScopedFontStats() {
+  UIDartState::ThrowIfUIOperationsProhibited();
+  auto& fonts = UIDartState::Current()
+                    ->platform_configuration()
+                    ->client()
+                    ->GetFontCollection();
+  std::lock_guard<std::mutex> lock(fonts.font_data_mutex_);
+  int64_t sources = 0;
+  int64_t bytes = 0;
+  for (auto it = fonts.font_data_.begin(); it != fonts.font_data_.end();) {
+    for (const auto& entry : it->second) {
+      if (auto source = entry.lock()) {
+        sources++;
+        bytes += source->bytes->size();
+      }
+    }
+    std::erase_if(it->second,
+                  [](const auto& entry) { return entry.expired(); });
+    if (it->second.empty())
+      it = fonts.font_data_.erase(it);
+    else
+      ++it;
+  }
+
+  return tonic::ToDart(std::vector<int64_t>{
+      static_cast<int64_t>(fonts.scoped_collections_.load()),
+      static_cast<int64_t>(fonts.scoped_families_.load()), sources, bytes});
+}
 
 FontCollection::FontCollection()
     : collection_(std::make_shared<txt::FontCollection>()) {
@@ -48,6 +249,7 @@ std::shared_ptr<txt::FontCollection> FontCollection::GetFontCollection() const {
 void FontCollection::SetupDefaultFontManager(
     uint32_t font_initialization_data) {
   collection_->SetupDefaultFontManager(font_initialization_data);
+  public_font_revision_++;
 }
 
 // Font manifest yaml format:
@@ -68,6 +270,7 @@ void FontCollection::SetupDefaultFontManager(
 // Structure described in https://docs.flutter.dev/cookbook/design/fonts
 void FontCollection::RegisterFonts(
     const std::shared_ptr<AssetManager>& asset_manager) {
+  public_font_revision_++;
 #if FML_OS_MACOSX || FML_OS_IOS
   RegisterSystemFonts(*dynamic_font_manager_);
 #endif
@@ -129,6 +332,7 @@ void FontCollection::RegisterFonts(
 }
 
 void FontCollection::RegisterTestFonts() {
+  public_font_revision_++;
   std::vector<sk_sp<SkTypeface>> test_typefaces = GetTestFontData();
   std::unique_ptr<txt::TypefaceFontAssetProvider> font_provider =
       std::make_unique<txt::TypefaceFontAssetProvider>();
@@ -151,8 +355,8 @@ void FontCollection::RegisterTestFonts() {
 void FontCollection::LoadFontFromList(Dart_Handle font_data_handle,
                                       Dart_Handle callback,
                                       const std::string& family_name) {
-  tonic::Uint8List font_data(font_data_handle);
   UIDartState::ThrowIfUIOperationsProhibited();
+  tonic::Uint8List font_data(font_data_handle);
   FontCollection& font_collection = UIDartState::Current()
                                         ->platform_configuration()
                                         ->client()
@@ -169,6 +373,7 @@ void FontCollection::LoadFontFromList(Dart_Handle font_data_handle,
   } else {
     font_provider.RegisterTypeface(typeface, family_name);
   }
+  font_collection.public_font_revision_++;
   font_collection.collection_->ClearFontFamilyCache();
 
   font_data.Release();

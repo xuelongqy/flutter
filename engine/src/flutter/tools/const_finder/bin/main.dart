@@ -67,6 +67,10 @@ void main(List<String> args) {
     ..addFlag('pretty', negatable: false, help: 'Pretty print JSON output (defaults to false).')
     ..addFlag('help', abbr: 'h', negatable: false, help: 'Print usage and exit')
     ..addOption(
+      'non-constant-factory-pragma',
+      help: 'A factory pragma whose runtime assets are subset by another compiler.',
+    )
+    ..addOption(
       'annotation-class-name',
       help:
           'The class name of the annotation for classes that should be '
@@ -106,6 +110,7 @@ void main(List<String> args) {
     className: getArg<String>('class-name'),
     annotationClassName: annotationClassName,
     annotationClassLibraryUri: annotationClassLibraryUri,
+    nonConstantFactoryPragma: getArg<String?>('non-constant-factory-pragma'),
   );
 
   final encoder = getArg<bool>('pretty') ? const JsonEncoder.withIndent('  ') : const JsonEncoder();

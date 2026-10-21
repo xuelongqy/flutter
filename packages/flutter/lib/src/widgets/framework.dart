@@ -12,6 +12,7 @@ library;
 
 import 'dart:async';
 import 'dart:collection';
+import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/rendering.dart';
@@ -57,6 +58,24 @@ export 'package:flutter/rendering.dart'
 // int _counter = 0;
 // Future<Directory> getApplicationDocumentsDirectory() async => Directory('');
 // late AnimationController animation;
+
+/// Native font ownership used by relocated Flax content, independently of JS.
+abstract interface class FlaxFontResources implements Listenable {
+  /// The native private lookup domain.
+  ui.FlaxFontCollection get collection;
+
+  /// Keeps the domain alive for mounted native content.
+  void retain();
+
+  /// Releases one owner after unmount or a domain change.
+  void release();
+}
+
+/// An explicit font boundary takes precedence over a Widget's resource origin.
+abstract interface class FlaxFontResourceBoundary {
+  /// Null explicitly selects inherited public/host behavior.
+  FlaxFontResources? get fontResources;
+}
 
 class _DebugOnly {
   const _DebugOnly();
@@ -3575,6 +3594,73 @@ abstract class Element extends DiagnosticableTree implements BuildContext {
     assert(debugMaybeDispatchCreated('widgets', 'Element', this));
   }
 
+  static final Expando<FlaxFontResources> _fontOrigins = Expando<FlaxFontResources>();
+
+  /// Records configuration provenance without wrapping or retaining a JS Session.
+  @internal
+  static void attachFlaxFontResources(Widget widget, FlaxFontResources resources) {
+    _fontOrigins[widget] = resources;
+  }
+
+  FlaxFontResources? _fontResources;
+  FlaxFontResources? _retainedFontResources;
+  FlaxFontResources? _fontDependency;
+  bool _hadFontDependency = false;
+  bool _fontBoundaryPresent = false;
+  bool _fontConsumer = false;
+  bool _fontResourcesChanged = false;
+
+  void _fontChanged() {
+    _fontResourcesChanged = true;
+    markNeedsBuild();
+  }
+
+  /// Subscribes only actual font consumers; ordinary Elements inherit one pointer.
+  @internal
+  FlaxFontResources? dependOnFlaxFontResources() {
+    assert(_debugCheckStateIsActiveForAncestorLookup());
+    _fontConsumer = true;
+    final FlaxFontResources? resources = _fontResources;
+    if (!identical(_fontDependency, resources)) {
+      _fontDependency?.removeListener(_fontChanged);
+      _fontDependency = resources;
+      resources?.addListener(_fontChanged);
+    }
+    return resources;
+  }
+
+  void _updateFontResources({bool propagate = true}) {
+    final FlaxFontResources? parentResources = _parent?._fontResources;
+    final bool parentBoundary = _parent?._fontBoundaryPresent ?? false;
+    final explicitBoundary = widget is FlaxFontResourceBoundary;
+    final FlaxFontResources? resources = widget is FlaxFontResourceBoundary
+        ? (widget as FlaxFontResourceBoundary).fontResources
+        : parentBoundary
+        ? parentResources
+        : _fontOrigins[widget];
+    final bool boundaryPresent = explicitBoundary || parentBoundary || resources != null;
+    final FlaxFontResources? retained = identical(resources, parentResources) ? null : resources;
+    if (!identical(retained, _retainedFontResources)) {
+      retained?.retain();
+      _retainedFontResources?.release();
+      _retainedFontResources = retained;
+    }
+    if (identical(resources, _fontResources) && boundaryPresent == _fontBoundaryPresent) {
+      return;
+    }
+    _fontResources = resources;
+    _fontBoundaryPresent = boundaryPresent;
+    if (_fontConsumer) {
+      _fontDependency?.removeListener(_fontChanged);
+      _fontDependency = null;
+      _fontChanged();
+    }
+    // Identity-preserved children also need a changed ambient font domain.
+    if (propagate) {
+      visitChildren((Element child) => child._updateFontResources());
+    }
+  }
+
   Element? _parent;
   _NotificationNode? _notificationTree;
 
@@ -4369,6 +4455,7 @@ abstract class Element extends DiagnosticableTree implements BuildContext {
       owner!._registerGlobalKey(key, this);
     }
     _updateInheritance();
+    _updateFontResources(propagate: false);
     attachNotificationTree();
   }
 
@@ -4404,6 +4491,7 @@ abstract class Element extends DiagnosticableTree implements BuildContext {
       return true;
     }());
     _widget = newWidget;
+    _updateFontResources();
   }
 
   /// Change the slot that the given child occupies in its parent.
@@ -4768,13 +4856,15 @@ abstract class Element extends DiagnosticableTree implements BuildContext {
     assert(_lifecycleState == _ElementLifecycle.inactive);
     assert(owner != null);
     final bool hadDependencies =
-        (_dependencies?.isNotEmpty ?? false) || _hadUnsatisfiedDependencies;
+        (_dependencies?.isNotEmpty ?? false) || _hadUnsatisfiedDependencies || _hadFontDependency;
     _lifecycleState = _ElementLifecycle.active;
     // We unregistered our dependencies in deactivate, but never cleared the list.
     // Since we're going to be reused, let's clear our list now.
     _dependencies?.clear();
     _hadUnsatisfiedDependencies = false;
+    _hadFontDependency = false;
     _updateInheritance();
+    _updateFontResources(propagate: false);
     attachNotificationTree();
     if (_dirty) {
       owner!.scheduleBuildFor(this);
@@ -4819,6 +4909,13 @@ abstract class Element extends DiagnosticableTree implements BuildContext {
   /// This method is immediately called after [Element.deactivate], even if that
   /// call throws an exception.
   void _ensureDeactivated() {
+    _hadFontDependency |= _fontConsumer;
+    _fontConsumer = false;
+    if (_fontDependency != null) {
+      _fontDependency!.removeListener(_fontChanged);
+      _fontDependency = null;
+      _hadFontDependency = true;
+    }
     if (_dependencies case final Set<InheritedElement> dependencies? when dependencies.isNotEmpty) {
       for (final dependency in dependencies) {
         dependency.removeDependent(this);
@@ -4873,6 +4970,9 @@ abstract class Element extends DiagnosticableTree implements BuildContext {
     }
     // Release resources to reduce the severity of memory leaks caused by
     // defunct, but accidentally retained Elements.
+    _retainedFontResources?.release();
+    _retainedFontResources = null;
+    _fontResources = null;
     _widget = null;
     _dependencies = null;
     _lifecycleState = _ElementLifecycle.defunct;
@@ -5539,6 +5639,10 @@ abstract class Element extends DiagnosticableTree implements BuildContext {
       return true;
     }());
     try {
+      if (_fontResourcesChanged) {
+        _fontResourcesChanged = false;
+        didChangeDependencies();
+      }
       performRebuild();
     } finally {
       assert(() {
