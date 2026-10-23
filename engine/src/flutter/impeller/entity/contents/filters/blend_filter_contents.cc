@@ -171,7 +171,8 @@ static std::optional<Entity> AdvancedBlend(
                                                  RenderPass& pass) {
     auto& data_host_buffer = renderer.GetTransientsDataBuffer();
 
-    auto size = pass.GetRenderTargetSize();
+    // Keep UVs in coverage space; rounding the texture must not rescale inputs.
+    auto size = coverage.GetSize();
 
     std::array<typename VS::PerVertexData, 4> vertices = {
         typename VS::PerVertexData{Point(0, 0), dst_uvs[0], src_uvs[0]},
@@ -242,12 +243,12 @@ static std::optional<Entity> AdvancedBlend(
     return std::nullopt;
   }
   fml::StatusOr<RenderTarget> render_target =
-      renderer.MakeSubpass("Advanced Blend Filter",            //
-                           ISize(subpass_coverage.GetSize()),  //
-                           command_buffer,                     //
-                           callback,                           //
-                           /*msaa_enabled=*/false,             //
-                           /*depth_stencil_enabled=*/false     //
+      renderer.MakeSubpass("Advanced Blend Filter",                 //
+                           ISize::Ceil(subpass_coverage.GetSize()),  //
+                           command_buffer,                          //
+                           callback,                                //
+                           /*msaa_enabled=*/false,                  //
+                           /*depth_stencil_enabled=*/false          //
       );
   if (!render_target.ok()) {
     return std::nullopt;
@@ -628,12 +629,12 @@ static std::optional<Entity> PipelineBlend(
   }
 
   fml::StatusOr<RenderTarget> render_target =
-      renderer.MakeSubpass("Pipeline Blend Filter",            //
-                           ISize(subpass_coverage.GetSize()),  //
-                           command_buffer,                     //
-                           callback,                           //
-                           /*msaa_enabled=*/false,             //
-                           /*depth_stencil_enabled=*/false     //
+      renderer.MakeSubpass("Pipeline Blend Filter",                 //
+                           ISize::Ceil(subpass_coverage.GetSize()),  //
+                           command_buffer,                          //
+                           callback,                                //
+                           /*msaa_enabled=*/false,                  //
+                           /*depth_stencil_enabled=*/false          //
       );
 
   if (!render_target.ok()) {
