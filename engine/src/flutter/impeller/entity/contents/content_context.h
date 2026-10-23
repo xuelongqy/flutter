@@ -233,6 +233,15 @@ class ContentContext {
 
   const Capabilities& GetDeviceCapabilities() const;
 
+  // Raster-thread scope for dependent blur/color-matrix passes. No render
+  // encoder may be active in this buffer while preparing those inputs.
+  void SetSubpassCommandBuffer(std::shared_ptr<CommandBuffer> command_buffer);
+
+  std::shared_ptr<CommandBuffer> CreateSubpassCommandBuffer() const;
+
+  bool EnqueueSubpassCommandBuffer(
+      std::shared_ptr<CommandBuffer> command_buffer) const;
+
   using SubpassCallback =
       std::function<bool(const ContentContext&, RenderPass&)>;
 
@@ -386,6 +395,8 @@ class ContentContext {
   bool is_texture_caching_enabled_ = false;
   mutable std::unordered_map<const flutter::DlImage*, std::shared_ptr<Texture>>
       texture_cache_;
+
+  std::shared_ptr<CommandBuffer> subpass_command_buffer_;
 
   ContentContext(const ContentContext&) = delete;
 

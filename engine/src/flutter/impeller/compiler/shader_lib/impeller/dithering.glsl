@@ -7,8 +7,8 @@
 
 #include <impeller/types.glsl>
 
-/// The dithering rate, which is 1.0 / 64.0, or 0.015625.
-const float kDitherRate = 1.0 / 64.0;
+/// One RGBA8 code value; the dither stays below half a quantization step.
+const float kDitherRate = 1.0 / 255.0;
 
 /// Returns the closest color to the input color using 8x8 ordered dithering.
 ///

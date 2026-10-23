@@ -25,6 +25,17 @@ std::optional<Rect> EntityPassClipStack::CurrentClipCoverage() const {
   return subpass_state_.back().clip_coverage.back().coverage;
 }
 
+std::optional<Rect> EntityPassClipStack::ParentClipCoverage() const {
+  FML_DCHECK(subpass_state_.size() > 1);
+  return subpass_state_[subpass_state_.size() - 2]
+      .clip_coverage.back()
+      .coverage;
+}
+
+bool EntityPassClipStack::HasSubpassClip() const {
+  return subpass_state_.back().clip_coverage.size() > 1;
+}
+
 bool EntityPassClipStack::HasCoverage() const {
   return !subpass_state_.back().clip_coverage.empty();
 }

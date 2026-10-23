@@ -45,6 +45,10 @@ class EntityPassClipStack {
 
   std::optional<Rect> CurrentClipCoverage() const;
 
+  std::optional<Rect> ParentClipCoverage() const;
+
+  bool HasSubpassClip() const;
+
   void PushSubpass(std::optional<Rect> subpass_coverage, size_t clip_height);
 
   void PopSubpass();

@@ -9,6 +9,45 @@ Other native V8 targets, device debug/profile and simulator profile/release rema
 
 ## Build
 
+The companion Canvas plugin uses the Canvas engine extension:
+`canvas_decoder.inc` validates protocol v1, owns drawing state and records all 48
+commands and 13 path operations into Flutter DisplayLists. One plugin installation
+owns its surface states and image registrations on the UI isolate. Its non-leaf
+entry accepts ordinary and external Uint8List storage synchronously; failed batches
+publish neither state nor a picture. The canonical `canvas.h` header is maintained
+with the Flax Canvas package. Dart retains widgets, history composition and async I/O.
+The plugin requires this engine extension and has no Dart decoder fallback. Installation
+uses the dispatch entry point without an exact feature-version gate. Preserve existing
+operation IDs and payload semantics when adding capabilities. The legacy version query
+remains for prior callers and diagnostics; compatible additions do not bump it. The plugin
+retains stroke hit tests, synchronous renderer pixel readback, text options, maxWidth
+and metrics, and adds ordered numeric filters, source-alpha shadows, full-surface
+composition and font-relative spacing. Text uses primary-face metrics and BASE tables. ImageData uploads premultiply straight RGBA; reset clears the output.
+Readback waits at most 10 seconds and never pins Dart bytes while waiting.
+Canvas shares the Session's existing FlaxFontCollection with drawing and
+measurement, refreshes public font registrations and enables native bold/italic
+synthesis. A host-independent CPU encoder exports straight RGBA8 as JPEG or WebP
+on a Dart worker isolate; ordinary drawing/readback operations remain on the UI
+isolate. PNG keeps the existing asynchronous Flutter encoder.
+roundRect preserves dash origin, winding and the final (x,y) subpath. SVG Path2D
+retains complete segments before a syntax error, delegates geometry to Skia and
+starts the required final subpath; addPath does the same after its transform.
+Text accepts the companion parser's normalized fractional weights and oblique
+angles, passes wght/slnt variation coordinates and shears static oblique faces
+around their baseline while preserving gradient/pattern coordinates.
+
+This experimental branch also retains a solid-fill Canvas recording probe as
+`__flaxCanvasPrototype`. It compares direct JSI calls with binary batch decoding into
+Flutter DisplayLists. Runtime shutdown retires pending frames explicitly. The companion
+Flax checkout's `experiments/canvas_native` owns the benchmark and isolated build
+helper. The probe is not a supported application API;
+native ABI 2 and the binding table remain unchanged.
+
+The isolated Canvas helper builds both the Debug test executable and macOS framework,
+and places the framework in its own XCFramework. Debug and Release application gates
+compare packaged engine bytes after signature removal and verify the framework loaded
+by dyld. The helper reuses base build commands without replacing base engine artifacts.
+
 From the Flutter checkout, after the ordinary engine dependencies are synced:
 
 ```sh
@@ -43,6 +82,11 @@ GN selects Xcode's linker for its SDK's TAPI format. Tool pins remain intact.
 Framework dependencies are copied into `FlutterMacOS.framework/Versions/A/Libraries`;
 the test executable uses an adjacent `Libraries` directory.
 
+The Canvas mobile experiment builds complete isolated targets, including renderer
+shaders and framework/JAR packaging. Android exports the Canvas dispatch and probe
+symbols. The companion `experiments/canvas_native/run_mobile.dart` runs the shared
+Canvas command, UI, bitmap/font and original-threshold WPT cases in an installed app.
+
 For Android, put Python 3.11's `python3` on PATH and install the NDK revision recorded
 by the verified V8 SDK's
 `metadata.hostTools.androidNdk` and set `ANDROID_HOME`. The engine uses that NDK's
@@ -69,6 +113,22 @@ Existing release SDK assets are not rebuilt or changed. CMake 3.24 or newer, Nin
 Xcode are required. Source stamps reject edits, missing patches and recipe changes;
 use `build_hermes.py --cache /fresh/path` and pass its output with `--hermes-build` to
 keep a previous producer intact.
+Matching simulator and device builds can reuse one prepared cache. Verification
+unwinds the patch stack in reverse order in a temporary copy, so overlapping patches
+are validated without modifying the prepared sources.
+
+The pinned Hermes patch set also corrects invalid canonical numeric TypedArray keys.
+Negative, fractional and out-of-range pixel indices remain absent instead of becoming
+ordinary properties; value conversion and native view identity are preserved. No JS
+Proxy or Canvas API change is needed. Rebuild the Hermes producer and dependent engine
+after changing this patch. The boundary follows the
+[ECMAScript TypedArray internal methods](https://tc39.es/ecma262/multipage/ordinary-and-exotic-objects-behaviours.html#sec-typedarray-exotic-objects).
+Run its small regression against the patched host CLI:
+
+```sh
+cmake --build /path/to/hermes-cache/host-tools --target hermes
+/path/to/hermes-cache/host-tools/bin/hermes -O engine/src/flutter/flax/native/hermes/typedarray_indices.js
+```
 
 ```sh
 python3 engine/src/flutter/flax/tools/build_engine.py --target ios-simulator-arm64 --mode debug
@@ -143,6 +203,9 @@ tracing. Bridge indices contain weak business values. JS work requests an idle V
 collection; Flutter
 idle notifications check Dart ownership without marking the JS heap changed.
 Requests are batched on the UI thread. GC callbacks never invoke business code.
+Only a completed V8 major collection requests another joint pass. Minor, incremental
+and weak-callback phases do not escalate to full Dart/V8 collections; idle work still
+provides eventual collection without creating a frame-by-frame GC feedback loop.
 Closing a Context releases only its edges; isolate shutdown cleans remaining
 runtimes before Dart handles become invalid. A Dart origin may expire while its JS
 peer still retains another Dart target. Conditional marking ignores finalized, still
@@ -156,6 +219,14 @@ joint tracing all participating VM markers reach the final marking phase before 
 processing, so mixed callback chains across sessions preserve their Dart business roots.
 Active JS jobs defer joint tracing and conservatively retain bridge peers until a safe
 owner-thread checkpoint. Closing a session clears only its VM's edges.
+
+Hades analytics distinguish completed old-generation collection from young and waiting
+phases. Only old-generation pressure requests a joint pass; delayed statistics bearing
+the `Flax joint GC` cause cannot request another pass. The idle timer checks Flutter's
+last frame time and postpones collection while frames arrive within 100 ms. It keeps
+the one-second check after animation stops, while Dart and Hades old-generation
+pressure bypass the frame check. This avoids unconditional full collections between
+animation frames without changing cross-heap reachability.
 
 Only one UI isolate per Dart isolate group is supported. Background runtime
 creation and a second UI isolate in that group fail explicitly. GC does not
@@ -204,3 +275,38 @@ The superseded global managed-font registration API is removed. Host family name
 no reserved Flax prefix. The build helper installs generated sky_engine declarations
 for analyzer/Pub. Rebuild matching Debug/Release engines whenever the dart:ui interface
 changes.
+
+Canvas bitmap decoding and explicit pixel conversion also run through CPU-only
+extension operations 16/17 in a Dart worker isolate. SkCodec handles embedded profiles
+and EXIF; crop/resize/flip preserves straight pixels until requested alpha conversion.
+No UI handles cross isolates. Command 48 draws the existing ImageData extension using
+the regular image paint/state path. Existing operation IDs and signatures are unchanged.
+
+Canvas snapshots and readback explicitly select RGBA8 instead of the display
+format. Explicit MSAA snapshots use lossless resolve textures; other Flutter snapshots
+retain their format selection. Snapshot images use Flutter deferred-image ownership.
+
+Metal Gaussian blurs encode dependent passes in one command buffer. For an
+integer-aligned, unity-scale decal blur with matching RGBA8, BGRA8 or XR10 textures,
+the vertical pass samples the existing source and transparent gutter directly,
+avoiding an identity copy. Both directional kernels and the source bitmap layers
+remain unchanged. Bounded, rescaled, mipmapped and other-format inputs retain the
+copy pass. Other backends retain separate buffers for the older Adreno workaround.
+Metal also continues a simple child layer restore into an unused offscreen parent
+within the same command buffer. Rectangular scissor-only clips defer pass creation;
+the first draw installs the saved scissor, and clipped fills cannot become a full-target
+clear. Filters and advanced blends submit their input dependencies first. Source
+quantization and per-operation blending remain intact.
+Blur/color-matrix layer filters additionally prepare their dependencies before opening
+an unused output encoder and share that output's command buffer on Metal. The source
+is submitted early; other filters and backends retain their scheduling. The render
+passes and screen sampling remain separate, preserving all quantization boundaries.
+An unused transparent Metal layer can retain an already resolved source texture in
+place of an integer-aligned copy. Different extents require an unclipped source and a
+translation-only, unity-scale decal-blur/matrix chain that preserves transparent black.
+The logical layer bounds remain unchanged; the snapshot carries the source's integer
+offset. Later drawing materializes the original copy before proceeding. Downsampled,
+other-effect, clipped and previously painted targets retain their existing passes.
+Gradient dithering uses one RGBA8 code value (1/255), so its sub-half-step noise
+preserves exactly representable endpoints. The previous 1/64 amplitude could turn
+opaque primary-color plateaus into 254 during Metal readback.

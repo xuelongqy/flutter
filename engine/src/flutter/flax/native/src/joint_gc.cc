@@ -175,7 +175,10 @@ void JointHeap::ScheduleIdle(bool js_changed) {
     auto heap = weak.lock();
     if (!heap || heap->closed_) return;
     heap->idle_pending_ = false;
-    if (!heap->cells_.empty()) heap->Request(true);
+    if (!heap->cells_.empty()) {
+      TRACE_EVENT0("flutter", "FlaxRequestIdleGC");
+      heap->Request(true);
+    }
   }, fml::TimeDelta::FromMilliseconds(1000));
 }
 
@@ -236,6 +239,7 @@ void JointHeap::Collect(void* peer, const Dart_FlaxGC* gc) {
       if (cell->origin) gc->mark(gc->context, cell->origin);
       if (cell->target) gc->mark(gc->context, cell->target);
     }
+    TRACE_EVENT0("flutter", "FlaxDeferActiveDartGC");
     heap.Request(true);
     return;
   }
@@ -290,13 +294,21 @@ void JointHeap::Trace(JointCell* cell, cppgc::Visitor* visitor) {
   }
 }
 
-void JointHeap::JsCollected(v8::Isolate*, v8::GCType, v8::GCCallbackFlags, void* peer) {
+void JointHeap::JsCollected(v8::Isolate*, v8::GCType type, v8::GCCallbackFlags, void* peer) {
   auto& heap = *static_cast<JointHeap*>(peer);
   if (heap.joint_) heap.RestoreRoots();
-  else if (!heap.cells_.empty()) heap.Request(true);
+  // Minor/incremental/weak-callback phases do not complete JS heap tracing.
+  // Escalating each phase to a full Dart/V8 collection creates a GC feedback loop.
+  else if ((type & v8::kGCTypeMarkSweepCompact) && !heap.cells_.empty()) {
+    TRACE_EVENT0("flutter", "FlaxRequestV8GC");
+    heap.Request(true);
+  } else if (!heap.joint_) {
+    TRACE_EVENT0("flutter", "FlaxV8IntermediateGC");
+  }
 }
 
 void JointHeap::RequestFromDart(void* peer) {
+  TRACE_EVENT0("flutter", "FlaxRequestBackgroundDartGC");
   static_cast<JointHeap*>(peer)->Request(true);
 }
 

@@ -1214,7 +1214,8 @@ void FirstPassDispatcher::setImageFilter(const flutter::DlImageFilter* filter) {
 
 namespace {
 bool PixelFormatSupportsMSAA(std::optional<PixelFormat> pixel_format) {
-  return !pixel_format.has_value();
+  return !pixel_format.has_value() ||
+         pixel_format == PixelFormat::kR8G8B8A8UNormInt;
 }
 }  // namespace
 

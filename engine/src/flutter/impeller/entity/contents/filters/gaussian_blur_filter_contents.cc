@@ -556,7 +556,8 @@ fml::StatusOr<RenderTarget> MakeBlurSubpass(
     const SamplerDescriptor& sampler_descriptor,
     const BlurParameters& blur_info,
     std::optional<RenderTarget> destination_target,
-    const Quad& blur_uvs) {
+    const Quad& blur_uvs,
+    const DownsamplePassArgs* source_mapping = nullptr) {
   using VS = GaussianBlurVertexShader;
 
   if (blur_info.blur_sigma < kEhCloseEnough) {
@@ -568,7 +569,8 @@ fml::StatusOr<RenderTarget> MakeBlurSubpass(
 
   // TODO(gaaclarke): This blurs the whole image, but because we know the clip
   //                  region we could focus on just blurring that.
-  ISize subpass_size = input_texture->GetSize();
+  ISize subpass_size =
+      source_mapping ? source_mapping->subpass_size : input_texture->GetSize();
   ContentContext::SubpassCallback subpass_callback =
       [&](const ContentContext& renderer, RenderPass& pass) {
         GaussianBlurVertexShader::FrameInfo frame_info;
@@ -589,15 +591,21 @@ fml::StatusOr<RenderTarget> MakeBlurSubpass(
         GaussianBlurFragmentShader::BindFragInfo(
             pass, data_host_buffer.EmplaceUniform(frag_info));
 
+        const Quad& texture_uvs =
+            source_mapping ? source_mapping->uvs : blur_uvs;
         std::array<VS::PerVertexData, 4> vertices = {
-            VS::PerVertexData{blur_uvs[0], blur_uvs[0]},
-            VS::PerVertexData{blur_uvs[1], blur_uvs[1]},
-            VS::PerVertexData{blur_uvs[2], blur_uvs[2]},
-            VS::PerVertexData{blur_uvs[3], blur_uvs[3]},
+            VS::PerVertexData{blur_uvs[0], texture_uvs[0]},
+            VS::PerVertexData{blur_uvs[1], texture_uvs[1]},
+            VS::PerVertexData{blur_uvs[2], texture_uvs[2]},
+            VS::PerVertexData{blur_uvs[3], texture_uvs[3]},
         };
         pass.SetVertexBuffer(CreateVertexBuffer(vertices, data_host_buffer));
 
         SamplerDescriptor linear_sampler_descriptor = sampler_descriptor;
+        if (source_mapping) {
+          SetTileMode(&linear_sampler_descriptor, renderer,
+                      Entity::TileMode::kDecal);
+        }
         linear_sampler_descriptor.mag_filter = MinMagFilter::kLinear;
         linear_sampler_descriptor.min_filter = MinMagFilter::kLinear;
         GaussianBlurFragmentShader::BindTextureSampler(
@@ -861,14 +869,13 @@ std::optional<Entity> GaussianBlurFilterContents::RenderFilter(
     return result;
   }
 
-  // Note: The code below uses three different command buffers when it would be
-  // possible to combine the operations into a single buffer. From testing and
-  // user bug reports (see https://github.com/flutter/flutter/issues/154046 ),
-  // this sometimes causes deviceLost errors on older Adreno devices. Breaking
-  // the work up into three different command buffers seems to prevent this
-  // crash.
+  // Metal can encode the dependent passes in one buffer without changing their
+  // order or intermediate textures. Keep separate buffers on other backends for
+  // older Adreno devices (https://github.com/flutter/flutter/issues/154046).
+  const bool combine_command_buffers =
+      renderer.GetContext()->GetBackendType() == Context::BackendType::kMetal;
   std::shared_ptr<CommandBuffer> command_buffer_1 =
-      renderer.GetContext()->CreateCommandBuffer();
+      renderer.CreateSubpassCommandBuffer();
   if (!command_buffer_1) {
     return std::nullopt;
   }
@@ -877,9 +884,39 @@ std::optional<Entity> GaussianBlurFilterContents::RenderFilter(
       blur_info.scaled_sigma, blur_info.padding, input_snapshot.value(),
       source_expanded_coverage_hint, source_bounds, inputs[0], snapshot_entity);
 
-  fml::StatusOr<RenderTarget> pass1_out = MakeDownsampleSubpass(
-      renderer, command_buffer_1, input_snapshot->texture,
-      input_snapshot->sampler_descriptor, downsample_pass_args, tile_mode_);
+  const auto input_size = input_snapshot->texture->GetSize();
+  const Quad padded_uvs = Rect::MakeSize(input_size)
+                              .Expand(blur_info.padding)
+                              .Scale(1.0f / Vector2(input_size))
+                              .GetPoints();
+  // An integer-aligned unorm copy only adds transparent padding. Decal sampling
+  // can supply that padding in the vertical pass without changing quantization.
+  const auto input_format =
+      input_snapshot->texture->GetTextureDescriptor().format;
+  const bool skip_copy =
+      combine_command_buffers && tile_mode_ == Entity::TileMode::kDecal &&
+      !bounds_.has_value() &&
+      renderer.GetDeviceCapabilities().SupportsDecalSamplerAddressMode() &&
+      downsample_pass_args.effective_scalar == Vector2(1, 1) &&
+      downsample_pass_args.uvs == padded_uvs &&
+      blur_info.scaled_sigma.y >= kEhCloseEnough &&
+      input_snapshot->texture->GetMipCount() == 1 &&
+      (input_format == PixelFormat::kR8G8B8A8UNormInt ||
+       input_format == PixelFormat::kB8G8R8A8UNormInt ||
+       input_format == PixelFormat::kB10G10R10A10XR) &&
+      input_format == renderer.GetDeviceCapabilities().GetDefaultColorFormat();
+  fml::StatusOr<RenderTarget> pass1_out = [&]() -> fml::StatusOr<RenderTarget> {
+    if (skip_copy) {
+      RenderTarget input_target;
+      ColorAttachment color;
+      color.texture = input_snapshot->texture;
+      input_target.SetColorAttachment(color, 0);
+      return input_target;
+    }
+    return MakeDownsampleSubpass(
+        renderer, command_buffer_1, input_snapshot->texture,
+        input_snapshot->sampler_descriptor, downsample_pass_args, tile_mode_);
+  }();
 
   if (!pass1_out.ok()) {
     return std::nullopt;
@@ -891,7 +928,8 @@ std::optional<Entity> GaussianBlurFilterContents::RenderFilter(
   Quad blur_uvs = {Point(0, 0), Point(1, 0), Point(0, 1), Point(1, 1)};
 
   std::shared_ptr<CommandBuffer> command_buffer_2 =
-      renderer.GetContext()->CreateCommandBuffer();
+      combine_command_buffers ? command_buffer_1
+                              : renderer.CreateSubpassCommandBuffer();
   if (!command_buffer_2) {
     return std::nullopt;
   }
@@ -908,29 +946,34 @@ std::optional<Entity> GaussianBlurFilterContents::RenderFilter(
           .step_size = 1,
           .apply_unpremultiply = false,
       },
-      /*destination_target=*/std::nullopt, blur_uvs);
+      /*destination_target=*/std::nullopt, blur_uvs,
+      skip_copy ? &downsample_pass_args : nullptr);
 
   if (!pass2_out.ok()) {
     return std::nullopt;
   }
+  Vector2 pass2_pixel_size =
+      1.0 / Vector2(pass2_out.value().GetRenderTargetTexture()->GetSize());
 
   std::shared_ptr<CommandBuffer> command_buffer_3 =
-      renderer.GetContext()->CreateCommandBuffer();
+      combine_command_buffers ? command_buffer_1
+                              : renderer.CreateSubpassCommandBuffer();
   if (!command_buffer_3) {
     return std::nullopt;
   }
 
   // Only ping pong if the first pass actually created a render target.
-  auto pass3_destination = pass2_out.value().GetRenderTargetTexture() !=
-                                   pass1_out.value().GetRenderTargetTexture()
-                               ? std::optional<RenderTarget>(pass1_out.value())
-                               : std::optional<RenderTarget>(std::nullopt);
+  auto pass3_destination =
+      !skip_copy && pass2_out.value().GetRenderTargetTexture() !=
+                        pass1_out.value().GetRenderTargetTexture()
+          ? std::optional<RenderTarget>(pass1_out.value())
+          : std::optional<RenderTarget>(std::nullopt);
 
   fml::StatusOr<RenderTarget> pass3_out = MakeBlurSubpass(
       renderer, command_buffer_3, /*input_pass=*/pass2_out.value(),
       input_snapshot->sampler_descriptor,
       BlurParameters{
-          .blur_uv_offset = Point(pass1_pixel_size.x, 0.0),
+          .blur_uv_offset = Point(pass2_pixel_size.x, 0.0),
           .blur_sigma = blur_info.scaled_sigma.x *
                         downsample_pass_args.effective_scalar.x,
           .blur_radius = ScaleBlurRadius(
@@ -944,19 +987,19 @@ std::optional<Entity> GaussianBlurFilterContents::RenderFilter(
     return std::nullopt;
   }
 
-  if (!(renderer.GetContext()->EnqueueCommandBuffer(
-            std::move(command_buffer_1)) &&
-        renderer.GetContext()->EnqueueCommandBuffer(
-            std::move(command_buffer_2)) &&
-        renderer.GetContext()->EnqueueCommandBuffer(
-            std::move(command_buffer_3)))) {
+  if (!renderer.EnqueueSubpassCommandBuffer(std::move(command_buffer_1))) {
+    return std::nullopt;
+  }
+  if (!combine_command_buffers &&
+      !(renderer.EnqueueSubpassCommandBuffer(std::move(command_buffer_2)) &&
+        renderer.EnqueueSubpassCommandBuffer(std::move(command_buffer_3)))) {
     return std::nullopt;
   }
 
   // The ping-pong approach requires that each render pass output has the same
   // size.
-  FML_DCHECK((pass1_out.value().GetRenderTargetSize() ==
-              pass2_out.value().GetRenderTargetSize()) &&
+  FML_DCHECK((skip_copy || pass1_out.value().GetRenderTargetSize() ==
+                               pass2_out.value().GetRenderTargetSize()) &&
              (pass2_out.value().GetRenderTargetSize() ==
               pass3_out.value().GetRenderTargetSize()));
 

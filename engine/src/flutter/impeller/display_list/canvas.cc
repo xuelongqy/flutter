@@ -15,7 +15,10 @@
 #include "display_list/effects/dl_color_filter.h"
 #include "display_list/effects/dl_color_source.h"
 #include "display_list/effects/dl_image_filter.h"
+#include "display_list/effects/image_filters/dl_color_filter_image_filter.h"
+#include "display_list/effects/image_filters/dl_compose_image_filter.h"
 #include "display_list/image/dl_image.h"
+#include "flutter/display_list/effects/image_filters/dl_blur_image_filter.h"
 #include "flutter/fml/logging.h"
 #include "flutter/fml/trace_event.h"
 #include "flutter/impeller/geometry/round_superellipse_param.h"
@@ -33,6 +36,7 @@
 #include "impeller/entity/contents/complex_rse_contents.h"
 #include "impeller/entity/contents/content_context.h"
 #include "impeller/entity/contents/filters/filter_contents.h"
+#include "impeller/entity/contents/filters/gaussian_blur_filter_contents.h"
 #include "impeller/entity/contents/framebuffer_blend_contents.h"
 #include "impeller/entity/contents/line_contents.h"
 #include "impeller/entity/contents/shadow_vertices_contents.h"
@@ -110,6 +114,24 @@ static void SetClipScissor(std::optional<Rect> clip_coverage,
   pass.SetScissor(scissor);
 }
 
+static bool CanBatchFilterSubpasses(const flutter::DlImageFilter& filter) {
+  switch (filter.type()) {
+    case flutter::DlImageFilterType::kBlur:
+      return true;
+    case flutter::DlImageFilterType::kColorFilter:
+      return filter.asColorFilter()->color_filter()->asMatrix() != nullptr;
+    case flutter::DlImageFilterType::kCompose: {
+      const auto* compose = filter.asCompose();
+      const auto inner = compose->inner();
+      const auto outer = compose->outer();
+      return (!inner || CanBatchFilterSubpasses(*inner)) &&
+             (!outer || CanBatchFilterSubpasses(*outer));
+    }
+    default:
+      return false;
+  }
+}
+
 static void ApplyFramebufferBlend(Entity& entity) {
   auto src_contents = entity.GetContents();
   auto contents = std::make_shared<FramebufferBlendContents>();
@@ -119,14 +141,45 @@ static void ApplyFramebufferBlend(Entity& entity) {
   entity.SetBlendMode(BlendMode::kSrc);
 }
 
+static bool CanElideTransparentPadding(const flutter::DlImageFilter& filter) {
+  // Rescaling changes the sample grid when the transparent border is omitted.
+  switch (filter.type()) {
+    case flutter::DlImageFilterType::kBlur: {
+      const auto* blur = filter.asBlur();
+      return blur->tile_mode() == flutter::DlTileMode::kDecal &&
+             GaussianBlurFilterContents::CalculateScale(
+                 GaussianBlurFilterContents::ScaleSigma(blur->sigma_x())) ==
+                 1 &&
+             GaussianBlurFilterContents::CalculateScale(
+                 GaussianBlurFilterContents::ScaleSigma(blur->sigma_y())) == 1;
+    }
+    case flutter::DlImageFilterType::kColorFilter:
+      return filter.asColorFilter()->color_filter()->asMatrix() &&
+             !filter.asColorFilter()
+                  ->color_filter()
+                  ->modifies_transparent_black();
+    case flutter::DlImageFilterType::kCompose: {
+      const auto* compose = filter.asCompose();
+      return (!compose->inner() ||
+              CanElideTransparentPadding(*compose->inner())) &&
+             (!compose->outer() ||
+              CanElideTransparentPadding(*compose->outer()));
+    }
+    default:
+      return false;
+  }
+}
+
 /// @brief Create the subpass restore contents, appling any filters or opacity
 ///        from the provided paint object.
 static std::shared_ptr<Contents> CreateContentsForSubpassTarget(
     const ContentContext& renderer,
     const Paint& paint,
     const std::shared_ptr<Texture>& target,
-    const Matrix& effect_transform) {
-  auto contents = TextureContents::MakeRect(Rect::MakeSize(target->GetSize()));
+    const Matrix& effect_transform,
+    Point texture_position) {
+  auto contents = TextureContents::MakeRect(
+      Rect::MakeOriginSize(texture_position, Size(target->GetSize())));
   contents->SetTexture(target);
   contents->SetLabel("Subpass");
   contents->SetSourceRect(Rect::MakeSize(target->GetSize()));
@@ -1334,7 +1387,8 @@ void Canvas::ClipGeometry(const Geometry& geometry,
           /*clip_height_floor=*/GetClipHeightFloor(),        //
           /*is_aa=*/is_aa);
 
-  if (clip_state_result.clip_did_change) {
+  if (clip_state_result.clip_did_change &&
+      render_passes_.back().GetInlinePassContext()->IsActive()) {
     // We only need to update the pass scissor if the clip state has changed.
     SetClipScissor(
         clip_coverage_stack_.CurrentClipCoverage(),
@@ -1357,18 +1411,16 @@ void Canvas::ClipGeometry(const Geometry& geometry,
   entity.SetTransform(clip_transform);
   entity.SetClipDepth(clip_depth);
 
-  GeometryResult geometry_result = geometry.GetPositionBuffer(
-      renderer_,                                                      //
-      entity,                                                         //
-      *render_passes_.back().GetInlinePassContext()->GetRenderPass()  //
-  );
+  GeometryResult geometry_result =
+      geometry.GetPositionBuffer(renderer_,              //
+                                 entity,                 //
+                                 GetCurrentRenderPass()  //
+      );
   clip_contents.SetGeometry(geometry_result);
   clip_coverage_stack_.GetLastReplayResult().clip_contents.SetGeometry(
       geometry_result);
 
-  clip_contents.Render(
-      renderer_, *render_passes_.back().GetInlinePassContext()->GetRenderPass(),
-      clip_depth);
+  clip_contents.Render(renderer_, GetCurrentRenderPass(), clip_depth);
 }
 
 void Canvas::DrawPoints(const Point points[],
@@ -1687,16 +1739,17 @@ std::optional<Rect> Canvas::GetLocalCoverageLimit() const {
 
   FML_CHECK(!render_passes_.empty());
   const LazyRenderingConfig& back_render_pass = render_passes_.back();
-  std::shared_ptr<Texture> back_texture =
-      back_render_pass.GetInlinePassContext()->GetTexture();
-  FML_CHECK(back_texture) << "Context is valid:"
-                          << back_render_pass.GetInlinePassContext()->IsValid();
+  const auto back_size = back_render_pass.GetEntityPassTarget()
+                             ->GetRenderTarget()
+                             .GetRenderTargetSize();
+  FML_CHECK(!back_size.IsEmpty())
+      << "Context is valid:"
+      << back_render_pass.GetInlinePassContext()->IsValid();
 
   // The maximum coverage of the subpass. Subpasses textures should never
   // extend outside the parent pass texture or the current clip coverage.
   std::optional<Rect> maybe_coverage_limit =
-      Rect::MakeOriginSize(GetGlobalPassPosition(),
-                           Size(back_texture->GetSize()))
+      Rect::MakeOriginSize(GetGlobalPassPosition(), Size(back_size))
           .Intersection(current_clip_coverage);
 
   if (!maybe_coverage_limit.has_value() || maybe_coverage_limit->IsEmpty()) {
@@ -1972,20 +2025,14 @@ bool Canvas::Restore() {
     auto lazy_render_pass = std::move(render_passes_.back());
     render_passes_.pop_back();
     // Force the render pass to be constructed if it never was.
-    lazy_render_pass.GetInlinePassContext()->GetRenderPass();
+    if (!lazy_render_pass.GetInlinePassContext()->HasDeferredTexture() &&
+        !lazy_render_pass.GetInlinePassContext()->GetRenderPass()) {
+      return false;
+    }
 
     SaveLayerState save_layer_state = save_layer_state_.back();
     save_layer_state_.pop_back();
     auto global_pass_position = GetGlobalPassPosition();
-
-    std::shared_ptr<Contents> contents = CreateContentsForSubpassTarget(
-        renderer_, save_layer_state.paint,                         //
-        lazy_render_pass.GetInlinePassContext()->GetTexture(),     //
-        Matrix::MakeTranslation(Vector3{-global_pass_position}) *  //
-            transform_stack_.back().transform                      //
-    );
-
-    lazy_render_pass.GetInlinePassContext()->EndPass();
 
     // Round the subpass texture position for pixel alignment with the parent
     // pass render target. By default, we draw subpass textures with nearest
@@ -2006,12 +2053,136 @@ bool Canvas::Restore() {
               .Round();
     }
 
+    const auto& layer_paint = save_layer_state.paint;
+    auto* parent_context = render_passes_.back().GetInlinePassContext();
+    const auto source_texture =
+        lazy_render_pass.GetInlinePassContext()->GetTexture();
+    const auto source_format = source_texture->GetTextureDescriptor().format;
+    const auto parent_clip = clip_coverage_stack_.ParentClipCoverage();
+    const auto source_bounds = Rect::MakeOriginSize(
+        subpass_texture_position, Size(source_texture->GetSize()));
+    const bool same_extent =
+        subpass_texture_position == Point(0, 0) &&
+        source_texture->GetSize() == parent_context->GetTexture()->GetSize();
+    const bool transparent_padding =
+        !save_layer_state_.empty() &&
+        save_layer_state_.back().paint.image_filter &&
+        save_layer_state_.back().paint.blend_mode == BlendMode::kSrcOver &&
+        save_layer_state_.back().paint.color.alpha == 1 &&
+        !save_layer_state_.back().paint.color_filter &&
+        !save_layer_state_.back().paint.invert_colors &&
+        !save_layer_state_.back().paint.mask_blur_descriptor &&
+        transform_stack_.back().transform.IsTranslationOnly() &&
+        CanElideTransparentPadding(
+            *save_layer_state_.back().paint.image_filter);
+    const bool defer_layer_copy =
+        render_passes_.size() > 1 &&
+        renderer_.GetContext()->GetBackendType() ==
+            Context::BackendType::kMetal &&
+        !parent_context->IsActive() && parent_context->GetPassCount() == 0 &&
+        !parent_context->HasDeferredTexture() &&
+        parent_context->GetPassTarget()
+                .GetRenderTarget()
+                .GetColorAttachment(0)
+                .clear_color == Color::BlackTransparent() &&
+        !layer_paint.image_filter && !layer_paint.color_filter &&
+        !layer_paint.invert_colors && !layer_paint.mask_blur_descriptor &&
+        layer_paint.color.alpha == 1 &&
+        (layer_paint.blend_mode == BlendMode::kSrc ||
+         layer_paint.blend_mode == BlendMode::kSrcOver) &&
+        (same_extent || transparent_padding) &&
+        Rect::MakeSize(parent_context->GetTexture()->GetSize())
+            .Contains(source_bounds) &&
+        source_texture->GetMipCount() == 1 &&
+        (source_format == PixelFormat::kR8G8B8A8UNormInt ||
+         source_format == PixelFormat::kB8G8R8A8UNormInt ||
+         source_format == PixelFormat::kB10G10R10A10XR) &&
+        source_format ==
+            parent_context->GetTexture()->GetTextureDescriptor().format &&
+        parent_clip.has_value() &&
+        IRect32::RoundOut(parent_clip->Shift(-global_pass_position))
+            .Contains(IRect32::RoundOut(source_bounds));
+    if (defer_layer_copy) {
+      // Keep the source resolve; an identical copy needs no second encoder.
+      if (!lazy_render_pass.GetInlinePassContext()->EndPass()) {
+        return false;
+      }
+      parent_context->DeferTexture(source_texture, subpass_texture_position,
+                                   ++current_depth_);
+      clip_coverage_stack_.PopSubpass();
+      transform_stack_.pop_back();
+      return true;
+    }
+    std::shared_ptr<Contents> contents = CreateContentsForSubpassTarget(
+        renderer_, save_layer_state.paint,                         //
+        lazy_render_pass.GetInlinePassContext()->GetTexture(),     //
+        Matrix::MakeTranslation(Vector3{-global_pass_position}) *  //
+            transform_stack_.back().transform,                     //
+        lazy_render_pass.GetInlinePassContext()->GetDeferredTexturePosition());
+
+    // Keep the resolve/quantization boundary. Simple copies can continue in
+    // an unused parent; filters must first prepare their dependent passes.
+    const bool continue_in_parent =
+        render_passes_.size() > 1 &&
+        renderer_.GetContext()->GetBackendType() ==
+            Context::BackendType::kMetal &&
+        !layer_paint.image_filter && !layer_paint.color_filter &&
+        !layer_paint.invert_colors && !layer_paint.mask_blur_descriptor &&
+        layer_paint.blend_mode <= Entity::kLastPipelineBlendMode;
+    const bool batch_filter_subpasses =
+        render_passes_.size() > 1 &&
+        renderer_.GetContext()->GetBackendType() ==
+            Context::BackendType::kMetal &&
+        !parent_context->IsActive() && parent_context->GetPassCount() == 0 &&
+        layer_paint.image_filter && !layer_paint.color_filter &&
+        !layer_paint.invert_colors && !layer_paint.mask_blur_descriptor &&
+        layer_paint.blend_mode <= Entity::kLastPipelineBlendMode &&
+        CanBatchFilterSubpasses(*layer_paint.image_filter);
+    if (!lazy_render_pass.GetInlinePassContext()->EndPass(
+            false, continue_in_parent ? parent_context : nullptr)) {
+      return false;
+    }
+
     Entity element_entity;
     element_entity.SetClipDepth(++current_depth_);
     element_entity.SetContents(std::move(contents));
     element_entity.SetBlendMode(save_layer_state.paint.blend_mode);
     element_entity.SetTransform(
         Matrix::MakeTranslation(Vector3(subpass_texture_position)));
+
+    bool should_render = true;
+    if (batch_filter_subpasses) {
+      // Resolve filter dependencies before opening the output encoder. All
+      // textures, sampling transforms, MSAA resolves and quantization stay put.
+      // Submit the source early, then encode only filter work and its output
+      // together. Holding source rasterization until the entire chain is ready
+      // regresses larger workloads on Metal.
+      auto filter_command_buffer =
+          renderer_.GetContext()->CreateCommandBuffer();
+      if (!filter_command_buffer) {
+        return false;
+      }
+      renderer_.SetSubpassCommandBuffer(filter_command_buffer);
+      auto filter_contents = std::static_pointer_cast<FilterContents>(
+          element_entity.GetContents());
+      // Match Entity::Render without opening the destination encoder yet.
+      if (!filter_contents->GetCoverageHint().has_value()) {
+        filter_contents->SetCoverageHint(
+            Rect::MakeSize(parent_context->GetPassTarget()
+                               .GetRenderTarget()
+                               .GetRenderTargetSize()));
+      }
+      auto filtered_entity = filter_contents->GetEntity(
+          renderer_, element_entity, filter_contents->GetCoverageHint());
+      renderer_.SetSubpassCommandBuffer(nullptr);
+      parent_context->ContinueWithCommandBuffer(
+          std::move(filter_command_buffer));
+      should_render = filtered_entity.has_value();
+      if (should_render) {
+        filtered_entity->SetClipDepth(element_entity.GetClipDepth());
+        element_entity = std::move(filtered_entity.value());
+      }
+    }
 
     if (element_entity.GetBlendMode() > Entity::kLastPipelineBlendMode) {
       if (renderer_.GetDeviceCapabilities().SupportsFramebufferFetch()) {
@@ -2043,10 +2214,16 @@ bool Canvas::Restore() {
       }
     }
 
-    element_entity.Render(
-        renderer_,                                                      //
-        *render_passes_.back().GetInlinePassContext()->GetRenderPass()  //
-    );
+    parent_context = render_passes_.back().GetInlinePassContext();
+    const bool parent_was_active = parent_context->IsActive();
+    auto& parent_pass = *parent_context->GetRenderPass();
+    if (!parent_was_active) {
+      SetClipScissor(clip_coverage_stack_.ParentClipCoverage(), parent_pass,
+                     global_pass_position);
+    }
+    if (should_render) {
+      element_entity.Render(renderer_, parent_pass);
+    }
     clip_coverage_stack_.PopSubpass();
     transform_stack_.pop_back();
 
@@ -2066,7 +2243,8 @@ bool Canvas::Restore() {
 
     // Clip restores are never required with depth based clipping.
     FML_DCHECK(!clip_state_result.should_render);
-    if (clip_state_result.clip_did_change) {
+    if (clip_state_result.clip_did_change &&
+        render_passes_.back().GetInlinePassContext()->IsActive()) {
       // We only need to update the pass scissor if the clip state has changed.
       SetClipScissor(
           clip_coverage_stack_.CurrentClipCoverage(),                      //
@@ -2320,7 +2498,8 @@ void Canvas::AddRenderEntityToCurrentPass(Entity& entity, bool reuse_depth) {
   // If the entity covers the current render target and is a solid color, then
   // conditionally update the backdrop color to its solid color value blended
   // with the current backdrop.
-  if (render_passes_.back().IsApplyingClearColor()) {
+  if (render_passes_.back().IsApplyingClearColor() &&
+      !clip_coverage_stack_.HasSubpassClip()) {
     std::optional<Color> maybe_color = entity.AsBackgroundColor(
         render_passes_.back().GetInlinePassContext()->GetTexture()->GetSize());
     if (maybe_color.has_value()) {
@@ -2389,20 +2568,32 @@ void Canvas::AddRenderEntityToCurrentPass(Entity& entity, bool reuse_depth) {
     }
   }
 
-  const std::shared_ptr<RenderPass>& result =
-      render_passes_.back().GetInlinePassContext()->GetRenderPass();
+  auto* pass_context = render_passes_.back().GetInlinePassContext();
+  const bool was_active = pass_context->IsActive();
+  const std::shared_ptr<RenderPass>& result = pass_context->GetRenderPass();
   if (!result) {
     // Failure to produce a render pass should be explained by specific errors
     // in `InlinePassContext::GetRenderPass()`, so avoid log spam and don't
     // append a validation log here.
     return;
   }
+  if (!was_active) {
+    SetClipScissor(clip_coverage_stack_.CurrentClipCoverage(), *result,
+                   GetGlobalPassPosition());
+  }
 
   entity.Render(renderer_, *result);
 }
 
 RenderPass& Canvas::GetCurrentRenderPass() const {
-  return *render_passes_.back().GetInlinePassContext()->GetRenderPass();
+  auto* pass_context = render_passes_.back().GetInlinePassContext();
+  const bool was_active = pass_context->IsActive();
+  auto& pass = *pass_context->GetRenderPass();
+  if (!was_active) {
+    SetClipScissor(clip_coverage_stack_.CurrentClipCoverage(), pass,
+                   GetGlobalPassPosition());
+  }
+  return pass;
 }
 
 void Canvas::SetBackdropData(
@@ -2685,7 +2876,8 @@ LazyRenderingConfig::LazyRenderingConfig(
 }
 
 bool LazyRenderingConfig::IsApplyingClearColor() const {
-  return !inline_pass_context_->IsActive();
+  return !inline_pass_context_->IsActive() &&
+         !inline_pass_context_->HasDeferredTexture();
 }
 
 EntityPassTarget* LazyRenderingConfig::GetEntityPassTarget() const {

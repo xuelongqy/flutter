@@ -63,7 +63,7 @@ std::optional<Snapshot> Contents::RenderToSnapshot(
   }
 
   std::shared_ptr<CommandBuffer> command_buffer =
-      renderer.GetContext()->CreateCommandBuffer();
+      renderer.CreateSubpassCommandBuffer();
   if (!command_buffer) {
     return std::nullopt;
   }
@@ -100,7 +100,7 @@ std::optional<Snapshot> Contents::RenderToSnapshot(
   if (!render_target.ok()) {
     return std::nullopt;
   }
-  if (!renderer.GetContext()->EnqueueCommandBuffer(std::move(command_buffer))) {
+  if (!renderer.EnqueueSubpassCommandBuffer(std::move(command_buffer))) {
     return std::nullopt;
   }
 

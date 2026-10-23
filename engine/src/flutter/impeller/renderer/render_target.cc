@@ -445,7 +445,12 @@ RenderTarget RenderTargetAllocator::CreateOffscreenMSAA(
         color_attachment_config.resolve_storage_mode;
     color0_resolve_tex_desc.format = pixel_format;
     color0_resolve_tex_desc.size = size;
-    color0_resolve_tex_desc.compression_type = CompressionType::kLossy;
+    // Explicit snapshot formats must preserve texels for pixel readback.
+    color0_resolve_tex_desc.compression_type =
+        (target_pixel_format.has_value() ||
+         pixel_format == PixelFormat::kR8G8B8A8UNormInt)
+            ? CompressionType::kLossless
+            : CompressionType::kLossy;
     color0_resolve_tex_desc.usage =
         TextureUsage::kRenderTarget | TextureUsage::kShaderRead;
     color0_resolve_tex_desc.mip_count = mip_count;
