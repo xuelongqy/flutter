@@ -36,17 +36,10 @@ Text accepts the companion parser's normalized fractional weights and oblique
 angles, passes wght/slnt variation coordinates and shears static oblique faces
 around their baseline while preserving gradient/pattern coordinates.
 
-This experimental branch also retains a solid-fill Canvas recording probe as
-`__flaxCanvasPrototype`. It compares direct JSI calls with binary batch decoding into
-Flutter DisplayLists. Runtime shutdown retires pending frames explicitly. The companion
-Flax checkout's `experiments/canvas_native` owns the benchmark and isolated build
-helper. The probe is not a supported application API;
-native ABI 2 and the binding table remain unchanged.
-
-The isolated Canvas helper builds both the Debug test executable and macOS framework,
-and places the framework in its own XCFramework. Debug and Release application gates
-compare packaged engine bytes after signature removal and verify the framework loaded
-by dyld. The helper reuses base build commands without replacing base engine artifacts.
+The Canvas decoder is part of the maintained engine builds below. Only the production
+Canvas dispatch is exported; the early direct-JSI fillRect probe has been removed.
+The companion Flax checkout retains decoder and drawImage benchmarks in
+`experiments/canvas_native`. Native ABI 2 and the binding table are unchanged.
 
 From the Flutter checkout, after the ordinary engine dependencies are synced:
 
@@ -83,8 +76,7 @@ Framework dependencies are copied into `FlutterMacOS.framework/Versions/A/Librar
 the test executable uses an adjacent `Libraries` directory.
 
 The Canvas mobile experiment builds complete isolated targets, including renderer
-shaders and framework/JAR packaging. Android exports the Canvas dispatch and probe
-symbols. The companion `experiments/canvas_native/run_mobile.dart` runs the shared
+shaders and framework/JAR packaging. Android exports the Canvas dispatch symbols. The companion `experiments/canvas_native/run_mobile.dart` runs the shared
 Canvas command, UI, bitmap/font and original-threshold WPT cases in an installed app.
 
 For Android, put Python 3.11's `python3` on PATH and install the NDK revision recorded
