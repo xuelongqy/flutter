@@ -41,11 +41,32 @@ out f16vec4 frag_color;
 void main() {
   f16vec4 total_color = f16vec4(0.0hf);
 
-  for (int i = 0; i < int(frag_info.sample_count); i++) {
-    float16_t coefficient = float16_t(kernel_samples.sample_data[i].z);
-    total_color += coefficient *
+#ifdef IMPELLER_TARGET_OPENGLES
+  // Constant indices avoid a dynamic uniform-array loop for small GLES blurs.
+  if (frag_info.sample_count == 3.0 || frag_info.sample_count == 4.0) {
+    total_color += float16_t(kernel_samples.sample_data[0].z) *
                    Sample(texture_sampler,
-                          v_texture_coords + kernel_samples.sample_data[i].xy);
+                          v_texture_coords + kernel_samples.sample_data[0].xy);
+    total_color += float16_t(kernel_samples.sample_data[1].z) *
+                   Sample(texture_sampler,
+                          v_texture_coords + kernel_samples.sample_data[1].xy);
+    total_color += float16_t(kernel_samples.sample_data[2].z) *
+                   Sample(texture_sampler,
+                          v_texture_coords + kernel_samples.sample_data[2].xy);
+    if (frag_info.sample_count == 4.0) {
+      total_color += float16_t(kernel_samples.sample_data[3].z) *
+                     Sample(texture_sampler,
+                            v_texture_coords + kernel_samples.sample_data[3].xy);
+    }
+  } else
+#endif
+  {
+    for (int i = 0; i < int(frag_info.sample_count); i++) {
+      float16_t coefficient = float16_t(kernel_samples.sample_data[i].z);
+      total_color += coefficient *
+                     Sample(texture_sampler,
+                            v_texture_coords + kernel_samples.sample_data[i].xy);
+    }
   }
 
   if (frag_info.unpremultiply > 0.5) {

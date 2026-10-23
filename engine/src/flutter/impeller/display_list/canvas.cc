@@ -2064,7 +2064,10 @@ bool Canvas::Restore() {
     const bool same_extent =
         subpass_texture_position == Point(0, 0) &&
         source_texture->GetSize() == parent_context->GetTexture()->GetSize();
+    // GLES keeps the original input extent to preserve its filter UV rounding.
     const bool transparent_padding =
+        renderer_.GetContext()->GetBackendType() ==
+            Context::BackendType::kMetal &&
         !save_layer_state_.empty() &&
         save_layer_state_.back().paint.image_filter &&
         save_layer_state_.back().paint.blend_mode == BlendMode::kSrcOver &&
@@ -2077,8 +2080,10 @@ bool Canvas::Restore() {
             *save_layer_state_.back().paint.image_filter);
     const bool defer_layer_copy =
         render_passes_.size() > 1 &&
-        renderer_.GetContext()->GetBackendType() ==
-            Context::BackendType::kMetal &&
+        (renderer_.GetContext()->GetBackendType() ==
+             Context::BackendType::kMetal ||
+         renderer_.GetContext()->GetBackendType() ==
+             Context::BackendType::kOpenGLES) &&
         !parent_context->IsActive() && parent_context->GetPassCount() == 0 &&
         !parent_context->HasDeferredTexture() &&
         parent_context->GetPassTarget()
@@ -2103,7 +2108,8 @@ bool Canvas::Restore() {
         IRect32::RoundOut(parent_clip->Shift(-global_pass_position))
             .Contains(IRect32::RoundOut(source_bounds));
     if (defer_layer_copy) {
-      // Keep the source resolve; an identical copy needs no second encoder.
+      // Finish the source resolve before reuse, including implicit GLES MSAA.
+      // The unused parent needs no second pass for an identical pixel copy.
       if (!lazy_render_pass.GetInlinePassContext()->EndPass()) {
         return false;
       }

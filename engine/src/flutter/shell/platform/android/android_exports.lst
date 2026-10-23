@@ -12,7 +12,6 @@
     flax_engine_get_binding_api;
     flax_canvas_version;
     flax_canvas_dispatch;
-    flax_canvas_prototype_*;
     _binary_icudtl_dat_start;
     _binary_icudtl_dat_size;
     InternalFlutterGpu*;

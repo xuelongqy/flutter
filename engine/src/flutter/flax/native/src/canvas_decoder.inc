@@ -8,6 +8,8 @@
 #include <regex>
 #include <sstream>
 #include "../include/flax/canvas.h"
+#include "flutter/display_list/dl_builder.h"
+#include "third_party/tonic/converter/dart_converter.h"
 #include "flutter/display_list/effects/color_sources/dl_conical_gradient_color_source.h"
 #include "flutter/display_list/effects/color_sources/dl_image_color_source.h"
 #include "flutter/display_list/effects/color_sources/dl_linear_gradient_color_source.h"
@@ -19,6 +21,7 @@
 #include "flutter/display_list/image/dl_image_skia.h"
 #include "flutter/display_list/skia/dl_sk_conversions.h"
 #include "flutter/fml/synchronization/waitable_event.h"
+#include "flutter/lib/ui/painting/canvas.h"
 #include "flutter/lib/ui/painting/display_list_image_gpu.h"
 #if !SLIMPELLER
 #include "flutter/lib/ui/painting/display_list_deferred_image_gpu_skia.h"
