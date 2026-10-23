@@ -1,0 +1,171 @@
+diff --git a/lib/VM/JSObject.cpp b/lib/VM/JSObject.cpp
+--- a/lib/VM/JSObject.cpp
++++ b/lib/VM/JSObject.cpp
+@@ -19,6 +19,8 @@
+ #include "hermes/VM/Operations.h"
+ #include "hermes/VM/PropertyAccessor.h"
+ #include "hermes/VM/StaticHUtils.h"
++
++#include <cmath>
+ 
+ #include "llvh/ADT/DenseSet.h"
+ #include "llvh/ADT/ScopeExit.h"
+@@ -1120,6 +1122,41 @@
+       selfHandle, runtime, *converted, propObj, desc);
+ }
+ 
++// Integer-indexed exotic objects must not create ordinary numeric properties.
++static CallResult<bool> invalidTypedArrayIndex(
++    Handle<JSObject> object,
++    Runtime &runtime,
++    Handle<> key) {
++  auto array = Handle<JSTypedArrayBase>::dyn_vmcast(object);
++  if (!array || key->isSymbol())
++    return false;
++
++  double index;
++  if (key->isNumber()) {
++    // ToPropertyKey converts a numeric -0 to the string "0".
++    index = key->getNumber();
++  } else {
++    auto textResult = toString_RJS(runtime, key);
++    if (textResult == ExecutionStatus::EXCEPTION)
++      return ExecutionStatus::EXCEPTION;
++    auto text = StringPrimitive::ensureFlat(
++        runtime, runtime.makeHandle(std::move(*textResult)));
++    if (text->getStringLength() == 2 && text->at(0) == '-' && text->at(1) == '0')
++      return true;
++    auto number = toNumber_RJS(runtime, text);
++    if (number == ExecutionStatus::EXCEPTION)
++      return ExecutionStatus::EXCEPTION;
++    index = number->getNumber();
++    auto canonical = numberToStringPrimitive(runtime, index);
++    if (canonical == ExecutionStatus::EXCEPTION)
++      return ExecutionStatus::EXCEPTION;
++    if (!text->equals(canonical->get()))
++      return false;
++  }
++  return !array->attached(runtime) || !std::isfinite(index) || index < 0 ||
++      std::floor(index) != index || index >= array->getLength();
++}
++
+ CallResult<PseudoHandle<>> JSObject::getNamedWithReceiver_RJS(
+     Handle<JSObject> selfHandle,
+     Runtime &runtime,
+@@ -1128,6 +1165,17 @@
+     PropOpFlags opFlags,
+     ReadPropertyCacheEntry *cacheEntry) {
+   NamedPropertyDescriptor desc;
++  if (vmisa<JSTypedArrayBase>(*selfHandle) && name.isUniqued()) {
++    auto invalid = invalidTypedArrayIndex(
++        selfHandle, runtime,
++        runtime.makeHandle(HermesValue::encodeStringValue(
++            runtime.getStringPrimFromSymbolID(name))));
++    if (invalid == ExecutionStatus::EXCEPTION)
++      return ExecutionStatus::EXCEPTION;
++    if (*invalid)
++      return createPseudoHandle(HermesValue::encodeUndefinedValue());
++  }
++
+   // Locate the descriptor. propObj contains the object which may be anywhere
+   // along the prototype chain.
+   JSObject *propObj = getNamedDescriptorUnsafe(selfHandle, runtime, name, desc);
+@@ -1250,6 +1298,13 @@
+     return ExecutionStatus::EXCEPTION;
+   }
+   auto nameValPrimitiveHandle = *converted;
++  auto invalid =
++      invalidTypedArrayIndex(selfHandle, runtime, nameValPrimitiveHandle);
++  if (invalid == ExecutionStatus::EXCEPTION)
++    return ExecutionStatus::EXCEPTION;
++  if (*invalid) {
++    return createPseudoHandle(HermesValue::encodeUndefinedValue());
++  }
+ 
+   ComputedPropertyDescWithSymStorage desc{MutableHandle<SymbolID>{runtime}};
+ 
+@@ -1358,6 +1413,13 @@
+     return ExecutionStatus::EXCEPTION;
+   }
+   auto nameValPrimitiveHandle = *converted;
++  auto invalid =
++      invalidTypedArrayIndex(selfHandle, runtime, nameValPrimitiveHandle);
++  if (invalid == ExecutionStatus::EXCEPTION)
++    return ExecutionStatus::EXCEPTION;
++  if (*invalid) {
++    return false;
++  }
+ 
+   ComputedPropertyDescWithSymStorage desc{MutableHandle<SymbolID>{runtime}};
+   MutableHandle<JSObject> propObj{runtime};
+@@ -1440,6 +1502,18 @@
+     SHUnit *unit,
+     WritePropertyCacheEntry *cacheEntry) {
+   NamedPropertyDescriptor desc;
++  if (vmisa<JSTypedArrayBase>(*selfHandle) && name.isUniqued()) {
++    auto invalid = invalidTypedArrayIndex(
++        selfHandle, runtime,
++        runtime.makeHandle(HermesValue::encodeStringValue(
++            runtime.getStringPrimFromSymbolID(name))));
++    if (invalid == ExecutionStatus::EXCEPTION)
++      return ExecutionStatus::EXCEPTION;
++    if (*invalid)
++      return selfHandle.getHermesValue().getRaw() == receiver->getRaw()
++          ? setOwnIndexed(selfHandle, runtime, UINT32_MAX, valueHandle)
++          : CallResult<bool>(true);
++  }
+ 
+   // Look for the property in this object or along the prototype chain.
+   // `name` will not be freed before this function returns,
+@@ -1678,6 +1752,15 @@
+     return ExecutionStatus::EXCEPTION;
+   }
+   auto nameValPrimitiveHandle = *converted;
++  auto invalid =
++      invalidTypedArrayIndex(selfHandle, runtime, nameValPrimitiveHandle);
++  if (invalid == ExecutionStatus::EXCEPTION)
++    return ExecutionStatus::EXCEPTION;
++  if (*invalid) {
++    return selfHandle.getHermesValue().getRaw() == receiver->getRaw()
++          ? setOwnIndexed(selfHandle, runtime, UINT32_MAX, valueHandle)
++          : CallResult<bool>(true);
++  }
+ 
+   ComputedPropertyDescWithSymStorage desc{MutableHandle<SymbolID>{runtime}};
+ 
+@@ -2123,6 +2206,20 @@
+ #endif
+ 
+   // Is it an existing property.
++  if (vmisa<JSTypedArrayBase>(*selfHandle) && name.isUniqued()) {
++    auto invalid = invalidTypedArrayIndex(
++        selfHandle, runtime,
++        runtime.makeHandle(HermesValue::encodeStringValue(
++            runtime.getStringPrimFromSymbolID(name))));
++    if (invalid == ExecutionStatus::EXCEPTION)
++      return ExecutionStatus::EXCEPTION;
++    if (*invalid) {
++      if (opFlags.getThrowOnError())
++        return runtime.raiseTypeError("Invalid typed array index");
++      return false;
++    }
++  }
++
+   NamedPropertyDescriptor desc;
+   auto pos = findProperty(selfHandle, runtime, name, desc);
+   if (pos) {
+@@ -2239,6 +2336,14 @@
+   if (selfHandle->flags_.indexedStorage) {
+     StringPrimitive *strPrim = nullptr;
+     TO_ARRAY_INDEX(runtime, nameValHandle, strPrim, arrayIndex);
++  }
++  auto invalid = invalidTypedArrayIndex(selfHandle, runtime, nameValHandle);
++  if (invalid == ExecutionStatus::EXCEPTION)
++    return ExecutionStatus::EXCEPTION;
++  if (*invalid) {
++    if (opFlags.getThrowOnError())
++      return runtime.raiseTypeError("Invalid typed array index");
++    return false;
+   }
+ 
+   SymbolID id{};

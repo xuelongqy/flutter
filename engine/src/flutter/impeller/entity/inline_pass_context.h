@@ -27,7 +27,20 @@ class InlinePassContext {
 
   std::shared_ptr<Texture> GetTexture();
 
+  bool HasDeferredTexture() const;
+
+  Point GetDeferredTexturePosition() const;
+
+  void DeferTexture(std::shared_ptr<Texture> texture,
+                    Point position,
+                    uint32_t clip_depth);
+
   bool EndPass(bool is_onscreen = false);
+
+  // Continue a completed pass in an unused offscreen parent on Metal.
+  bool EndPass(bool is_onscreen, InlinePassContext* continuation);
+
+  void ContinueWithCommandBuffer(std::shared_ptr<CommandBuffer> command_buffer);
 
   EntityPassTarget& GetPassTarget() const;
 
@@ -41,6 +54,9 @@ class InlinePassContext {
   std::shared_ptr<CommandBuffer> command_buffer_;
   std::shared_ptr<RenderPass> pass_;
   uint32_t pass_count_ = 0;
+  std::shared_ptr<Texture> deferred_texture_;
+  Point deferred_texture_position_;
+  uint32_t deferred_clip_depth_ = 0;
 
   InlinePassContext(const InlinePassContext&) = delete;
 

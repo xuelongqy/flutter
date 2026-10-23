@@ -10,6 +10,7 @@
 #include "impeller/base/validation.h"
 #include "impeller/core/formats.h"
 #include "impeller/entity/contents/content_context.h"
+#include "impeller/entity/contents/texture_contents.h"
 #include "impeller/entity/entity_pass_target.h"
 #include "impeller/renderer/command_buffer.h"
 #include "impeller/renderer/render_pass.h"
@@ -37,10 +38,36 @@ std::shared_ptr<Texture> InlinePassContext::GetTexture() {
   if (!IsValid()) {
     return nullptr;
   }
-  return pass_target_.GetRenderTarget().GetRenderTargetTexture();
+  return deferred_texture_
+             ? deferred_texture_
+             : pass_target_.GetRenderTarget().GetRenderTargetTexture();
+}
+
+bool InlinePassContext::HasDeferredTexture() const {
+  return deferred_texture_ != nullptr;
+}
+
+Point InlinePassContext::GetDeferredTexturePosition() const {
+  return deferred_texture_ ? deferred_texture_position_ : Point();
+}
+
+void InlinePassContext::DeferTexture(std::shared_ptr<Texture> texture,
+                                     Point position,
+                                     uint32_t clip_depth) {
+  FML_DCHECK(!IsActive() && !command_buffer_ && pass_count_ == 0 &&
+             !deferred_texture_);
+  FML_DCHECK(texture);
+  deferred_texture_ = std::move(texture);
+  deferred_texture_position_ = position;
+  deferred_clip_depth_ = clip_depth;
 }
 
 bool InlinePassContext::EndPass(bool is_onscreen) {
+  return EndPass(is_onscreen, nullptr);
+}
+
+bool InlinePassContext::EndPass(bool is_onscreen,
+                                InlinePassContext* continuation) {
   if (!IsActive()) {
     return true;
   }
@@ -63,12 +90,25 @@ bool InlinePassContext::EndPass(bool is_onscreen) {
   }
 
   pass_ = nullptr;
+  if (!is_onscreen && continuation && !continuation->IsActive() &&
+      !continuation->command_buffer_ && continuation->pass_count_ == 0) {
+    FML_DCHECK(&renderer_ == &continuation->renderer_);
+    continuation->command_buffer_ = std::move(command_buffer_);
+    return true;
+  }
   if (is_onscreen) {
     return renderer_.GetContext()->SubmitOnscreen(std::move(command_buffer_));
   } else {
     return renderer_.GetContext()->EnqueueCommandBuffer(
         std::move(command_buffer_));
   }
+}
+
+void InlinePassContext::ContinueWithCommandBuffer(
+    std::shared_ptr<CommandBuffer> command_buffer) {
+  FML_DCHECK(!IsActive() && !command_buffer_ && pass_count_ == 0);
+  FML_DCHECK(command_buffer);
+  command_buffer_ = std::move(command_buffer);
 }
 
 EntityPassTarget& InlinePassContext::GetPassTarget() const {
@@ -84,7 +124,9 @@ const std::shared_ptr<RenderPass>& InlinePassContext::GetRenderPass() {
   /// time this method is called, but it'll also run if the pass has been
   /// previously ended via `EndPass`.
 
-  command_buffer_ = renderer_.GetContext()->CreateCommandBuffer();
+  if (!command_buffer_) {
+    command_buffer_ = renderer_.GetContext()->CreateCommandBuffer();
+  }
   if (!command_buffer_) {
     VALIDATION_LOG << "Could not create command buffer.";
     return pass_;
@@ -148,6 +190,22 @@ const std::shared_ptr<RenderPass>& InlinePassContext::GetRenderPass() {
   pass_->SetLabel("EntityPass Render Pass");
 
   ++pass_count_;
+  if (deferred_texture_) {
+    // Materialize the resolved copy only when another draw needs this target.
+    auto bounds = Rect::MakeSize(deferred_texture_->GetSize());
+    auto contents =
+        TextureContents::MakeRect(bounds.Shift(deferred_texture_position_));
+    contents->SetSourceRect(bounds);
+    contents->SetTexture(std::move(deferred_texture_));
+    Entity copy;
+    copy.SetContents(std::move(contents));
+    copy.SetBlendMode(BlendMode::kSrc);
+    copy.SetClipDepth(deferred_clip_depth_);
+    if (!copy.Render(renderer_, *pass_)) {
+      VALIDATION_LOG << "Could not materialize deferred layer texture.";
+      pass_ = nullptr;
+    }
+  }
   return pass_;
 }
 

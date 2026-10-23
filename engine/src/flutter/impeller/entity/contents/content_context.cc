@@ -889,6 +889,27 @@ std::shared_ptr<Texture> ContentContext::GetEmptyTexture() const {
   return empty_texture_;
 }
 
+void ContentContext::SetSubpassCommandBuffer(
+    std::shared_ptr<CommandBuffer> command_buffer) {
+  FML_DCHECK(!command_buffer || !subpass_command_buffer_);
+  subpass_command_buffer_ = std::move(command_buffer);
+}
+
+std::shared_ptr<CommandBuffer> ContentContext::CreateSubpassCommandBuffer()
+    const {
+  return subpass_command_buffer_ ? subpass_command_buffer_
+                                 : context_->CreateCommandBuffer();
+}
+
+bool ContentContext::EnqueueSubpassCommandBuffer(
+    std::shared_ptr<CommandBuffer> command_buffer) const {
+  if (!command_buffer) {
+    return false;
+  }
+  return command_buffer == subpass_command_buffer_ ||
+         context_->EnqueueCommandBuffer(std::move(command_buffer));
+}
+
 fml::StatusOr<RenderTarget> ContentContext::MakeSubpass(
     std::string_view label,
     ISize texture_size,
@@ -1010,6 +1031,7 @@ void ContentContext::ClearCachedRuntimeEffectPipeline(
 }
 
 void ContentContext::ResetTransientsBuffers() {
+  FML_DCHECK(!subpass_command_buffer_);
   data_host_buffer_->Reset();
 
   // We should only reset the indexes host buffer if it is actually different

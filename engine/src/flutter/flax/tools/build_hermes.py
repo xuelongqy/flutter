@@ -9,6 +9,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tarfile
+import tempfile
 import urllib.request
 
 
@@ -37,13 +38,17 @@ def prepare(flax: Path, cache: Path, archive: Path | None) -> Path:
         for name, expected in saved["files"].items():
             if digest(source / name) != expected:
                 raise ValueError("Prepared Hermes source changed: " + name)
-        for patch in lock["patches"]:
-            result = subprocess.run(["git", "apply", "--reverse", "--check",
-                                     str(flax / "patches/hermes" / patch["file"])],
-                                    cwd=source, env=env, stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.DEVNULL)
-            if result.returncode:
-                raise ValueError("Prepared Hermes patches are missing; use a fresh --cache directory")
+        # Later patches can change earlier hunks; unwind the stack in a disposable copy.
+        with tempfile.TemporaryDirectory(prefix="verify-patches-", dir=cache) as directory:
+            copied = Path(directory) / "source"
+            shutil.copytree(source, copied, symlinks=True)
+            for patch in reversed(lock["patches"]):
+                result = subprocess.run(["git", "apply", "--reverse",
+                                         str(flax / "patches/hermes" / patch["file"])],
+                                        cwd=copied, env=env, stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL)
+                if result.returncode:
+                    raise ValueError("Prepared Hermes patches are missing; use a fresh --cache directory")
         return source
     if source.exists():
         raise ValueError("Unstamped Hermes source exists; use a fresh --cache directory")

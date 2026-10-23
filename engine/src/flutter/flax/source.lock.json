@@ -64,6 +64,10 @@
       {
         "file": "hermes-shared-buffers.patch",
         "sha256": "e11313c2d7392ad2ed68f2a7c9ca41ebd31aa5fdd511de84422a0818a301766f"
+      },
+      {
+        "file": "hermes-typedarray-indices.patch",
+        "sha256": "c2f12be4256a4ac3cd95412b5101888630e9f4c6dd052344e61c1346a6dd6199"
       }
     ]
   }

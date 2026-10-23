@@ -13,6 +13,7 @@
 #include "flutter/fml/time/time_delta.h"
 #include "flutter/fml/trace_event.h"
 #include "flutter/lib/ui/ui_dart_state.h"
+#include "flutter/lib/ui/window/platform_configuration.h"
 #include "third_party/tonic/scopes/dart_isolate_scope.h"
 
 namespace js = facebook::jsi;
@@ -75,7 +76,10 @@ class HermesHeap : public std::enable_shared_from_this<HermesHeap> {
           "Flax does not support multiple UI isolates in one Dart isolate "
           "group");
     Dart_FlaxSetCollectionRequest(
-        [](void* p) { static_cast<HermesHeap*>(p)->Request(true); });
+        [](void* p) {
+          TRACE_EVENT0("flutter", "FlaxHermesRequestDartGC");
+          static_cast<HermesHeap*>(p)->Request(true);
+        });
   }
   ~HermesHeap() { Shutdown(); }
 
@@ -172,6 +176,7 @@ class HermesHeap : public std::enable_shared_from_this<HermesHeap> {
     cells_empty_ = cells_.empty();
   }
   void Prune() {
+    TRACE_EVENT0("flutter", "FlaxHermesPrune");
     for (auto it = cells_.begin(); it != cells_.end();) {
       auto* cell = (it++)->first;
       if (cell->value.lock(*cell->session).isUndefined() ||
@@ -198,6 +203,22 @@ class HermesHeap : public std::enable_shared_from_this<HermesHeap> {
         [weak = weak_from_this()] {
           if (auto heap = weak.lock(); heap && !heap->closed_) {
             heap->idle_pending_ = false;
+            auto state = heap->state_.lock();
+            if (!state || state->IsShuttingDown() || heap->cells_.empty())
+              return;
+            auto* configuration =
+                static_cast<flutter::UIDartState*>(state.get())
+                    ->platform_configuration();
+            // A timer firing does not make the interval between animation
+            // frames idle. Pressure collections still bypass this deferral.
+            if (configuration &&
+                fml::TimePoint::Now() - configuration->GetLastFrameTime() <
+                    fml::TimeDelta::FromMilliseconds(100)) {
+              TRACE_EVENT0("flutter", "FlaxHermesDeferFrameGC");
+              heap->ScheduleIdle();
+              return;
+            }
+            TRACE_EVENT0("flutter", "FlaxHermesRequestIdleGC");
             heap->Request(true);
           }
         },
@@ -220,15 +241,22 @@ class HermesHeap : public std::enable_shared_from_this<HermesHeap> {
       heap->queued_ = false;
       tonic::DartIsolateScope entered(state->isolate());
       Dart_EnterScope();
-      if (heap->collect_requested_.exchange(false))
+      if (heap->collect_requested_.exchange(false)) {
+        TRACE_EVENT0("flutter", "FlaxHermesCollect");
         Dart_FlaxCollect(false, false);
+      }
       heap->Prune();
       Dart_ExitScope();
     });
   }
-  void JsCollected() {
-    if (!in_joint_ && !cells_empty_)
+  void JsCollected(const ::hermes::vm::GCAnalyticsEvent& event) {
+    // A young collection is not a completed tracing of the JS heap. Old-gen
+    // statistics can arrive after the joint collection that produced them.
+    if (event.collectionType == "old" && event.cause != "Flax joint GC" &&
+        !in_joint_ && !cells_empty_) {
+      TRACE_EVENT0("flutter", "FlaxHermesRequestOldGC");
       Request(true);
+    }
   }
 
  private:
@@ -288,6 +316,7 @@ class HermesHeap : public std::enable_shared_from_this<HermesHeap> {
       std::abort();
     for (auto& [_, session] : heap.runtimes_)
       if (*session.active) {
+        TRACE_EVENT0("flutter", "FlaxHermesDeferActiveGC");
         for (auto& [cell, _] : heap.cells_) {
           if (cell->origin)
             gc->mark(gc->context, cell->origin);
@@ -328,14 +357,23 @@ class HermesHeap : public std::enable_shared_from_this<HermesHeap> {
 
 std::unique_ptr<js::Runtime> createEngineRuntime(size_t* active) {
   auto heap = HermesHeap::Current();
-  auto gc = ::hermes::vm::GCConfig::Builder()
-                .withCallback([weak = std::weak_ptr<HermesHeap>(heap)](
-                                  ::hermes::vm::GCEventKind kind, const char*) {
-                  if (kind == ::hermes::vm::GCEventKind::CollectionEnd)
-                    if (auto heap = weak.lock())
-                      heap->JsCollected();
-                })
-                .build();
+  auto gc =
+      ::hermes::vm::GCConfig::Builder()
+          .withCallback([](::hermes::vm::GCEventKind kind, const char* info) {
+            TRACE_EVENT_INSTANT1(
+                "flutter",
+                kind == ::hermes::vm::GCEventKind::CollectionEnd
+                    ? "FlaxHermesGCEnd"
+                    : "FlaxHermesGCStart",
+                "kind", info);
+          })
+          .withAnalyticsCallback(
+              [weak = std::weak_ptr<HermesHeap>(heap)](
+                  const ::hermes::vm::GCAnalyticsEvent& event) {
+                if (auto heap = weak.lock())
+                  heap->JsCollected(event);
+              })
+          .build();
   auto config = ::hermes::vm::RuntimeConfig::Builder()
                     .withES6BlockScoping(true)
                     .withMicrotaskQueue(true)

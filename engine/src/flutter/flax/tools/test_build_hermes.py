@@ -23,18 +23,23 @@ class HermesSourceTest(unittest.TestCase):
             patch = patches / "joint.patch"
             patch.write_text("diff --git a/api.h b/api.h\n--- a/api.h\n+++ b/api.h\n"
                              "@@ -1 +1 @@\n-old\n+joint\n")
+            dependent = patches / "shared.patch"
+            dependent.write_text("diff --git a/api.h b/api.h\n--- a/api.h\n+++ b/api.h\n"
+                                 "@@ -1 +1 @@\n-joint\n+shared\n")
             archive = root / "source.tar.gz"
             with tarfile.open(archive, "w:gz") as tar:
                 item = tarfile.TarInfo("hermes-revision/api.h")
                 item.size = 4
                 tar.addfile(item, io.BytesIO(b"old\n"))
             lock = {"revision": "revision", "sha256": digest(archive),
-                    "patches": [{"file": patch.name, "sha256": digest(patch)}]}
+                    "patches": [{"file": p.name, "sha256": digest(p)}
+                                for p in (patch, dependent)]}
             (flax / "source.lock.json").write_text(json.dumps({"hermes": lock}))
             cache = root / ".local/hermes"
             source = prepare(flax, cache, archive)
-            self.assertEqual((source / "api.h").read_text(), "joint\n")
+            self.assertEqual((source / "api.h").read_text(), "shared\n")
             self.assertEqual(prepare(flax, cache, archive), source)
+            self.assertEqual((source / "api.h").read_text(), "shared\n")
             (source / "api.h").write_text("changed\n")
             with self.assertRaisesRegex(ValueError, "source changed"):
                 prepare(flax, cache, archive)

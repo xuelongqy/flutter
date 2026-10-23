@@ -520,6 +520,11 @@ class PlatformConfiguration final {
   ///
   void BeginFrame(fml::TimePoint frame_time, uint64_t frame_number);
 
+  fml::TimePoint GetLastFrameTime() const {
+    return fml::TimePoint::FromEpochDelta(
+        fml::TimeDelta::FromMicroseconds(last_microseconds_));
+  }
+
   //----------------------------------------------------------------------------
   /// @brief      Dart code cannot fully measure the time it takes for a
   ///             specific frame to be rendered. This is because Dart code only

@@ -15,6 +15,8 @@
 #include <unordered_set>
 #include <vector>
 #include "value_id.h"
+#include "canvas_prototype.inc"
+#include "canvas_decoder.inc"
 
 namespace fbjsi = facebook::jsi;
 struct BoundValue;
@@ -31,6 +33,10 @@ struct ProxyMember {
 
 struct FlaxRuntime {
   ~FlaxRuntime() {
+    if (canvasPrototype) {
+      canvasPrototype->retire();
+      canvasPrototype->builder.reset();
+    }
     if (js)
       flax::closeEngineRuntime(*js);
   }
@@ -39,6 +45,7 @@ struct FlaxRuntime {
   size_t depth = 0;
   bool disposing = false;
   std::unique_ptr<fbjsi::Runtime> js;
+  std::shared_ptr<flax::canvas_prototype::State> canvasPrototype;
   // Declared after js so references are released before the engine.
   std::unique_ptr<fbjsi::Function> byteView;
   std::unique_ptr<fbjsi::Function> arrayBufferConstructor;
@@ -219,6 +226,7 @@ int32_t create(FlaxRuntime** output, FlaxError* error) {
   return protect(error, [&] {
     auto runtime = std::make_unique<FlaxRuntime>();
     runtime->js = flax::createEngineRuntime(&runtime->depth);
+    runtime->canvasPrototype = flax::canvas_prototype::install(*runtime->js);
     runtime->arrayBufferConstructor = std::make_unique<fbjsi::Function>(
         runtime->js->global().getPropertyAsFunction(*runtime->js,
                                                     "ArrayBuffer"));

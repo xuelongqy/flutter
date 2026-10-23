@@ -4,6 +4,7 @@
 
 #include "impeller/entity/render_target_cache.h"
 #include "impeller/core/formats.h"
+#include "impeller/renderer/context.h"
 #include "impeller/renderer/render_target.h"
 
 namespace impeller {
@@ -77,7 +78,12 @@ RenderTarget RenderTargetCache::CreateOffscreen(
   if (CacheEnabled()) {
     for (RenderTargetData& render_target_data : render_target_data_) {
       const RenderTargetConfig other_config = render_target_data.config;
-      if (!render_target_data.used_this_frame && other_config == config) {
+      if (!render_target_data.used_this_frame && other_config == config &&
+          render_target_data.render_target.GetRenderTargetTexture()
+                  ->GetTextureDescriptor()
+                  .format ==
+              target_pixel_format.value_or(
+                  context.GetCapabilities()->GetDefaultColorFormat())) {
         render_target_data.used_this_frame = true;
         render_target_data.keep_alive_frame_count = keep_alive_frame_count_;
         ColorAttachment color0 =
@@ -136,7 +142,12 @@ RenderTarget RenderTargetCache::CreateOffscreenMSAA(
   if (CacheEnabled()) {
     for (RenderTargetData& render_target_data : render_target_data_) {
       const RenderTargetConfig other_config = render_target_data.config;
-      if (!render_target_data.used_this_frame && other_config == config) {
+      if (!render_target_data.used_this_frame && other_config == config &&
+          render_target_data.render_target.GetRenderTargetTexture()
+                  ->GetTextureDescriptor()
+                  .format ==
+              target_pixel_format.value_or(
+                  context.GetCapabilities()->GetDefaultColorFormat())) {
         render_target_data.used_this_frame = true;
         render_target_data.keep_alive_frame_count = keep_alive_frame_count_;
         ColorAttachment color0 =

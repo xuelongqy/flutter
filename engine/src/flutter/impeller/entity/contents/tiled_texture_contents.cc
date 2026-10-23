@@ -224,11 +224,11 @@ std::optional<Snapshot> TiledTextureContents::RenderToSnapshot(
     const Entity& entity,
     const SnapshotOptions& options) const {
   std::optional<Rect> geometry_coverage = GetGeometry()->GetCoverage({});
+  // Reusing the entire texture cannot represent a crop or transformed tile.
   if (GetInverseEffectTransform().IsIdentity() &&
-      GetGeometry()->IsAxisAlignedRect() &&
-      (!geometry_coverage.has_value() ||
-       Rect::MakeSize(texture_->GetSize())
-           .Contains(geometry_coverage.value()))) {
+      entity.GetTransform().IsTranslationOnly() &&
+      GetGeometry()->IsAxisAlignedRect() && geometry_coverage.has_value() &&
+      geometry_coverage.value() == Rect::MakeSize(texture_->GetSize())) {
     auto coverage = GetCoverage(entity);
     if (!coverage.has_value()) {
       return std::nullopt;
