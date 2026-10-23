@@ -141,35 +141,6 @@ static void ApplyFramebufferBlend(Entity& entity) {
   entity.SetBlendMode(BlendMode::kSrc);
 }
 
-static bool CanElideTransparentPadding(const flutter::DlImageFilter& filter) {
-  // Rescaling changes the sample grid when the transparent border is omitted.
-  switch (filter.type()) {
-    case flutter::DlImageFilterType::kBlur: {
-      const auto* blur = filter.asBlur();
-      return blur->tile_mode() == flutter::DlTileMode::kDecal &&
-             GaussianBlurFilterContents::CalculateScale(
-                 GaussianBlurFilterContents::ScaleSigma(blur->sigma_x())) ==
-                 1 &&
-             GaussianBlurFilterContents::CalculateScale(
-                 GaussianBlurFilterContents::ScaleSigma(blur->sigma_y())) == 1;
-    }
-    case flutter::DlImageFilterType::kColorFilter:
-      return filter.asColorFilter()->color_filter()->asMatrix() &&
-             !filter.asColorFilter()
-                  ->color_filter()
-                  ->modifies_transparent_black();
-    case flutter::DlImageFilterType::kCompose: {
-      const auto* compose = filter.asCompose();
-      return (!compose->inner() ||
-              CanElideTransparentPadding(*compose->inner())) &&
-             (!compose->outer() ||
-              CanElideTransparentPadding(*compose->outer()));
-    }
-    default:
-      return false;
-  }
-}
-
 /// @brief Create the subpass restore contents, appling any filters or opacity
 ///        from the provided paint object.
 static std::shared_ptr<Contents> CreateContentsForSubpassTarget(
@@ -2057,27 +2028,23 @@ bool Canvas::Restore() {
     auto* parent_context = render_passes_.back().GetInlinePassContext();
     const auto source_texture =
         lazy_render_pass.GetInlinePassContext()->GetTexture();
-    const auto source_format = source_texture->GetTextureDescriptor().format;
+    const auto& source_descriptor = source_texture->GetTextureDescriptor();
+    const auto& parent_descriptor =
+        parent_context->GetTexture()->GetTextureDescriptor();
+    const auto source_format = source_descriptor.format;
     const auto parent_clip = clip_coverage_stack_.ParentClipCoverage();
     const auto source_bounds = Rect::MakeOriginSize(
         subpass_texture_position, Size(source_texture->GetSize()));
+    // Keep the input sample grid and lossless unorm quantization unchanged.
     const bool same_extent =
         subpass_texture_position == Point(0, 0) &&
         source_texture->GetSize() == parent_context->GetTexture()->GetSize();
-    // GLES keeps the original input extent to preserve its filter UV rounding.
-    const bool transparent_padding =
+    // GLES stores uncompressed texels; Metal attachments can use lossy storage.
+    const bool lossless_copy =
         renderer_.GetContext()->GetBackendType() ==
-            Context::BackendType::kMetal &&
-        !save_layer_state_.empty() &&
-        save_layer_state_.back().paint.image_filter &&
-        save_layer_state_.back().paint.blend_mode == BlendMode::kSrcOver &&
-        save_layer_state_.back().paint.color.alpha == 1 &&
-        !save_layer_state_.back().paint.color_filter &&
-        !save_layer_state_.back().paint.invert_colors &&
-        !save_layer_state_.back().paint.mask_blur_descriptor &&
-        transform_stack_.back().transform.IsTranslationOnly() &&
-        CanElideTransparentPadding(
-            *save_layer_state_.back().paint.image_filter);
+            Context::BackendType::kOpenGLES ||
+        (source_descriptor.compression_type == CompressionType::kLossless &&
+         parent_descriptor.compression_type == CompressionType::kLossless);
     const bool defer_layer_copy =
         render_passes_.size() > 1 &&
         (renderer_.GetContext()->GetBackendType() ==
@@ -2095,18 +2062,16 @@ bool Canvas::Restore() {
         layer_paint.color.alpha == 1 &&
         (layer_paint.blend_mode == BlendMode::kSrc ||
          layer_paint.blend_mode == BlendMode::kSrcOver) &&
-        (same_extent || transparent_padding) &&
+        same_extent && lossless_copy &&
         Rect::MakeSize(parent_context->GetTexture()->GetSize())
             .Contains(source_bounds) &&
         source_texture->GetMipCount() == 1 &&
         (source_format == PixelFormat::kR8G8B8A8UNormInt ||
-         source_format == PixelFormat::kB8G8R8A8UNormInt ||
-         source_format == PixelFormat::kB10G10R10A10XR) &&
+         source_format == PixelFormat::kB8G8R8A8UNormInt) &&
         source_format ==
             parent_context->GetTexture()->GetTextureDescriptor().format &&
         parent_clip.has_value() &&
-        IRect32::RoundOut(parent_clip->Shift(-global_pass_position))
-            .Contains(IRect32::RoundOut(source_bounds));
+        parent_clip->Shift(-global_pass_position).Contains(source_bounds);
     if (defer_layer_copy) {
       // Finish the source resolve before reuse, including implicit GLES MSAA.
       // The unused parent needs no second pass for an identical pixel copy.
