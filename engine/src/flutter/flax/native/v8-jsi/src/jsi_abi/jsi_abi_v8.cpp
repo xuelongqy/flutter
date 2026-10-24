@@ -1,3 +1,4 @@
+thread_local bool flaxFfiDetachedRuntime = false;
 /*
  * Copyright (c) Microsoft Corporation.
  * Licensed under the MIT license.
@@ -434,15 +435,22 @@ v8::Local<v8::Value> toV8Value(v8::Isolate *isolate, const jsi_value *val) {
 struct NativeStateWrapper {
   jsi_native_state *state;
   v8::Global<v8::Object> weak_ref;
+  v8::Isolate *isolate;
+  int64_t externalSize = 0;
+  std::list<NativeStateWrapper *> *owners;
+  std::list<NativeStateWrapper *>::iterator position;
 
   NativeStateWrapper(v8::Isolate *isolate, v8::Local<v8::Object> obj,
-                     jsi_native_state *s)
-      : state(s) {
+                     jsi_native_state *s, std::list<NativeStateWrapper *> &list)
+      : state(s), isolate(isolate), owners(&list) {
+    position = owners->insert(owners->end(), this);
     weak_ref.Reset(isolate, obj);
     weak_ref.SetWeak(this, weak_callback, v8::WeakCallbackType::kParameter);
   }
 
   ~NativeStateWrapper() {
+    owners->erase(position);
+    if (externalSize) isolate->AdjustAmountOfExternalAllocatedMemory(-externalSize);
     if (state) {
       state->vtable->release(state);
     }
@@ -504,6 +512,7 @@ struct JsiRuntimeState : public jsi_runtime {
   // Host function infrastructure
   v8::Persistent<v8::Private> hostFunctionKey;
   std::list<HostFunctionContext *> hostFunctionContexts;
+  std::list<NativeStateWrapper *> nativeStateWrappers;
 
   // unhandled-promise tracking. Migrated from the legacy V8Runtime so the
   // Node-API path (jsr_has_unhandled_promise_rejection /
@@ -903,8 +912,9 @@ JsiRuntimeState *JsiRuntimeState::create(const jsi_config_s *config) {
     }
   }
 
-  auto heap = flax::JointHeap::Current(isolateConfig);
-  v8::Isolate *isolate = heap->isolate();
+  std::shared_ptr<flax::JointHeap> heap;
+  if (!flaxFfiDetachedRuntime) heap = flax::JointHeap::Current(isolateConfig);
+  v8::Isolate *isolate = heap ? heap->isolate() : v8rt::createIsolate(isolateConfig);
   if (!isolate)
     return nullptr;
 
@@ -1069,7 +1079,7 @@ struct V8Scope {
   }
 
   ~V8Scope() {
-    if (--depth == 0) heap->ScheduleIdle();
+    if (--depth == 0 && heap) heap->ScheduleIdle();
   }
 
   static thread_local unsigned depth;
@@ -1164,6 +1174,9 @@ JsiRuntimeState::~JsiRuntimeState() {
   }
   hostObjectProxies.clear();
 
+  // Weak callbacks need not run when a context or isolate is destroyed.
+  while (!nativeStateWrappers.empty()) delete nativeStateWrappers.front();
+
   abi::release_value(pendingJSError);
 
 #if defined(_WIN32) && defined(V8JSI_ENABLE_INSPECTOR)
@@ -1185,11 +1198,16 @@ JsiRuntimeState::~JsiRuntimeState() {
   }
   context.Reset();
 
-  heap->CloseSession(this);
+  if (heap) heap->CloseSession(this);
   isolate->ContextDisposedNotification(false);
   microtasks.Clear();
   }
-  heap.reset();
+  if (heap) heap.reset();
+  else {
+    { v8::Locker lock(isolate); v8::Isolate::Scope scope(isolate); delete isolateData; }
+    v8rt::V8PlatformHolder::notifyIsolateShutdown(isolate);
+    isolate->Dispose();
+  }
 
   // release the consumer-supplied script cache after the isolate is gone
   // (no more cache calls can be in flight). Runs in the consumer's CRT
@@ -2120,11 +2138,20 @@ jsi_array_or_error JSI_CDECL jsi_get_object_property_names(jsi_runtime *rt,
 }
 
 jsi_error_code JSI_CDECL jsi_set_object_external_memory_pressure(
-    jsi_runtime *rt, jsi_object /*obj*/, size_t amount) {
+    jsi_runtime *rt, jsi_object obj, size_t amount) {
   auto *state = getState(rt);
   V8Scope scope(state);
-  state->isolate->AdjustAmountOfExternalAllocatedMemory(
-      static_cast<int64_t>(amount));
+  auto context = state->getContextLocal();
+  auto object = toObjectHandle(obj)->get(state->isolate);
+  auto *wrapper = getNativeStateWrapper(state, context, object);
+  if (!wrapper) {
+    wrapper = new NativeStateWrapper(state->isolate, object, nullptr, state->nativeStateWrappers);
+    object->SetPrivate(context, state->getNativeStateKey(),
+        v8::External::New(state->isolate, wrapper, v8::kExternalPointerTypeTagDefault)).Check();
+  }
+  auto previous = wrapper->externalSize;
+  wrapper->externalSize = static_cast<int64_t>(amount);
+  state->isolate->AdjustAmountOfExternalAllocatedMemory(wrapper->externalSize - previous);
   return jsi_no_error;
 }
 
@@ -2483,8 +2510,9 @@ bool JSI_CDECL jsi_has_native_state(jsi_runtime *rt, jsi_object obj) {
   v8::Local<v8::Object> v8obj = toObjectHandle(obj)->get(state->isolate);
 
   v8::Local<v8::Private> key = state->getNativeStateKey();
-  v8::Maybe<bool> hasPrivate = v8obj->HasPrivate(context, key);
-  return hasPrivate.FromMaybe(false);
+  auto *wrapper = getNativeStateWrapper(state, context, v8obj);
+  (void)key;
+  return wrapper && wrapper->state;
 }
 
 jsi_native_state *JSI_CDECL jsi_get_native_state(jsi_runtime *rt,
@@ -2514,7 +2542,7 @@ jsi_error_code JSI_CDECL jsi_set_native_state(jsi_runtime *rt,
       existing->state->vtable->release(existing->state);
     existing->state = ns;
   } else {
-    auto *wrapper = new NativeStateWrapper(isolate, v8obj, ns);
+    auto *wrapper = new NativeStateWrapper(isolate, v8obj, ns, state->nativeStateWrappers);
     v8::Local<v8::External> external = v8::External::New(isolate, wrapper, v8::kExternalPointerTypeTagDefault);
     v8obj->SetPrivate(context, key, external).Check();
   }
@@ -3367,3 +3395,5 @@ Uint8View readUint8Array(facebook::jsi::Runtime& runtime,
 }
 
 }  // namespace flax
+
+#include "ffi/callback_v8.inc"

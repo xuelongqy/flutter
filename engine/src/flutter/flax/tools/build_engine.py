@@ -36,6 +36,8 @@ def main() -> None:
     checkout = source.parents[1]
     apply(flax.parent / "third_party/dart", flax / "patches/dart.patch",
           (flax / "patches/dart_revision").read_text().strip())
+    apply(flax.parent / "third_party/dart", flax / "patches/dart-ffi.patch",
+          (flax / "patches/dart_revision").read_text().strip())
     if ios:
         if args.hermes_build is None:
             from build_hermes import build
