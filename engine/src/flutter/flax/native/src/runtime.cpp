@@ -1,3 +1,8 @@
+#if defined(FLAX_ENABLE_FFI)
+struct FlaxRuntime;
+bool flaxFfiExperimentInstalled(FlaxRuntime*);
+void flaxFfiExperimentShutdown(FlaxRuntime*);
+#endif
 #include <dart_flax_api.h>
 #include "engine.h"
 #include "flax/engine_binding.h"
@@ -346,6 +351,10 @@ int32_t destroy(FlaxRuntime* runtime, FlaxError* error) {
       if (!lock.owns_lock() || runtime->depth != 0 || runtime->disposing) {
         throw BridgeError(FLAX_STATE_ERROR, "Cannot destroy an active runtime");
       }
+#if defined(FLAX_ENABLE_FFI)
+      if (flaxFfiExperimentInstalled(runtime))
+        throw BridgeError(FLAX_STATE_ERROR, "FFI retirement is incomplete");
+#endif
       runtime->disposing = true;
       runtime->values.clear();
       runtime->byteView.reset();
@@ -1213,6 +1222,9 @@ extern "C" void flax_engine_shutdown_current_isolate() {
     if (it != runtimes.end())
       live.assign(it->second.begin(), it->second.end());
   }
+#if defined(FLAX_ENABLE_FFI)
+  for (auto* runtime : live) flaxFfiExperimentShutdown(runtime);
+#endif
   flax::shutdownJointHeap();
   for (auto* runtime : live) {
     FlaxError error{};
@@ -1224,3 +1236,7 @@ extern "C" void flax_engine_shutdown_current_isolate() {
 extern "C" void flax_engine_notify_idle_current_isolate() {
   flax::notifyIdleJointHeap();
 }
+
+#if defined(FLAX_ENABLE_FFI)
+#include "ffi/runtime.inc"
+#endif

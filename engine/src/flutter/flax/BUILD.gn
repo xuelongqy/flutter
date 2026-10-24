@@ -92,7 +92,16 @@ if (flax_enable_runtime) {
       "native/src",
       "//flutter/third_party/dart/runtime/include",
     ]
+    deps = []
     defines = [ "FLAX_BUILDING_BRIDGE" ]
+    if (is_mac || is_ios) {
+      defines += [ "FLAX_ENABLE_FFI" ]
+      include_dirs += [
+        "third_party/libffi/include",
+        "third_party/libffi/src/aarch64",
+      ]
+      deps = [ ":ffi" ]
+    }
     if (is_ios) {
       sources += [ "native/hermes_engine.cpp" ]
       defines += [ "FLAX_ENGINE_ID=1" ]
@@ -129,7 +138,7 @@ if (flax_enable_runtime) {
     if (is_mac) {
       all_dependent_configs = [ ":loader_path" ]
     }
-    deps = [
+    deps += [
       "//flutter/fml",
       "//flutter/lib/ui",
       "//flutter/third_party/dart/runtime:dart_api",
@@ -151,5 +160,29 @@ if (flax_enable_runtime) {
       sources = sdk.libraries
       outputs = [ "$root_out_dir/Libraries/{{source_file_part}}" ]
     }
+  }
+}
+
+# Runtime ABI calls and callbacks share precompiled Apple arm64 assembly.
+if (flax_enable_runtime && (is_mac || is_ios)) {
+  source_set("ffi") {
+    sources = [
+      "third_party/libffi/src/aarch64/ffi.c",
+      "third_party/libffi/src/aarch64/sysv.S",
+      "third_party/libffi/src/closures.c",
+      "third_party/libffi/src/java_raw_api.c",
+      "third_party/libffi/src/prep_cif.c",
+      "third_party/libffi/src/raw_api.c",
+      "third_party/libffi/src/tramp.c",
+      "third_party/libffi/src/types.c",
+    ]
+    include_dirs = [
+      "third_party/libffi/include",
+      "third_party/libffi/src/aarch64",
+    ]
+    defines = [ "HAVE_CONFIG_H" ]
+    cflags = [ "-Wno-error=deprecated-declarations" ]
+    configs -= [ "//build/config/compiler:chromium_code" ]
+    configs += [ "//build/config/compiler:no_chromium_code" ]
   }
 }

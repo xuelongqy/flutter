@@ -1,0 +1,16 @@
+diff --git a/runtime/vm/heap/compactor.cc b/runtime/vm/heap/compactor.cc
+--- a/runtime/vm/heap/compactor.cc
++++ b/runtime/vm/heap/compactor.cc
+@@ -803,9 +803,9 @@
+       MutexLocker ml(freelist->mutex());
+       page_in_use = sweeper.SweepPage(page, freelist);
+     }
+-    ASSERT(page_in_use);
+-
+-    page->VisitObjectPointers(this);
++    // Joint GC can release the last Flax byte pin while marking a fixed page.
++    // SweepPage has already returned an empty page to the freelist.
++    if (page_in_use) page->VisitObjectPointers(this);
+ 
+     ml.Lock();
+   }

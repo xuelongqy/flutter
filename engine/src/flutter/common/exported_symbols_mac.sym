@@ -7,5 +7,6 @@ _kInternalFlutterGpu*
 _flax_engine_get_api
 _flax_engine_get_gc_api
 _flax_engine_get_binding_api
+_flax_engine_get_ffi_api
 _flax_canvas_version
 _flax_canvas_dispatch

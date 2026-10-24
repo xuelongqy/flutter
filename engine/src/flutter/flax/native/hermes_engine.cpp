@@ -9,6 +9,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 #include "engine.h"
 #include "flutter/fml/time/time_delta.h"
 #include "flutter/fml/trace_event.h"
@@ -151,6 +152,8 @@ class HermesHeap : public std::enable_shared_from_this<HermesHeap> {
     cell->data = data;
     peers_[&runtime][id].insert(cell);
     cells_.emplace(cell, std::move(owned));
+    ++runtimes_.at(&runtime).cells;
+    if (cell->origin) origins_.emplace(cell->origin, cell);
     cells_empty_ = false;
     if (weaken)
       hgc::makeFlaxConditional(runtime, object);
@@ -166,8 +169,11 @@ class HermesHeap : public std::enable_shared_from_this<HermesHeap> {
       if (it->second.empty())
         by_id.erase(it);
     }
-    if (cell->origin)
+    --runtimes_.at(cell->session).cells;
+    if (cell->origin) {
+      origins_.erase(cell->origin);
       Dart_DeleteWeakPersistentHandle(cell->origin);
+    }
     if (cell->target)
       Dart_DeleteWeakPersistentHandle(cell->target);
     if (cell->cleanup)
@@ -263,49 +269,75 @@ class HermesHeap : public std::enable_shared_from_this<HermesHeap> {
   struct Session {
     size_t* active;
     const hgc::FlaxGC* visitor;
+    size_t cells = 0;
+    bool needs_drain = false;
   };
   void Trace(hgc::HermesRuntime& runtime, const hgc::FlaxGC& js) {
     if (!joint_)
       return;
     if (!js.complete) {
-      for (auto& [cell, _] : cells_)
-        if (cell->session == &runtime && cell->origin &&
-            joint_->is_marked(joint_->context, cell->origin))
-          js.mark(js.context, cell->value);
+      for (auto& [_, cells] : peers_.at(&runtime))
+        for (auto* cell : cells)
+          if (cell->origin &&
+              joint_->is_marked(joint_->context, cell->origin))
+            js.mark(js.context, cell->value);
       return;
     }
     auto& session = runtimes_.at(&runtime);
     session.visitor = &js;
-    // Suspend the outer mark phase until every session has reached this phase.
-    for (auto& [other, _] : runtimes_)
-      if (!started_.contains(other)) {
+    // Suspend every participating VM before any VM starts weak processing.
+    for (auto& [other, state] : runtimes_)
+      if (state.cells && !started_.contains(other)) {
         started_.insert(other);
         hgc::collectFlaxGC(*other);
       }
-    bool changed;
-    do {
-      changed = false;
-      for (auto& [cell, _] : cells_) {
-        auto* visitor = runtimes_.at(cell->session).visitor;
-        if (!visitor)
-          continue;
-        if (cell->origin && joint_->is_marked(joint_->context, cell->origin) &&
-            !visitor->isMarked(visitor->context, cell->value)) {
-          visitor->mark(visitor->context, cell->value);
-          if (!visitor->isMarked(visitor->context, cell->value))
-            std::abort();
-          changed = true;
+    if (!traced_) {
+      traced_ = true;
+      std::vector<JointCell*> pending;
+      pending.reserve(cells_.size());
+      for (auto& [cell, _] : cells_)
+        if (cell->target &&
+            !joint_->is_marked(joint_->context, cell->target))
+          pending.push_back(cell);
+      bool changed;
+      do {
+        while (auto origin = joint_->next_marked_origin(joint_->context)) {
+          auto found = origins_.find(origin);
+          if (found == origins_.end())
+            continue;
+          auto* cell = found->second;
+          auto& state = runtimes_.at(cell->session);
+          auto* visitor = state.visitor;
+          if (!visitor->isMarked(visitor->context, cell->value)) {
+            visitor->mark(visitor->context, cell->value);
+            if (!visitor->isMarked(visitor->context, cell->value))
+              std::abort();
+            state.needs_drain = true;
+          }
         }
-        if (cell->target && visitor->isMarked(visitor->context, cell->value) &&
-            !joint_->is_marked(joint_->context, cell->target)) {
-          joint_->mark(joint_->context, cell->target);
-          changed = true;
+        for (auto& [_, state] : runtimes_)
+          if (state.needs_drain) {
+            state.needs_drain = false;
+            state.visitor->drain(state.visitor->context);
+          }
+        changed = false;
+        // Hermes exposes marked bits, not a newly marked JS-object worklist.
+        // Keep only unresolved targets for subsequent fixed-point rounds.
+        size_t remaining = 0;
+        for (auto* cell : pending) {
+          if (joint_->is_marked(joint_->context, cell->target))
+            continue;
+          auto* visitor = runtimes_.at(cell->session).visitor;
+          if (visitor->isMarked(visitor->context, cell->value)) {
+            joint_->mark(joint_->context, cell->target);
+            changed = true;
+          } else {
+            pending[remaining++] = cell;
+          }
         }
-      }
-      for (auto& [_, state] : runtimes_)
-        if (state.visitor)
-          state.visitor->drain(state.visitor->context);
-    } while (changed);
+        pending.resize(remaining);
+      } while (changed);
+    }
     session.visitor = nullptr;
   }
   static void Collect(void* p, const Dart_FlaxGC* gc) {
@@ -328,10 +360,14 @@ class HermesHeap : public std::enable_shared_from_this<HermesHeap> {
       }
     TRACE_EVENT0("flutter", "FlaxHermesJointGC");
     heap.in_joint_ = true;
-    for (auto& [runtime, _] : heap.runtimes_)
-      hgc::prepareFlaxGC(*runtime);
+    hgc::HermesRuntime* first = nullptr;
+    for (auto& [runtime, session] : heap.runtimes_)
+      if (session.cells) {
+        hgc::prepareFlaxGC(*runtime);
+        if (!first) first = runtime;
+      }
     heap.joint_ = gc;
-    auto* first = heap.runtimes_.begin()->first;
+    heap.traced_ = false;
     heap.started_.insert(first);
     hgc::collectFlaxGC(*first);
     heap.started_.clear();
@@ -348,11 +384,12 @@ class HermesHeap : public std::enable_shared_from_this<HermesHeap> {
       hgc::HermesRuntime*,
       std::unordered_map<uint64_t, std::unordered_set<JointCell*>>>
       peers_;
+  std::unordered_map<Dart_WeakPersistentHandle, JointCell*> origins_;
   std::unordered_set<hgc::HermesRuntime*> started_;
   const Dart_FlaxGC* joint_ = nullptr;
   std::atomic<bool> queued_{false}, collect_requested_{false}, closed_{false};
   std::atomic<bool> in_joint_{false}, cells_empty_{true};
-  bool idle_pending_ = false;
+  bool idle_pending_ = false, traced_ = false;
 };
 
 std::unique_ptr<js::Runtime> createEngineRuntime(size_t* active) {
@@ -473,3 +510,5 @@ Uint8View readUint8Array(facebook::jsi::Runtime& runtime,
 }
 
 }  // namespace flax
+
+#include "ffi/callback_hermes.inc"
