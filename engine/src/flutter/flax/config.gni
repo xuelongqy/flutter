@@ -1,21 +1,14 @@
-# Local producers select a verified SDK; applications consume the Flutter engine.
+# Local producers select a verified SDK; applications consume the Flutter
+# engine.
 declare_args() {
   flax_v8_sdk = ""
-  flax_hermes_build = ""
 }
-assert(flax_v8_sdk == "" || flax_hermes_build == "",
-       "Select one Flax engine per platform")
 if (flax_v8_sdk != "") {
-  assert(
-      (target_os == "mac" || target_os == "android") && target_cpu == "arm64",
-      "The Flax engine currently supports macOS and Android arm64")
-}
-if (flax_hermes_build != "") {
-  import("//build/config/darwin/darwin_sdk.gni")
-  assert(target_os == "ios" && target_cpu == "arm64",
-         "The Hermes engine currently supports iOS arm64")
+  assert((target_os == "mac" || target_os == "android" || target_os == "ios") &&
+             target_cpu == "arm64",
+         "The Flax engine supports macOS, Android and iOS arm64")
 }
 
 # Cross-compilation host tools must never link the target's V8 SDK.
-flax_enable_runtime = (flax_v8_sdk != "" || flax_hermes_build != "") &&
-                      current_os == target_os && current_cpu == target_cpu
+flax_enable_runtime =
+    flax_v8_sdk != "" && current_os == target_os && current_cpu == target_cpu

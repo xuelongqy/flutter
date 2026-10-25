@@ -14,7 +14,8 @@ config("system_cxx") {
                         "$flax_v8_sdk/manifest.json",
                       ])
 
-    # Dart needs atomic_ref; use the SDK's newer headers without changing tool pins.
+    # Dart needs atomic_ref; use the SDK's newer headers without changing tool
+    # pins.
     cxx_headers = sdk.cxxHeaders
 
     # Android's -nostdlib requires explicit linkage to the SDK's shared libc++.
@@ -34,45 +35,32 @@ config("system_cxx") {
 }
 
 if (flax_enable_runtime) {
+  sdk_target = "macos-arm64"
   if (is_ios) {
     sdk_target = "ios-device-arm64"
     if (use_ios_simulator) {
       sdk_target = "ios-simulator-arm64"
     }
-    sdk = exec_script("tools/sdk_info.py",
-                      [
-                        flax_hermes_build,
-                        sdk_target,
-                      ],
-                      "json",
-                      [
-                        "source.lock.json",
-                        "$flax_hermes_build/flax-hermes.json",
-                      ])
-  } else {
-    sdk_target = "macos-arm64"
-    if (is_android) {
-      sdk_target = "android-arm64"
-    }
-    sdk = exec_script("tools/sdk_info.py",
-                      [
-                        flax_v8_sdk,
-                        sdk_target,
-                      ],
-                      "json",
-                      [
-                        "source.lock.json",
-                        "$flax_v8_sdk/manifest.json",
-                      ])
+  } else if (is_android) {
+    sdk_target = "android-arm64"
   }
+  sdk = exec_script("tools/sdk_info.py",
+                    [
+                      flax_v8_sdk,
+                      sdk_target,
+                    ],
+                    "json",
+                    [
+                      "source.lock.json",
+                      "$flax_v8_sdk/manifest.json",
+                    ])
   config("sdk") {
-    if (is_ios) {
-      include_dirs = sdk.includeDirs
-    } else {
-      include_dirs = [ "$flax_v8_sdk/include" ]
-    }
+    include_dirs = [ "$flax_v8_sdk/include" ]
     defines = sdk.defines
     libs = sdk.libraries
+    if (is_ios) {
+      frameworks = [ "CoreFoundation.framework" ]
+    }
     if (is_android) {
       # Flutter uses -nostdlib; bridge exceptions need the pinned NDK unwinder.
       libs += [
@@ -102,31 +90,26 @@ if (flax_enable_runtime) {
       ]
       deps = [ ":ffi" ]
     }
-    if (is_ios) {
-      sources += [ "native/hermes_engine.cpp" ]
-      defines += [ "FLAX_ENGINE_ID=1" ]
-    } else {
-      sources += [
-        "native/jsi/jsi/jsi.cpp",
-        "native/src/joint_gc.cc",
-        "native/v8-jsi/src/MurmurHash.cpp",
-        "native/v8-jsi/src/jsi_abi/JsiAbiRuntime.cpp",
-        "native/v8-jsi/src/jsi_abi/jsi_abi_v8.cpp",
-        "native/v8-jsi/src/v8_core.cpp",
-        "native/v8_engine.cpp",
-      ]
-      include_dirs += [
-        "native/jsi",
-        "native/v8-jsi/src",
-      ]
-      defines += [
-        "FLAX_ENGINE_ID=2",
-        "JSI_VERSION=20",
-        "JSI_NOEXCEPT_15=noexcept",
-        "JSI_CONST_10=const",
-        "JSI_NO_CONST_3=",
-      ]
-    }
+    sources += [
+      "native/jsi/jsi/jsi.cpp",
+      "native/src/joint_gc.cc",
+      "native/v8-jsi/src/MurmurHash.cpp",
+      "native/v8-jsi/src/jsi_abi/JsiAbiRuntime.cpp",
+      "native/v8-jsi/src/jsi_abi/jsi_abi_v8.cpp",
+      "native/v8-jsi/src/v8_core.cpp",
+      "native/v8_engine.cpp",
+    ]
+    include_dirs += [
+      "native/jsi",
+      "native/v8-jsi/src",
+    ]
+    defines += [
+      "FLAX_ENGINE_ID=2",
+      "JSI_VERSION=20",
+      "JSI_NOEXCEPT_15=noexcept",
+      "JSI_CONST_10=const",
+      "JSI_NO_CONST_3=",
+    ]
     configs += [
       ":sdk",
       "//build/config/compiler:enable_exceptions",
@@ -165,6 +148,10 @@ if (flax_enable_runtime) {
 
 # Runtime ABI calls and callbacks share precompiled Apple arm64 assembly.
 if (flax_enable_runtime && (is_mac || is_ios)) {
+  config("ffi_c_language") {
+    # libffi's ARM64 implementation uses GNU inline assembly.
+    cflags_c = [ "-std=gnu11" ]
+  }
   source_set("ffi") {
     sources = [
       "third_party/libffi/src/aarch64/ffi.c",
@@ -183,6 +170,9 @@ if (flax_enable_runtime && (is_mac || is_ios)) {
     defines = [ "HAVE_CONFIG_H" ]
     cflags = [ "-Wno-error=deprecated-declarations" ]
     configs -= [ "//build/config/compiler:chromium_code" ]
-    configs += [ "//build/config/compiler:no_chromium_code" ]
+    configs += [
+      "//build/config/compiler:no_chromium_code",
+      ":ffi_c_language",
+    ]
   }
 }

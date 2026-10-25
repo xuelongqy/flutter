@@ -6,7 +6,7 @@ is controlled by Core, and ordinary target calls stay in shared JSI/libffi code.
 
 `runtime.inc` owns loading, binding and retirement, `types.inc` owns ABI layouts,
 `memory.inc` owns byte access, and `callbacks.inc` owns callback queues and finalizers.
-The V8/Hermes fragments adapt byte storage and independent callback runtimes. The
+The V8 fragments adapt byte storage and independent callback runtimes. The
 runtime translation unit includes the common implementation once. Native test controls
 are excluded from normal engine builds.
 

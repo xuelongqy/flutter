@@ -4,7 +4,8 @@ Experimental proof on macOS arm64, not a production Flutter engine integration.
 The local fork starts at Flutter **3.47.6 stable**, commit
 `5fc346839b5d0eef006ed8404392afb4dfae428d`, with its pinned Dart **3.13.5**
 revision `04bcd1036cdc799ac6564988f159ee454d42c822`.
-The platform direction is Hermes on iOS and V8 with JIT on other native platforms.
+The historical experiment planned Hermes on iOS. The maintained engine now uses V8
+jitless on iOS and V8 JIT on other supported native platforms; see the integration README.
 Only macOS arm64 V8 is exercised here.
 
 ## What passed

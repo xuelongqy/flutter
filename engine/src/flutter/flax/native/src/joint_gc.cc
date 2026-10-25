@@ -3,6 +3,7 @@
 #include <stdexcept>
 #include <algorithm>
 #include "flutter/lib/ui/ui_dart_state.h"
+#include "flutter/lib/ui/window/platform_configuration.h"
 #include "flutter/fml/time/time_delta.h"
 #include "flutter/fml/trace_event.h"
 #include "third_party/tonic/scopes/dart_isolate_scope.h"
@@ -175,10 +176,21 @@ void JointHeap::ScheduleIdle(bool js_changed) {
     auto heap = weak.lock();
     if (!heap || heap->closed_) return;
     heap->idle_pending_ = false;
-    if (!heap->cells_.empty()) {
-      TRACE_EVENT0("flutter", "FlaxRequestIdleGC");
-      heap->Request(true);
+    auto state = heap->dart_state_.lock();
+    if (!state || state->IsShuttingDown() || heap->cells_.empty()) return;
+    auto* configuration = static_cast<flutter::UIDartState*>(state.get())
+                              ->platform_configuration();
+    // Match Hermes: a timer between animation frames is not a GC idle window.
+    // Pressure collections still request joint tracing without this deferral.
+    if (configuration &&
+        fml::TimePoint::Now() - configuration->GetLastFrameTime() <
+            fml::TimeDelta::FromMilliseconds(100)) {
+      TRACE_EVENT0("flutter", "FlaxDeferFrameGC");
+      heap->ScheduleIdle(false);
+      return;
     }
+    TRACE_EVENT0("flutter", "FlaxRequestIdleGC");
+    heap->Request(true);
   }, fml::TimeDelta::FromMilliseconds(1000));
 }
 
