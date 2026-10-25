@@ -6,44 +6,10 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from sdk_info import android_cxx_headers, sdk_inputs, hermes_inputs
-from build_hermes import recipe_digest
+from sdk_info import android_cxx_headers, sdk_inputs
 
 
 class SdkTest(unittest.TestCase):
-    def test_hermes_requires_the_joint_gc_recipe_and_unchanged_libraries(self):
-        with tempfile.TemporaryDirectory() as directory:
-            build = Path(directory).resolve()
-            libraries = [build / "hermes/lib/libhermesvm_a.a", build / "hermes/jsi/libjsi.a",
-                         build / "hermes/external/boost/boost_1_86_0/libs/context/libboost_context.a"]
-            for path in libraries:
-                path.parent.mkdir(parents=True)
-                path.write_bytes(b"fixture")
-            lock = {"hermes": {"revision": "hermes", "patches": []},
-                    "flutterRevision": "flutter", "dartRevision": "dart"}
-            manifest = {"engine": "hermes", "target": "ios-simulator-arm64", "jit": False,
-                        "gcExtension": 1, "revision": "hermes", "recipe": recipe_digest(lock["hermes"]),
-                        "libraries": [str(p) for p in libraries], "includeDirs": [],
-                        "files": {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in libraries}}
-            path = build / "flax-hermes.json"
-            path.write_text(json.dumps(manifest))
-            for target in ("ios-device-arm64", "ios-simulator-arm64"):
-                manifest["target"] = target
-                path.write_text(json.dumps(manifest))
-                self.assertEqual(hermes_inputs(build, lock, target)["libraries"], manifest["libraries"])
-                other = "ios-device-arm64" if target == "ios-simulator-arm64" else "ios-simulator-arm64"
-                with self.assertRaisesRegex(ValueError, "joint-GC"):
-                    hermes_inputs(build, lock, other)
-            manifest["gcExtension"] = 0
-            path.write_text(json.dumps(manifest))
-            with self.assertRaisesRegex(ValueError, "joint-GC"):
-                hermes_inputs(build, lock, "ios-simulator-arm64")
-            manifest["gcExtension"] = 1
-            path.write_text(json.dumps(manifest))
-            libraries[0].write_bytes(b"changed")
-            with self.assertRaisesRegex(ValueError, "input changed"):
-                hermes_inputs(build, lock, "ios-simulator-arm64")
-
     def test_android_headers_match_the_sdk_revision(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -71,19 +37,24 @@ class SdkTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             sdk = Path(directory).resolve()
             (sdk / "lib").mkdir()
-            (sdk / "lib/v8").write_bytes(b"library")
-            (sdk / "config").write_text('INTERFACE_COMPILE_DEFINITIONS "V8_SHARED;CPPGC"')
-            for target in ("macos-arm64", "android-arm64"):
+            for target, jit in (("macos-arm64", True), ("android-arm64", True),
+                                ("ios-device-arm64", False), ("ios-simulator-arm64", False)):
+                library = "lib/v8" if jit else "lib/libv8_monolith.a"
+                (sdk / library).write_bytes(b"library")
+                (sdk / "config").write_text('STATIC IMPORTED\nINTERFACE_COMPILE_DEFINITIONS "CPPGC_SLIM_WRITE_BARRIER' +
+                                            (';V8_JITLESS' if not jit else '') + '"')
                 manifest = {
                     "target": target,
-                    "metadata": {"jit": True, "revision": "v8"},
-                    "libraries": ["lib/v8"],
+                    "metadata": {"jit": jit, "revision": "v8", "linkage": "shared" if jit else "static",
+                                 "cppgc": {"cagedHeap": False, "pointerCompression": False,
+                                           "youngGeneration": False}},
+                    "libraries": [library],
                     "cmakeConfig": "config",
                     "files": {name: hashlib.sha256((sdk / name).read_bytes()).hexdigest()
-                              for name in ("lib/v8", "config")},
+                              for name in (library, "config")},
                 }
                 lock = {"v8Revision": "v8", "flutterRevision": "flutter", "dartRevision": "dart",
-                        "targets": {target: {"libraries": {"lib/v8": manifest["files"]["lib/v8"]}}}}
+                        "targets": {target: {"libraries": {library: manifest["files"][library]}}}}
 
                 def pin_manifest():
                     raw = json.dumps(manifest).encode()
@@ -92,16 +63,38 @@ class SdkTest(unittest.TestCase):
 
                 pin_manifest()
                 inputs = sdk_inputs(sdk, target, lock)
-                self.assertEqual(inputs["libraries"], [str(sdk / "lib/v8")])
-                self.assertIn("CPPGC", inputs["defines"])
+                self.assertEqual(inputs["libraries"], [str(sdk / library)])
+                self.assertIn("CPPGC_SLIM_WRITE_BARRIER", inputs["defines"])
+                if not jit:
+                    manifest["metadata"]["cppgc"]["cagedHeap"] = True
+                    pin_manifest()
+                    with self.assertRaisesRegex(ValueError, "uncaged CppGC"):
+                        sdk_inputs(sdk, target, lock)
+                    manifest["metadata"]["cppgc"]["cagedHeap"] = False
+                    pin_manifest()
+                    config = (sdk / "config").read_text()
+                    (sdk / "config").write_text(config.replace('V8_JITLESS', 'V8_JITLESS;CPPGC_CAGED_HEAP=1'))
+                    manifest["files"]["config"] = hashlib.sha256((sdk / "config").read_bytes()).hexdigest()
+                    pin_manifest()
+                    with self.assertRaisesRegex(ValueError, "header defines"):
+                        sdk_inputs(sdk, target, lock)
+                    (sdk / "config").write_text(config)
+                    manifest["files"]["config"] = hashlib.sha256((sdk / "config").read_bytes()).hexdigest()
+                    pin_manifest()
+                manifest["metadata"]["jit"] = not jit
+                pin_manifest()
+                with self.assertRaisesRegex(ValueError, "Expected the pinned"):
+                    sdk_inputs(sdk, target, lock)
+                manifest["metadata"]["jit"] = jit
+                pin_manifest()
                 (sdk / "manifest.json").write_text("changed")
                 with self.assertRaisesRegex(ValueError, "manifest does not match"):
                     sdk_inputs(sdk, target, lock)
                 pin_manifest()
-                (sdk / "lib/v8").write_bytes(b"changed")
+                (sdk / library).write_bytes(b"changed")
                 with self.assertRaisesRegex(ValueError, "file mismatch"):
                     sdk_inputs(sdk, target, lock)
-                (sdk / "lib/v8").write_bytes(b"library")
+                (sdk / library).write_bytes(b"library")
                 manifest["target"] = "wrong-target"
                 pin_manifest()
                 with self.assertRaisesRegex(ValueError, "Expected the pinned"):

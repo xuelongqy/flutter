@@ -1005,11 +1005,6 @@ int32_t shareBuffer(FlaxRuntime* runtime,
       pin.release();
       saved = {storage, buffer.token, runtime->owner};
     }
-#if FLAX_ENGINE_ID == 1
-    if (storage->size() > UINT32_MAX)
-      throw BridgeError(FLAX_ARGUMENT_ERROR,
-                        "Hermes ArrayBuffer exceeds its 32-bit size limit");
-#endif
     auto& js = *runtime->js;
     fbjsi::ArrayBuffer arrayBuffer(js, storage);
     *output = keep(runtime, runtime->bufferView->call(

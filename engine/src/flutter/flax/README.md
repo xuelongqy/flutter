@@ -3,7 +3,7 @@
 Experimental macOS, Android and iOS arm64 integration based on Flutter 3.47.6
 and Dart 3.13.5. macOS targets 15 or later; Android targets API 24 or later. The iOS
 producer targets 16.3 or later and supports simulator debug and device release/AOT.
-The exact Flutter, Dart, bridge, V8 SDK and Hermes source revisions are in `source.lock.json`.
+The exact Flutter, Dart, bridge, V8 SDK revisions are in `source.lock.json`.
 The maintained branch is `flax/main`; version branches use `flax/<version>`.
 Other native V8 targets, device debug/profile and simulator profile/release remain unimplemented.
 
@@ -55,7 +55,6 @@ resetting local edits. Verify those boundaries with:
 ```sh
 python3 engine/src/flutter/flax/tools/test_apply_dart_patch.py
 python3 engine/src/flutter/flax/tools/test_sdk_info.py
-python3 engine/src/flutter/flax/tools/test_build_hermes.py
 ```
 
 Use the official local-engine flow from an application checkout:
@@ -99,56 +98,39 @@ acceptance APK, verifies V8 JIT, and audits library hashes, signatures and 16 KB
 page compatibility. Release uses Dart AOT. The APK runs from a relocated path
 after the temporary application source is removed.
 
-For the iOS arm64 simulator, the helper downloads the pinned Hermes source archive,
-checks every patch, and builds host compiler tools plus static interpreter libraries.
-Existing release SDK assets are not rebuilt or changed. CMake 3.24 or newer, Ninja and
-Xcode are required. Source stamps reject edits, missing patches and recipe changes;
-use `build_hermes.py --cache /fresh/path` and pass its output with `--hermes-build` to
-keep a previous producer intact.
-Matching simulator and device builds can reuse one prepared cache. Verification
-unwinds the patch stack in reverse order in a temporary copy, so overlapping patches
-are validated without modifying the prepared sources.
-
-The pinned Hermes patch set also corrects invalid canonical numeric TypedArray keys.
-Negative, fractional and out-of-range pixel indices remain absent instead of becoming
-ordinary properties; value conversion and native view identity are preserved. No JS
-Proxy or Canvas API change is needed. Rebuild the Hermes producer and dependent engine
-after changing this patch. The boundary follows the
-[ECMAScript TypedArray internal methods](https://tc39.es/ecma262/multipage/ordinary-and-exotic-objects-behaviours.html#sec-typedarray-exotic-objects).
-Run its small regression against the patched host CLI:
+iOS uses V8 jitless with uncaged CppGC. Build the matching macOS host tools first,
+then select the verified static SDK for the exact device or simulator target:
 
 ```sh
-cmake --build /path/to/hermes-cache/host-tools --target hermes
-/path/to/hermes-cache/host-tools/bin/hermes -O engine/src/flutter/flax/native/hermes/typedarray_indices.js
+python3 engine/src/flutter/flax/tools/build_engine.py --target ios-simulator-arm64 --mode debug --sdk /path/to/verified/v8-ios-simulator-arm64
+python3 engine/src/flutter/flax/tools/build_engine.py --target ios-device-arm64 --mode release --sdk /path/to/verified/v8-ios-device-arm64
 ```
 
+The iOS SDK producer is pinned by each target's `sdkProducerRevision` in
+`source.lock.json` (the local 0.3.1 candidate; no SDK publication is implied).
+The SDK lock verifies archive, header, recipe and target hashes. Its private Abseil and
+Unicode namespaces are isolated from Flutter's copies. Both iOS SDKs disable JIT,
+TurboFan, WebAssembly, the CppGC cage, pointer compression and young generation. These
+flags are different from the application sandbox policy; no application sandbox or
+runtime module loader is implemented here.
+
+V8, JSI and CppGC link statically into `Flutter.framework`; no standalone JS engine
+library or archive is packaged in the app. `FlaxV8Notices` preserves the exact SDK
+manifest and upstream notices. iOS requires no JS JIT entitlement. Consumers target iOS
+16.3 or later and use Flutter's ordinary local-engine flags:
+
 ```sh
-python3 engine/src/flutter/flax/tools/build_engine.py --target ios-simulator-arm64 --mode debug
 /path/to/flutter/bin/flutter --local-engine-src-path=/path/to/flutter/engine/src --local-engine=flax_ios_debug_sim_arm64 --local-engine-host=flax_mac_debug_arm64 build ios --simulator --debug
-```
-
-Build the matching macOS debug host tools first and set the application deployment
-target to 16.3 or later. Flutter links Hermes, JSI and Boost.Context statically into
-`Flutter.framework`; applications carry no standalone Hermes library or JIT entitlement.
-The Flax gate uses `FLAX_CHECK_TARGET=ios-simulator-arm64 FLAX_CHECK_DEVICE=<simulator-id>
-dart run tool/check_engine_application.dart debug`. It checks interpreter identity,
-joint GC, the simulator framework, signatures and relocation.
-
-For a physical arm64 iPhone, build the matching macOS release host tools, then the
-device release engine. The producer keeps device and simulator static libraries and
-manifests separate and rejects a mismatched input target:
-
-```sh
-python3 engine/src/flutter/flax/tools/build_engine.py --target ios-device-arm64 --mode release
 /path/to/flutter/bin/flutter --local-engine-src-path=/path/to/flutter/engine/src --local-engine=flax_ios_release_arm64 --local-engine-host=flax_mac_release_arm64 build ios --release
 ```
 
-In the Flax checkout, use `FLAX_CHECK_TARGET=ios-device-arm64`,
-`FLAX_CHECK_DEVICE=<iphone-id>` and `FLAX_IOS_TEAM=<team-id>`, then run
-`dart run tool/check_engine_application.dart release`. The device gate requires real
-development signing and provisioning, verifies Dart AOT and the embedded Hermes closure,
-and installs the relocated application after source removal. iOS requires no JS JIT
-entitlement. These gates do not establish release distribution or Hermes GC/frame performance.
+From the Flax checkout, set `FLAX_CHECK_TARGET`, `FLAX_CHECK_DEVICE` and, for a physical
+iPhone, `FLAX_IOS_TEAM`. Run `tool/check_engine_application.dart debug` for the simulator
+or `release` for the device. The gate verifies actual jitless execution, runtime/UI/GC,
+production optional FFI, engine input hashes, signatures and relocation. The device gate
+also verifies development provisioning and Dart AOT. Use `FLAX_CHECK_STRESS_SECONDS=900`
+for the separate sustained device GC gate. These checks do not certify distribution
+signing. Simulator profile/release and device debug/profile remain unsupported.
 
 Internal binding extension 8 includes the VM fix for recursive function bounds under
 an enclosing generic declaration. The VM only resolves type-parameter bounds for its
@@ -203,22 +185,10 @@ runtimes before Dart handles become invalid. A Dart origin may expire while its 
 peer still retains another Dart target. Conditional marking ignores finalized, still
 registered weak handles; it never resurrects them or accepts unregistered handles.
 
-Hermes has no V8-style Context API. Each session therefore owns a Hermes VM, while one
-UI-isolate coordinator follows conditional references across all of them to a fixed
-point. Hermes's existing Hades marker provides reachability and weak processing; no
-separate JS heap scanner is added. Ordinary Hades marking remains concurrent. During
-joint tracing all participating VM markers reach the final marking phase before weak
-processing, so mixed callback chains across sessions preserve their Dart business roots.
-Active JS jobs defer joint tracing and conservatively retain bridge peers until a safe
-owner-thread checkpoint. Closing a session clears only its VM's edges.
-
-Hades analytics distinguish completed old-generation collection from young and waiting
-phases. Only old-generation pressure requests a joint pass; delayed statistics bearing
-the `Flax joint GC` cause cannot request another pass. The idle timer checks Flutter's
-last frame time and postpones collection while frames arrive within 100 ms. It keeps
-the one-second check after animation stops, while Dart and Hades old-generation
-pressure bypass the frame check. This avoids unconditional full collections between
-animation frames without changing cross-heap reachability.
+The proactive one-second timer defers collection while the native frame clock is less
+than 100 ms old. Deferral preserves pending JS changes. Dart/V8 allocation pressure
+still requests collection, and stopping animation allows eventual idle cleanup. Gaps of
+100 ms or more may admit proactive collection; this is an inactivity heuristic.
 
 Only one UI isolate per Dart isolate group is supported. Background runtime
 creation and a second UI isolate in that group fail explicitly. GC does not
@@ -235,7 +205,7 @@ regressions and acceptance evidence belong to the Flax checkout.
 
 
 Record transfer uses common VM `Dart_FlaxRecordFields` and `Dart_FlaxNewRecord`
-operations, independent of V8/Hermes. Typed construction validates the real field Types;
+operations, independent of the engine adapter. Typed construction validates the real field Types;
 a null target creates a runtime layout from sorted public field names. No per-layout
 Dart constructor or business Record peer is needed. The maintained Dart patch also marks
 referenced Record shapes as externally allocatable and synthetic fields as externally

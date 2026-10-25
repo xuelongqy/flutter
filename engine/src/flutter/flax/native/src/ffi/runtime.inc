@@ -776,7 +776,7 @@ bool State::retire(bool reportCallbackErrors) {
   uint8View.reset();
   attachFinalizer.reset();
   detachFinalizer.reset();
-  // Closed factories may be collected on Hermes's finalizer thread later.
+  // Closed factories can outlive FFI retirement until runtime destruction.
   for (auto &image : ownedImages) image->shared.reset();
   ownedImages.clear();
   return true;

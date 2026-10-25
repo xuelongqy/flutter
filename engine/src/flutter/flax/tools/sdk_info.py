@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Return GN inputs from verified V8 SDKs or the patched Hermes producer."""
+"""Return GN inputs from verified platform-specific V8 SDKs."""
 
 import hashlib
 import json
@@ -7,32 +7,6 @@ import os
 from pathlib import Path
 import re
 import sys
-
-from build_hermes import digest, recipe_digest
-
-
-def hermes_inputs(build: Path, lock: dict, target: str) -> dict:
-    manifest = json.loads((build / "flax-hermes.json").read_text())
-    if (target not in ("ios-device-arm64", "ios-simulator-arm64") or
-            manifest["engine"] != "hermes" or manifest["target"] != target or
-            manifest["jit"] is not False or manifest["gcExtension"] != 1 or
-            manifest["revision"] != lock["hermes"]["revision"] or
-            manifest["recipe"] != recipe_digest(lock["hermes"])):
-        raise ValueError("Expected the pinned " + target + " Hermes joint-GC build")
-    expected = [str(build / "hermes/lib/libhermesvm_a.a"),
-                str(build / "hermes/jsi/libjsi.a"),
-                str(build / "hermes/external/boost/boost_1_86_0/libs/context/libboost_context.a")]
-    if manifest["libraries"] != expected:
-        raise ValueError("Unexpected Hermes static libraries")
-    for name, expected_digest in manifest["files"].items():
-        if digest(Path(name)) != expected_digest:
-            raise ValueError("Hermes producer input changed: " + name)
-    if any(name not in manifest["files"] for name in expected):
-        raise ValueError("Hermes library hash is missing")
-    return {"includeDirs": manifest["includeDirs"], "libraries": expected,
-            "defines": ['FLAX_HERMES_REVISION="' + lock['hermes']['revision'] + '"',
-                        'FLAX_FLUTTER_REVISION="' + lock['flutterRevision'] + '"',
-                        'FLAX_DART_REVISION="' + lock['dartRevision'] + '"']}
 
 def sdk_inputs(sdk: Path, target: str, lock: dict) -> dict:
     sdk = sdk.resolve()
@@ -42,9 +16,16 @@ def sdk_inputs(sdk: Path, target: str, lock: dict) -> dict:
         raise ValueError("V8 SDK manifest does not match the Flax engine source lock")
     manifest = json.loads(raw)
     if (manifest["target"] != target or
-            not manifest["metadata"].get("jit") or
+            manifest["metadata"].get("jit") != (not target.startswith("ios-")) or
             manifest["metadata"]["revision"] != lock["v8Revision"]):
-        raise ValueError(f"Expected the pinned {target} V8 JIT SDK")
+        raise ValueError(f"Expected the pinned {target} V8 SDK")
+    if target.startswith("ios-"):
+        metadata = manifest["metadata"]
+        if (metadata.get("linkage") != "static" or
+                metadata.get("cppgc") != {"cagedHeap": False, "pointerCompression": False,
+                                          "youngGeneration": False} or
+                manifest["libraries"] != ["lib/libv8_monolith.a"]):
+            raise ValueError("Expected static iOS V8 with uncaged CppGC")
     libraries = {name: manifest["files"][name] for name in manifest["libraries"]}
     if libraries != pinned["libraries"] or manifest["cmakeConfig"] not in manifest["files"]:
         raise ValueError("V8 SDK library or CMake configuration differs from the source lock")
@@ -54,6 +35,14 @@ def sdk_inputs(sdk: Path, target: str, lock: dict) -> dict:
             raise ValueError(f"V8 SDK file mismatch: {name}")
     config = (sdk / manifest["cmakeConfig"]).read_text()
     defines = re.search(r'INTERFACE_COMPILE_DEFINITIONS "([^"]+)"', config).group(1).split(";")
+    if target.startswith("ios-"):
+        defined_names = {item.partition("=")[0] for item in defines}
+        if ("V8_JITLESS" not in defines or
+                defined_names.intersection({"CPPGC_CAGED_HEAP", "CPPGC_POINTER_COMPRESSION",
+                                            "CPPGC_YOUNG_GENERATION", "USING_V8_SHARED",
+                                            "USING_V8_PLATFORM_SHARED"}) or
+                "STATIC IMPORTED" not in config):
+            raise ValueError("Static iOS V8 header defines do not match the collector")
     defines += ['FLAX_FLUTTER_REVISION="' + lock['flutterRevision'] + '"',
                 'FLAX_DART_REVISION="' + lock['dartRevision'] + '"']
     return {"defines": defines, "libraries": [str(sdk / x) for x in libraries]}
@@ -82,8 +71,7 @@ if __name__ == "__main__":
     lock = json.loads((flax / "source.lock.json").read_text())
     sdk = Path(sys.argv[1]).resolve()
     target = sys.argv[2]
-    inputs = (hermes_inputs(sdk, lock, target) if target in ("ios-device-arm64", "ios-simulator-arm64")
-              else sdk_inputs(sdk, target, lock))
+    inputs = sdk_inputs(sdk, target, lock)
     if target == "android-arm64":
         android_sdk = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT")
         if not android_sdk:
