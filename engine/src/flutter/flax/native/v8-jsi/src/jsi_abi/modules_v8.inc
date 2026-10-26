@@ -392,6 +392,14 @@ struct FlaxModules {
     if (list->Length() > 256)
       throw std::invalid_argument("Module dependency limit exceeded");
     auto result = v8::Array::New(state->isolate, list->Length());
+    const bool asynchronous =
+        record->module.Get(state->isolate)->IsSourceTextModule() &&
+        record->module.Get(state->isolate)->HasTopLevelAwait();
+    if (result
+            ->CreateDataProperty(context, str("async"),
+                                 v8::Boolean::New(state->isolate, asynchronous))
+            .IsNothing())
+      throw FlaxModuleFailure{};
     for (int i = 0; i < list->Length(); ++i) {
       auto request = list->Get(i).As<v8::ModuleRequest>();
       const auto phase = request->GetPhase();
@@ -550,6 +558,10 @@ struct FlaxModules {
     }
     if (record->evaluation.IsEmpty()) {
       auto evaluated = moduleLocal(module->Evaluate(context));
+      if (evaluated->State() == v8::Promise::kRejected) {
+        state->isolate->ThrowException(evaluated->Result());
+        throw FlaxModuleFailure{};
+      }
       // A namespace can export "then"; entry readiness must not assimilate it.
       v8::Local<v8::Value> values[] = {module->GetModuleNamespace()};
       auto result = v8::Object::New(state->isolate);
@@ -607,7 +619,7 @@ struct FlaxModules {
       error(info.GetIsolate(), e);
     }
     if (caught.HasCaught()) {
-      if (self)
+      if (self && !self->closed)
         self->lastFailure.Reset(info.GetIsolate(), caught.Exception());
       caught.ReThrow();
     }

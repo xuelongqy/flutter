@@ -1414,6 +1414,9 @@ int32_t installModules(FlaxRuntime* runtime,
                         "Expected a module import function");
     fbjsi::Object result(*runtime->js);
     flax::installModuleController(*runtime->js, callback, result);
+    runtime->preparedEntry.reset();
+    runtime->preparedSource.clear();
+    runtime->preparedUrl.clear();
     *controller = keep(runtime, std::move(result));
   });
 }
