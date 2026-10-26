@@ -25,20 +25,20 @@
       }
     },
     "ios-device-arm64": {
-      "sdkVersion": "0.3.1",
-      "sdkManifestSha256": "c2fe5b4558f550e0dfdee2426339b80d4b6085e2059f94fd583fa1485e4669f8",
+      "sdkVersion": "0.3.2",
+      "sdkManifestSha256": "d1f6aaaa4416dfa303fe6616546e7a9333eacb58cf18bb6908afe2d9669e2a4b",
       "libraries": {
-        "lib/libv8_monolith.a": "c96ed9dde86e1248330366458e342523c5cf010d94b83031aa165583598f7f95"
+        "lib/libv8_monolith.a": "06f95b926e1004c372fcd9bdb9a44e597014044ffcd56a92b1a8bfac55f5eda3"
       },
-      "sdkProducerRevision": "c3cf4e795ecb7727f8932aef206075e4be3801fb"
+      "sdkProducerRevision": "3fa63023dd6e2c18bf41790dd8cd26428064ad25"
     },
     "ios-simulator-arm64": {
-      "sdkVersion": "0.3.1",
-      "sdkManifestSha256": "0ae434cae17343b87928c6b06f635dafdaa2a86410457ce18e55ebfed90ba5e0",
+      "sdkVersion": "0.3.2",
+      "sdkManifestSha256": "3bc85f0d6cb2d4da19db5849c19ba87158313bd37f4e1f77666be154b86c693a",
       "libraries": {
-        "lib/libv8_monolith.a": "e421e53a84ad85528a9f14e26ba04659e867fc0b114cf902efdeda717e1a6162"
+        "lib/libv8_monolith.a": "21336d45a54acefe7ff2d8061fd9ca82dd457d9fc44e522e123c9e42a3262793"
       },
-      "sdkProducerRevision": "c3cf4e795ecb7727f8932aef206075e4be3801fb"
+      "sdkProducerRevision": "3fa63023dd6e2c18bf41790dd8cd26428064ad25"
     }
   }
 }

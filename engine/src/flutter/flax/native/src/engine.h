@@ -1,5 +1,5 @@
-#ifndef FLAX_ENGINE_H
-#define FLAX_ENGINE_H
+#ifndef FLUTTER_FLAX_NATIVE_SRC_ENGINE_H_
+#define FLUTTER_FLAX_NATIVE_SRC_ENGINE_H_
 
 #include <dart_api.h>
 #include <jsi/jsi.h>
@@ -14,6 +14,10 @@ struct Uint8View {
   size_t length;
 };
 Uint8View readUint8Array(facebook::jsi::Runtime&, const facebook::jsi::Object&);
+void setRuntimeWakeupPort(facebook::jsi::Runtime&, int64_t port);
+void installModuleController(facebook::jsi::Runtime&,
+                             const facebook::jsi::Object& importer,
+                             const facebook::jsi::Object& controller);
 // Implemented once by the selected engine adapter, not by the shared runtime.
 std::unique_ptr<facebook::jsi::Runtime> createEngineRuntime(
     size_t* active_depth);
@@ -34,4 +38,4 @@ void shutdownJointHeap();
 void notifyIdleJointHeap();
 const FlaxApi* runtimeApi();
 }  // namespace flax
-#endif
+#endif  // FLUTTER_FLAX_NATIVE_SRC_ENGINE_H_

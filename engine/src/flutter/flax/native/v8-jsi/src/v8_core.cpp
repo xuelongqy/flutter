@@ -8,16 +8,21 @@
 #include "v8-cppgc.h"
 
 #include <cstdio>
+#include <map>
+#include <vector>
 
 #include "jsi_abi/v8_snapshot_container.h"
 
 namespace v8rt {
+
+#include "foreground_tasks.inc"
 
 //==============================================================================
 // V8PlatformHolder Static Members
 //==============================================================================
 
 std::mutex V8PlatformHolder::mutex_;
+std::unique_ptr<v8::Platform> V8PlatformHolder::default_platform_;
 std::unique_ptr<v8::Platform> V8PlatformHolder::platform_;
 bool V8PlatformHolder::is_initialized_ = false;
 bool V8PlatformHolder::is_disposed_ = false;
@@ -39,19 +44,19 @@ v8::Isolate* createIsolate(const IsolateConfig& config) {
   v8::CppHeapCreateParams cpp_params({});
   cpp_params.marking_support = cppgc::Heap::MarkingType::kAtomic;
   cpp_params.sweeping_support = cppgc::Heap::SweepingType::kAtomic;
-  create_params.cpp_heap = v8::CppHeap::Create(
-      V8PlatformHolder::platform(), cpp_params).release();
+  create_params.cpp_heap =
+      v8::CppHeap::Create(V8PlatformHolder::platform(), cpp_params).release();
 
   // Set up array buffer allocator
   create_params.array_buffer_allocator_shared =
-      std::shared_ptr<v8::ArrayBuffer::Allocator>(v8::ArrayBuffer::Allocator::NewDefaultAllocator());
+      std::shared_ptr<v8::ArrayBuffer::Allocator>(
+          v8::ArrayBuffer::Allocator::NewDefaultAllocator());
 
   // Configure heap constraints if specified
   if (config.initial_heap_size > 0 || config.maximum_heap_size > 0) {
     v8::ResourceConstraints constraints;
-    constraints.ConfigureDefaultsFromHeapSize(
-        config.initial_heap_size,
-        config.maximum_heap_size);
+    constraints.ConfigureDefaultsFromHeapSize(config.initial_heap_size,
+                                              config.maximum_heap_size);
     create_params.constraints = constraints;
   }
 
@@ -68,10 +73,11 @@ v8::Isolate* createIsolate(const IsolateConfig& config) {
   // heap is materialized from the blob instead of the built-in startup data.
   // V8 deserializes contexts LAZILY and keeps the snapshot_blob pointer for the
   // isolate's lifetime, so it must point at storage that outlives Initialize —
-  // hence IsolateData::snapshot_blob_ (the blob bytes are owned by the runtime).
-  // external_references must be a non-null, null-terminated array matching the
-  // one used at snapshot-creation time (v8_create_startup_snapshot); nullptr
-  // makes V8 ignore the serialized context table.
+  // hence IsolateData::snapshot_blob_ (the blob bytes are owned by the
+  // runtime). external_references must be a non-null, null-terminated array
+  // matching the one used at snapshot-creation time
+  // (v8_create_startup_snapshot); nullptr makes V8 ignore the serialized
+  // context table.
   static const intptr_t kNoExternalRefs[] = {0};
   if (config.startup_snapshot_blob != nullptr &&
       config.startup_snapshot_blob_size > 0) {
@@ -109,14 +115,16 @@ v8::Isolate* createIsolate(const IsolateConfig& config) {
   return isolate;
 }
 
-v8::Local<v8::Context> createContext(v8::Isolate* isolate, bool from_snapshot,
-                                   v8::MicrotaskQueue* microtasks) {
+v8::Local<v8::Context> createContext(v8::Isolate* isolate,
+                                     bool from_snapshot,
+                                     v8::MicrotaskQueue* microtasks) {
   if (from_snapshot) {
     // Restore the context the snapshot serialized via AddContext at index 0,
     // which carries the global proxy and all baked-in globalThis state — so the
     // embedded script need not be re-run. (Node's main-context pattern.)
     v8::Local<v8::Context> ctx;
-    if (v8::Context::FromSnapshot(isolate, 0, nullptr, {}, {}, microtasks).ToLocal(&ctx))
+    if (v8::Context::FromSnapshot(isolate, 0, nullptr, {}, {}, microtasks)
+            .ToLocal(&ctx))
       return ctx;
     // Snapshot had no context at index 0 — fall back to a fresh context.
     v8::Local<v8::ObjectTemplate> fallback = v8::ObjectTemplate::New(isolate);

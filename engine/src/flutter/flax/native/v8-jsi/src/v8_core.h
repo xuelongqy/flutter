@@ -13,22 +13,25 @@
 /// - No C++ exceptions (matches Node.js/V8 style)
 /// - Minimal abstractions
 
-#pragma once
+#ifndef FLUTTER_FLAX_NATIVE_V8_JSI_SRC_V8_CORE_H_
+#define FLUTTER_FLAX_NATIVE_V8_JSI_SRC_V8_CORE_H_
 
 #include "v8config.h"
 // The locked SDK uses the ordinary arm64 calling convention.
 #undef V8_PRESERVE_MOST
 #define V8_PRESERVE_MOST
-#include "v8.h"
 #include "libplatform/libplatform.h"
+#include "v8.h"
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
-#include <functional>
 #include <optional>
 
 namespace v8rt {
+
+std::unique_ptr<v8::Platform> createForegroundPlatform(v8::Platform* base);
 
 //==============================================================================
 // Forward Declarations
@@ -71,17 +74,21 @@ class TaskRunner {
 class V8PlatformHolder {
  public:
   /// Initialize the V8 platform.
-  /// \param thread_pool_size 0 for default (V8 uses min(N-1, 16) where N = cores)
-  /// \param init_callback Called once during first initialization for custom setup
+  /// \param thread_pool_size 0 for default (V8 uses min(N-1, 16) where N =
+  /// cores)
+  /// \param init_callback Called once during first initialization for custom
+  /// setup
   template <typename InitCallback>
-  static void initializePlatform(int thread_pool_size, InitCallback&& init_callback) {
+  static void initializePlatform(int thread_pool_size,
+                                 InitCallback&& init_callback) {
     std::lock_guard<std::mutex> guard(mutex_);
     if (is_initialized_) {
       return;
     }
     is_initialized_ = true;
     init_callback();
-    platform_ = v8::platform::NewDefaultPlatform(thread_pool_size);
+    default_platform_ = v8::platform::NewDefaultPlatform(thread_pool_size);
+    platform_ = createForegroundPlatform(default_platform_.get());
     v8::V8::InitializePlatform(platform_.get());
     v8::V8::Initialize();
   }
@@ -97,6 +104,7 @@ class V8PlatformHolder {
     v8::V8::Dispose();
     v8::V8::DisposePlatform();
     platform_ = nullptr;
+    default_platform_ = nullptr;
   }
 
   /// Check if the platform is initialized.
@@ -105,20 +113,32 @@ class V8PlatformHolder {
     return is_initialized_ && !is_disposed_;
   }
 
-  static std::shared_ptr<v8::TaskRunner> foregroundTaskRunner(v8::Isolate* isolate) {
+  static std::shared_ptr<v8::TaskRunner> foregroundTaskRunner(
+      v8::Isolate* isolate) {
     return platform_->GetForegroundTaskRunner(isolate);
   }
 
   static v8::Platform* platform() { return platform_.get(); }
 
+  static void setForegroundWakeup(v8::Isolate*,
+                                  const void* owner,
+                                  std::function<void()> callback);
+
   static void pumpForegroundTasks(v8::Isolate* isolate) {
-    // Non-blocking and bounded: run only while the host has entered the runtime.
-    for (int i = 0; i < 64 && v8::platform::PumpMessageLoop(
-             platform_.get(), isolate, v8::platform::MessageLoopBehavior::kDoNotWait); ++i) {}
+    // Non-blocking and bounded: run only while the host has entered the
+    // runtime.
+    int count = 0;
+    while (count < 64 && v8::platform::PumpMessageLoop(
+                             default_platform_.get(), isolate,
+                             v8::platform::MessageLoopBehavior::kDoNotWait))
+      ++count;
+    if (count == 64)
+      notifyPendingForegroundTasks(isolate);
   }
 
   static void notifyIsolateShutdown(v8::Isolate* isolate) {
-    v8::platform::NotifyIsolateShutdown(platform_.get(), isolate);
+    closeForegroundTasks(isolate);
+    v8::platform::NotifyIsolateShutdown(default_platform_.get(), isolate);
   }
 
   V8PlatformHolder() = delete;
@@ -127,6 +147,9 @@ class V8PlatformHolder {
 
  private:
   static std::mutex mutex_;
+  static void notifyPendingForegroundTasks(v8::Isolate*);
+  static void closeForegroundTasks(v8::Isolate*);
+  static std::unique_ptr<v8::Platform> default_platform_;
   static std::unique_ptr<v8::Platform> platform_;
   static bool is_initialized_;
   static bool is_disposed_;
@@ -150,14 +173,17 @@ struct IsolateData {
   /// Create IsolateData for an isolate.
   /// \param isolate The V8 isolate (must not be null)
   /// \param task_runner Optional task runner for foreground tasks
-  IsolateData(v8::Isolate* isolate, std::shared_ptr<TaskRunner> task_runner = nullptr) noexcept
+  IsolateData(v8::Isolate* isolate,
+              std::shared_ptr<TaskRunner> task_runner = nullptr) noexcept
       : foreground_task_runner_(std::move(task_runner)), isolate_(isolate) {}
 
   /// Get the isolate this data is associated with.
   v8::Isolate* isolate() const noexcept { return isolate_; }
 
   /// Get the foreground task runner.
-  std::shared_ptr<TaskRunner> taskRunner() const noexcept { return foreground_task_runner_; }
+  std::shared_ptr<TaskRunner> taskRunner() const noexcept {
+    return foreground_task_runner_;
+  }
 
   //----------------------------------------------------------------------------
   // Private Property Keys
@@ -194,9 +220,7 @@ struct IsolateData {
   }
 
   /// Associate this IsolateData with its isolate.
-  void attachToIsolate() noexcept {
-    isolate_->SetData(kIsolateDataSlot, this);
-  }
+  void attachToIsolate() noexcept { isolate_->SetData(kIsolateDataSlot, this); }
 
   /// Public access to foreground task runner (for backwards compatibility)
   std::shared_ptr<TaskRunner> foreground_task_runner_;
@@ -210,18 +234,20 @@ struct IsolateData {
   v8::StartupData snapshot_blob_{nullptr, 0};
 
  private:
-  v8::Local<v8::Private> getOrCreatePrivateKey(
-      v8::Eternal<v8::Private>& key,
-      const char* name) {
+  v8::Local<v8::Private> getOrCreatePrivateKey(v8::Eternal<v8::Private>& key,
+                                               const char* name) {
     if (key.IsEmpty()) {
-      v8::Local<v8::String> key_name = v8::String::NewFromUtf8(
-          isolate_, name, v8::NewStringType::kInternalized).ToLocalChecked();
+      v8::Local<v8::String> key_name =
+          v8::String::NewFromUtf8(isolate_, name,
+                                  v8::NewStringType::kInternalized)
+              .ToLocalChecked();
       key.Set(isolate_, v8::Private::New(isolate_, key_name));
     }
     return key.Get(isolate_);
   }
 
-  // Note: isolate_ is declared after foreground_task_runner_ to match init order
+  // Note: isolate_ is declared after foreground_task_runner_ to match init
+  // order
   v8::Isolate* isolate_;
   v8::Eternal<v8::Private> napi_type_tag_;
   v8::Eternal<v8::Private> napi_wrapper_;
@@ -305,8 +331,8 @@ class IsolateLocker {
         context_scope_(context.Get(isolate)) {}
 
  protected:
-  static std::optional<v8::Locker> makeOptionalLocker(
-      v8::Isolate* isolate, bool enabled) noexcept {
+  static std::optional<v8::Locker> makeOptionalLocker(v8::Isolate* isolate,
+                                                      bool enabled) noexcept {
     if (enabled) {
       return std::make_optional<v8::Locker>(isolate);
     }
@@ -323,13 +349,12 @@ class IsolateLocker {
 // TryCatch Wrapper
 //==============================================================================
 
-/// Wrapper around v8::TryCatch that stores caught exceptions for later retrieval.
-/// Similar to Node-API's v8impl::TryCatch.
-/// Does NOT use C++ exceptions.
+/// Wrapper around v8::TryCatch that stores caught exceptions for later
+/// retrieval. Similar to Node-API's v8impl::TryCatch. Does NOT use C++
+/// exceptions.
 class TryCatch {
  public:
-  explicit TryCatch(v8::Isolate* isolate) noexcept
-      : try_catch_(isolate) {}
+  explicit TryCatch(v8::Isolate* isolate) noexcept : try_catch_(isolate) {}
 
   /// Check if a JavaScript exception was caught.
   bool hasCaught() const noexcept { return try_catch_.HasCaught(); }
@@ -376,7 +401,8 @@ struct IsolateConfig {
 
   /// Optional V8 startup-snapshot blob (borrowed; caller keeps it alive for the
   /// isolate's lifetime). When non-null, the isolate is created from it instead
-  /// of the built-in startup data, pre-materializing the embedded script's heap.
+  /// of the built-in startup data, pre-materializing the embedded script's
+  /// heap.
   const uint8_t* startup_snapshot_blob = nullptr;
   size_t startup_snapshot_blob_size = 0;
 };
@@ -391,8 +417,9 @@ v8::Isolate* createIsolate(const IsolateConfig& config);
 /// When \p from_snapshot is true the isolate was created from a custom startup
 /// snapshot; the context is cloned from the snapshot's default context (no
 /// global template) so the baked-in globalThis state is restored.
-v8::Local<v8::Context> createContext(v8::Isolate* isolate, bool from_snapshot = false,
-                                   v8::MicrotaskQueue* microtasks = nullptr);
+v8::Local<v8::Context> createContext(v8::Isolate* isolate,
+                                     bool from_snapshot = false,
+                                     v8::MicrotaskQueue* microtasks = nullptr);
 
 //==============================================================================
 // Context Embedder Data Indices
@@ -407,8 +434,8 @@ struct ContextEmbedderIndex {
   static constexpr int kRuntime = 0;
 
   /// Slot 1 — RuntimeContextTagPtr (a stable per-process address). Used as a
-  /// "this is a v8jsi context" marker so upstream Node.js Environment::GetCurrent
-  /// patterns recognize it.
+  /// "this is a v8jsi context" marker so upstream Node.js
+  /// Environment::GetCurrent patterns recognize it.
   static constexpr int kContextTag = 1;
 };
 
@@ -434,3 +461,5 @@ struct UnhandledPromiseRejection {
 };
 
 }  // namespace v8rt
+
+#endif  // FLUTTER_FLAX_NATIVE_V8_JSI_SRC_V8_CORE_H_

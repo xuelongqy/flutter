@@ -8,6 +8,7 @@ void flaxFfiExperimentShutdown(FlaxRuntime*);
 #include "flax/engine_binding.h"
 #include "flax/engine_execution.h"
 #include "flax/engine_gc.h"
+#include "flax/engine_modules.h"
 #include "flutter/fml/build_config.h"
 #include "flutter/lib/ui/ui_dart_state.h"
 #include "joint_gc.h"
@@ -55,6 +56,7 @@ struct FlaxRuntime {
   size_t depth = 0;
   bool disposing = false;
   bool cold = true;
+  int64_t wakeupPort = 0;
   std::unique_ptr<fbjsi::Runtime> js;
   // Declared after js so references are released before the engine.
   std::unique_ptr<fbjsi::Function> byteView;
@@ -260,6 +262,8 @@ void clearRuntime(FlaxRuntime* runtime) {
 
 void initializeRuntime(FlaxRuntime* runtime) {
   runtime->js = flax::createEngineRuntime(&runtime->depth);
+  if (runtime->wakeupPort)
+    flax::setRuntimeWakeupPort(*runtime->js, runtime->wakeupPort);
   runtime->arrayBufferConstructor = std::make_unique<fbjsi::Function>(
       runtime->js->global().getPropertyAsFunction(*runtime->js, "ArrayBuffer"));
   runtime->bigIntConstructor = std::make_unique<fbjsi::Function>(
@@ -1393,4 +1397,53 @@ const FlaxEngineExecutionApi* flax_get_engine_execution_api(uint32_t version) {
                                               pollStartup,
                                               cancelStartupEntry};
   return version == results.version ? &results : nullptr;
+}
+
+namespace {
+int32_t installModules(FlaxRuntime* runtime,
+                       FlaxValueId importer,
+                       FlaxValueId* controller,
+                       FlaxError* error) {
+  return enter(runtime, error, [&] {
+    if (!controller)
+      throw BridgeError(FLAX_ARGUMENT_ERROR, "Null module controller output");
+    *controller = 0;
+    auto callback = object(runtime, importer);
+    if (!callback.isFunction(*runtime->js))
+      throw BridgeError(FLAX_ARGUMENT_ERROR,
+                        "Expected a module import function");
+    fbjsi::Object result(*runtime->js);
+    flax::installModuleController(*runtime->js, callback, result);
+    *controller = keep(runtime, std::move(result));
+  });
+}
+int32_t setWakeupPort(FlaxRuntime* runtime, int64_t port, FlaxError* error) {
+  // Port registration preserves the cold context used by pure startup
+  // preparation.
+  return enter(
+      runtime, error,
+      [&] {
+        if (runtime->startup)
+          throw BridgeError(FLAX_STATE_ERROR,
+                            "Runtime is preparing JavaScript");
+        if (port <= 0)
+          throw BridgeError(FLAX_ARGUMENT_ERROR, "Invalid wakeup port");
+        runtime->wakeupPort = port;
+        flax::setRuntimeWakeupPort(*runtime->js, port);
+      },
+      true);
+}
+const FlaxEngineModulesApi modulesApi{
+    FLAX_ENGINE_MODULES_VERSION, sizeof(FlaxEngineModulesApi),
+    FLAX_MODULE_JAVASCRIPT | FLAX_MODULE_JSON
+#ifdef V8_ENABLE_WEBASSEMBLY
+        | FLAX_MODULE_WASM | FLAX_MODULE_SOURCE_IMPORTS
+#endif
+    ,
+    installModules, setWakeupPort};
+}  // namespace
+
+extern "C" __attribute__((visibility("default"))) const FlaxEngineModulesApi*
+flax_engine_get_modules_api(uint32_t version) {
+  return version == FLAX_ENGINE_MODULES_VERSION ? &modulesApi : nullptr;
 }
