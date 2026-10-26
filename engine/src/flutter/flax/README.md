@@ -107,12 +107,18 @@ python3 engine/src/flutter/flax/tools/build_engine.py --target ios-device-arm64 
 ```
 
 The iOS SDK producer is pinned by each target's `sdkProducerRevision` in
-`source.lock.json` (the local 0.3.1 candidate; no SDK publication is implied).
+`source.lock.json` (the local candidate; no SDK publication is implied).
 The SDK lock verifies archive, header, recipe and target hashes. Its private Abseil and
-Unicode namespaces are isolated from Flutter's copies. Both iOS SDKs disable JIT,
-TurboFan, WebAssembly, the CppGC cage, pointer compression and young generation. These
-flags are different from the application sandbox policy; no application sandbox or
-runtime module loader is implemented here.
+Unicode namespaces are isolated from Flutter's copies. The 0.3.2 iOS candidates disable
+JIT and TurboFan while enabling Wasm through
+DrumBrake with explicit bounds checks and V8 pointer compression. CppGC remains uncaged,
+with its own pointer compression and young generation disabled. These engine flags are
+independent of the reserved host sandbox policy. An optional module extension version 1
+adds original JavaScript ESM, JSON synthetic modules and Wasm source/evaluation imports,
+without changing ABI 2 or UI protocol 24; the host owns asynchronous source loading.
+V8 retains its default foreground queues. Worker tasks notify the owning Dart native
+port; only the owning thread pumps tasks and drains microtasks. Notifications are
+unregistered before Context destruction, including late asynchronous Wasm completion.
 
 V8, JSI and CppGC link statically into `Flutter.framework`; no standalone JS engine
 library or archive is packaged in the app. `FlaxV8Notices` preserves the exact SDK
@@ -123,6 +129,14 @@ manifest and upstream notices. iOS requires no JS JIT entitlement. Consumers tar
 /path/to/flutter/bin/flutter --local-engine-src-path=/path/to/flutter/engine/src --local-engine=flax_ios_debug_sim_arm64 --local-engine-host=flax_mac_debug_arm64 build ios --simulator --debug
 /path/to/flutter/bin/flutter --local-engine-src-path=/path/to/flutter/engine/src --local-engine=flax_ios_release_arm64 --local-engine-host=flax_mac_release_arm64 build ios --release
 ```
+
+With the Wasm-enabled 0.3.2 SDK, physical app targets also need Xcode's **Extended
+Virtual Addressing** capability and a provisioning profile containing
+`com.apple.developer.kernel.extended-virtual-addressing = true`. V8 pointer compression
+reserves a 4 GiB virtual region, rather than committing 4 GiB of RAM. Missing address
+space aborts V8 initialization before any module executes. The previous SDK without
+Wasm did not require this capability. The Flax example tools configure it and the
+device application audit checks the signed entitlement before installation.
 
 From the Flax checkout, set `FLAX_CHECK_TARGET`, `FLAX_CHECK_DEVICE` and, for a physical
 iPhone, `FLAX_IOS_TEAM`. Run `tool/check_engine_application.dart debug` for the simulator

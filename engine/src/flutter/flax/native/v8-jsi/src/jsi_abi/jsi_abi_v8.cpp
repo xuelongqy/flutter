@@ -27,6 +27,7 @@ thread_local bool flaxFfiDetachedRuntime = false;
 ///
 /// This file is designed to work without C++ exceptions.
 
+#include <dart_native_api.h>
 #include <atomic>
 #include "../MurmurHash.h"
 #include "../v8_core.h"
@@ -52,11 +53,13 @@ unsigned flaxV8JitEventCount() {
 #include <cstring>
 #include <fstream>
 #include <list>
+#include <map>
 #include <memory>
 #include <optional>
 #include <ostream>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace abi = jsi::abi;
@@ -467,6 +470,21 @@ struct NativeStateWrapper {
 
 /// Internal runtime state that manages V8 isolate and context directly.
 /// Inherits from jsi_runtime so the pointer IS a jsi_runtime*.
+struct FlaxModules;
+struct RuntimeWakeup {
+  std::atomic<int64_t> port{0};
+  std::atomic<bool> pending{false};
+  void notify() {
+    const auto target = port.load();
+    if (target == 0 || pending.exchange(true))
+      return;
+    Dart_CObject message{};
+    message.type = Dart_CObject_kNull;
+    if (!Dart_PostCObject(target, &message))
+      pending = false;
+  }
+};
+
 struct JsiRuntimeState : public jsi_runtime {
   // Reference count. Starts at 1 in create(); incremented by jsi_add_ref;
   // decremented by jsi_release, which destroys the runtime at zero.
@@ -481,6 +499,8 @@ struct JsiRuntimeState : public jsi_runtime {
   std::shared_ptr<flax::JointHeap> heap;
   cppgc::Persistent<v8::MicrotaskQueue> microtasks;
   v8::Global<v8::Context> context;
+  std::shared_ptr<FlaxModules> modules;
+  std::shared_ptr<RuntimeWakeup> wakeup;
   v8rt::IsolateData* isolateData;
 
   // True if the consumer requested v8::Locker-protected isolate access.
@@ -858,6 +878,9 @@ JsiRuntimeState* JsiRuntimeState::create(const jsi_config_s* config) {
 
 #ifdef V8_JITLESS
   appendFlag("--jitless");
+#ifdef V8_ENABLE_DRUMBRAKE
+  appendFlag("--wasm-jitless");
+#endif
 #else
   if (!useDefaults && config->enable_jit_tracing) {
     appendFlag("--allow-natives-syntax");
@@ -873,6 +896,7 @@ JsiRuntimeState* JsiRuntimeState::create(const jsi_config_s* config) {
       appendFlag("--enable-system-instrumentation");
   }
 
+  appendFlag("--js-source-phase-imports");
   const int thread_pool_size = useDefaults ? 0 : config->thread_pool_size;
 
   // Capture flags by value into the lambda so the string survives to first
@@ -1094,8 +1118,11 @@ struct V8Scope {
         context_scope(state->getContextLocal()),
         heap(state->heap.get()) {
     // Nested bridge callbacks must not run unrelated foreground tasks.
-    if (depth++ == 0)
+    if (depth++ == 0) {
+      if (state->wakeup)
+        state->wakeup->pending = false;
       v8rt::V8PlatformHolder::pumpForegroundTasks(state->isolate);
+    }
   }
 
   ~V8Scope() {
@@ -1163,12 +1190,20 @@ struct HostFunctionContext {
   }
 };
 
+#include "modules_v8.inc"
+
 // Deferred definition — requires HostFunctionContext and AbiHostObjectProxy
 // to be complete types.
 JsiRuntimeState::~JsiRuntimeState() {
   {
     v8::Locker cleanupLocker(isolate);
     v8::Isolate::Scope cleanupScope(isolate);
+    if (wakeup) {
+      wakeup->port = 0;
+      v8rt::V8PlatformHolder::setForegroundWakeup(isolate, this, {});
+      wakeup.reset();
+    }
+    modules.reset();
     // tear down the attached Node-API surface (if any) before disposing
     // V8 state. The destroy callback owns deleting the attached object.
     if (attached_owner_destroy) {
@@ -1216,6 +1251,14 @@ JsiRuntimeState::~JsiRuntimeState() {
     hostFunctionKey.Reset();
     {
       v8::HandleScope handles(isolate);
+      // Async Wasm jobs can retain a detached Context after its Dart owner
+      // closes.
+      getContextLocal()->SetAlignedPointerInEmbedderData(
+          v8rt::ContextEmbedderIndex::kRuntime, nullptr,
+          v8::kEmbedderDataTypeTagDefault);
+      getContextLocal()->SetAlignedPointerInEmbedderData(
+          v8rt::ContextEmbedderIndex::kContextTag, nullptr,
+          v8::kEmbedderDataTypeTagDefault);
       getContextLocal()->DetachGlobal();
     }
     context.Reset();
@@ -3131,12 +3174,21 @@ v8_create_startup_snapshot(const char* script_utf8,
     return jsi_error_native;
   *out_blob = nullptr;
   *out_blob_size = 0;
+#ifdef V8_JITLESS
+  if (!jitless)
+    return jsi_error_native;
+#endif
 
   // Ensure the V8 platform is initialized (idempotent). Set process-global
   // flags inside the one-time init so they match the eventual consumer engine.
   v8rt::V8PlatformHolder::initializePlatform(0, [jitless]() {
-    if (jitless)
+    v8::V8::SetFlagsFromString("--js-source-phase-imports");
+    if (jitless) {
       v8::V8::SetFlagsFromString("--jitless");
+#ifdef V8_ENABLE_DRUMBRAKE
+      v8::V8::SetFlagsFromString("--wasm-jitless");
+#endif
+    }
   });
 
   // A non-null, null-terminated external-reference table (empty here — our
@@ -3487,6 +3539,9 @@ Uint8View readUint8Array(facebook::jsi::Runtime& runtime,
   auto buffer = array->Buffer();
   if (!buffer->IsArrayBuffer() || buffer->WasDetached())
     throw std::invalid_argument("Expected an attached, unshared ArrayBuffer");
+  if (!buffer->IsDetachable())
+    throw std::invalid_argument(
+        "Non-detachable buffers require copied byte access");
   auto storage = buffer->GetBackingStore();
   if (storage->IsShared() || storage->IsResizableByUserJavaScript() ||
       storage->IsImmutable())
@@ -3495,6 +3550,53 @@ Uint8View readUint8Array(facebook::jsi::Runtime& runtime,
   if (offset > storage->ByteLength() || length > storage->ByteLength() - offset)
     throw std::invalid_argument("Uint8Array range is out of bounds");
   return {std::make_shared<V8Buffer>(std::move(storage)), offset, length};
+}
+
+void setRuntimeWakeupPort(facebook::jsi::Runtime& runtime, int64_t port) {
+  auto* state = getState(jsi::abi::getAbiRuntime(runtime));
+  if (!state->wakeup)
+    state->wakeup = std::make_shared<RuntimeWakeup>();
+  state->wakeup->port = port;
+  const std::weak_ptr<RuntimeWakeup> weak = state->wakeup;
+  v8rt::V8PlatformHolder::setForegroundWakeup(state->isolate, state, [weak] {
+    if (auto value = weak.lock())
+      value->notify();
+  });
+}
+
+void installModuleController(facebook::jsi::Runtime& runtime,
+                             const facebook::jsi::Object& importer,
+                             const facebook::jsi::Object& controller) {
+  auto* state = getState(jsi::abi::getAbiRuntime(runtime));
+  V8Scope scope(state);
+  if (state->modules)
+    throw std::invalid_argument("A module loader is already installed");
+  auto callback = toObjectHandle(jsi::abi::getAbiObject(runtime, importer))
+                      ->get(state->isolate);
+  auto object = toObjectHandle(jsi::abi::getAbiObject(runtime, controller))
+                    ->get(state->isolate);
+  if (!callback->IsFunction())
+    throw std::invalid_argument("Expected an import callback");
+  v8::TryCatch errors(state->isolate);
+  try {
+    auto modules =
+        std::make_shared<FlaxModules>(state, callback.As<v8::Function>());
+    modules->install(object);
+    state->modules = std::move(modules);
+  } catch (const FlaxModuleFailure&) {
+    if (errors.HasCaught()) {
+      v8::String::Utf8Value message(state->isolate, errors.Exception());
+      throw facebook::jsi::JSError(
+          runtime, *message ? *message : "Module initialization failed");
+    }
+    throw std::runtime_error("Module initialization failed");
+  }
+  state->isolate->SetHostImportModuleDynamicallyCallback(
+      FlaxModules::importDynamic);
+  state->isolate->SetHostImportModuleWithPhaseDynamicallyCallback(
+      FlaxModules::importWithPhase);
+  state->isolate->SetHostInitializeImportMetaObjectCallback(
+      FlaxModules::importMeta);
 }
 
 }  // namespace flax

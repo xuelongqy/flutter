@@ -9,5 +9,6 @@ _flax_engine_get_gc_api
 _flax_engine_get_binding_api
 _flax_get_engine_execution_api
 _flax_engine_get_ffi_api
+_flax_engine_get_modules_api
 _flax_canvas_version
 _flax_canvas_dispatch

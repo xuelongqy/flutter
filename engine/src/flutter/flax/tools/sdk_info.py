@@ -27,6 +27,10 @@ def sdk_inputs(sdk: Path, target: str, lock: dict) -> dict:
         != {"cagedHeap": False, "pointerCompression": False, "youngGeneration": False} or
         manifest["libraries"] != ["lib/libv8_monolith.a"]):
       raise ValueError("Expected static iOS V8 with uncaged CppGC")
+    wasm = metadata.get("wasm")
+    if wasm is not None and (not isinstance(wasm, dict) or not wasm.get("enabled") or
+                             not wasm.get("interpreter") or wasm.get("boundsChecks") != "explicit"):
+      raise ValueError("Expected iOS Wasm with explicit interpreter bounds checks")
   libraries = {name: manifest["files"][name] for name in manifest["libraries"]}
   if libraries != pinned["libraries"] or manifest["cmakeConfig"] not in manifest["files"]:
     raise ValueError("V8 SDK library or CMake configuration differs from the source lock")
@@ -42,6 +46,11 @@ def sdk_inputs(sdk: Path, target: str, lock: dict) -> dict:
         {"CPPGC_CAGED_HEAP", "CPPGC_POINTER_COMPRESSION", "CPPGC_YOUNG_GENERATION",
          "USING_V8_SHARED", "USING_V8_PLATFORM_SHARED"}) or "STATIC IMPORTED" not in config):
       raise ValueError("Static iOS V8 header defines do not match the collector")
+    if manifest["metadata"].get("wasm") is not None and not {
+        "V8_ENABLE_WEBASSEMBLY", "V8_ENABLE_DRUMBRAKE", "V8_DRUMBRAKE_BOUNDS_CHECKS",
+        "V8_COMPRESS_POINTERS"
+    }.issubset(defined_names):
+      raise ValueError("iOS Wasm header defines do not match the interpreter")
   defines += [
       'FLAX_FLUTTER_REVISION="' + lock['flutterRevision'] + '"',
       'FLAX_DART_REVISION="' + lock['dartRevision'] + '"'

@@ -91,6 +91,30 @@ class SdkTest(unittest.TestCase):
           (sdk / "config").write_text(config)
           manifest["files"]["config"] = hashlib.sha256((sdk / "config").read_bytes()).hexdigest()
           pin_manifest()
+        if not jit:
+          manifest["metadata"]["wasm"] = {
+              "enabled": True, "interpreter": True, "boundsChecks": "explicit"
+          }
+          pin_manifest()
+          with self.assertRaisesRegex(ValueError, "interpreter"):
+            sdk_inputs(sdk, target, lock)
+          config = (sdk / "config").read_text()
+          wasm_config = config.replace(
+              'V8_JITLESS', 'V8_JITLESS;V8_ENABLE_WEBASSEMBLY;'
+              'V8_ENABLE_DRUMBRAKE;V8_DRUMBRAKE_BOUNDS_CHECKS;V8_COMPRESS_POINTERS'
+          )
+          (sdk / "config").write_text(wasm_config)
+          manifest["files"]["config"] = hashlib.sha256((sdk / "config").read_bytes()).hexdigest()
+          pin_manifest()
+          self.assertIn("V8_ENABLE_DRUMBRAKE", sdk_inputs(sdk, target, lock)["defines"])
+          manifest["metadata"]["wasm"]["boundsChecks"] = "trap-handler"
+          pin_manifest()
+          with self.assertRaisesRegex(ValueError, "bounds checks"):
+            sdk_inputs(sdk, target, lock)
+          manifest["metadata"].pop("wasm")
+          (sdk / "config").write_text(config)
+          manifest["files"]["config"] = hashlib.sha256((sdk / "config").read_bytes()).hexdigest()
+          pin_manifest()
         manifest["metadata"]["jit"] = not jit
         pin_manifest()
         with self.assertRaisesRegex(ValueError, "Expected the pinned"):

@@ -11,6 +11,7 @@
     flax_engine_get_gc_api;
     flax_engine_get_binding_api;
     flax_get_engine_execution_api;
+    flax_engine_get_modules_api;
     flax_canvas_version;
     flax_canvas_dispatch;
     _binary_icudtl_dat_start;
