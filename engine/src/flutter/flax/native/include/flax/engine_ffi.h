@@ -1,5 +1,5 @@
-#ifndef FLAX_ENGINE_FFI_H
-#define FLAX_ENGINE_FFI_H
+#ifndef FLUTTER_FLAX_NATIVE_INCLUDE_FLAX_ENGINE_FFI_H_
+#define FLUTTER_FLAX_NATIVE_INCLUDE_FLAX_ENGINE_FFI_H_
 #include "runtime.h"
 #ifdef __cplusplus
 extern "C" {
@@ -12,11 +12,12 @@ typedef struct FlaxEngineFfiApi {
   size_t struct_size;
   int32_t (*install)(FlaxRuntime*, int64_t wake_port, FlaxError*);
   int32_t (*checkpoint)(FlaxRuntime*, FlaxError*);
-  /* Revokes new work, stops owned producers, then waits for active callbacks. */
+  /* Revokes new work, stops owned producers, then waits for active callbacks.
+   */
   int32_t (*retire)(FlaxRuntime*, uint8_t* complete, FlaxError*);
 } FlaxEngineFfiApi;
 const FlaxEngineFfiApi* flax_engine_get_ffi_api(uint32_t version);
 #ifdef __cplusplus
 }
 #endif
-#endif
+#endif  // FLUTTER_FLAX_NATIVE_INCLUDE_FLAX_ENGINE_FFI_H_

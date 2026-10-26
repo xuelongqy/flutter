@@ -1,11 +1,11 @@
 #include "joint_gc.h"
 #include <cppgc/allocation.h>
-#include <stdexcept>
 #include <algorithm>
-#include "flutter/lib/ui/ui_dart_state.h"
-#include "flutter/lib/ui/window/platform_configuration.h"
+#include <stdexcept>
 #include "flutter/fml/time/time_delta.h"
 #include "flutter/fml/trace_event.h"
+#include "flutter/lib/ui/ui_dart_state.h"
+#include "flutter/lib/ui/window/platform_configuration.h"
 #include "third_party/tonic/scopes/dart_isolate_scope.h"
 
 namespace flax {
@@ -13,9 +13,10 @@ namespace {
 std::mutex heaps_mutex;
 std::unordered_map<Dart_Isolate, std::weak_ptr<JointHeap>> heaps;
 constexpr auto tag = v8::CppHeapPointerTag::kFirstObjectWrappableTag;
-}
+}  // namespace
 
-std::shared_ptr<JointHeap> JointHeap::Current(const v8rt::IsolateConfig& config) {
+std::shared_ptr<JointHeap> JointHeap::Current(
+    const v8rt::IsolateConfig& config) {
   CheckPreparation();
   auto* state = flutter::UIDartState::Current();
   if (!state || !state->IsRootIsolate() ||
@@ -24,7 +25,8 @@ std::shared_ptr<JointHeap> JointHeap::Current(const v8rt::IsolateConfig& config)
   }
   std::lock_guard<std::mutex> lock(heaps_mutex);
   auto& entry = heaps[Dart_CurrentIsolate()];
-  if (auto heap = entry.lock()) return heap;
+  if (auto heap = entry.lock())
+    return heap;
   auto heap = std::shared_ptr<JointHeap>(new JointHeap(config));
   entry = heap;
   return heap;
@@ -49,7 +51,8 @@ std::shared_ptr<JointHeap> JointHeap::BeginPreparation() {
 }
 
 void JointHeap::CancelPreparation() {
-  if (preparing_) isolate_->TerminateExecution();
+  if (preparing_)
+    isolate_->TerminateExecution();
 }
 
 void JointHeap::EndPreparation() {
@@ -62,13 +65,16 @@ void JointHeap::EndPreparation() {
 JointHeap::JointHeap(const v8rt::IsolateConfig& config)
     : dart_isolate_(Dart_CurrentIsolate()),
       dart_state_(flutter::UIDartState::Current()->GetWeakPtr()),
-      runner_(flutter::UIDartState::Current()->GetTaskRunners().GetUITaskRunner()) {
+      runner_(
+          flutter::UIDartState::Current()->GetTaskRunners().GetUITaskRunner()) {
   if (!Dart_FlaxSetCollector(Collect, this)) {
-    throw std::runtime_error("Flax does not support multiple UI isolates in one Dart isolate group");
+    throw std::runtime_error(
+        "Flax does not support multiple UI isolates in one Dart isolate group");
   }
   try {
     isolate_ = v8rt::createIsolate(config);
-    if (!isolate_) throw std::runtime_error("V8 isolate creation failed");
+    if (!isolate_)
+      throw std::runtime_error("V8 isolate creation failed");
     v8::Locker locker(isolate_);
     v8::Isolate::Scope scope(isolate_);
     v8::HandleScope handles(isolate_);
@@ -86,11 +92,13 @@ void JointHeap::ShutdownCurrent() {
   {
     std::lock_guard<std::mutex> lock(heaps_mutex);
     auto it = heaps.find(Dart_CurrentIsolate());
-    if (it == heaps.end()) return;
+    if (it == heaps.end())
+      return;
     heap = it->second.lock();
     heaps.erase(it);
   }
-  if (heap) heap->Shutdown();
+  if (heap)
+    heap->Shutdown();
 }
 
 void JointHeap::NotifyIdleCurrent() {
@@ -98,22 +106,27 @@ void JointHeap::NotifyIdleCurrent() {
   {
     std::lock_guard<std::mutex> lock(heaps_mutex);
     auto it = heaps.find(Dart_CurrentIsolate());
-    if (it != heaps.end()) heap = it->second.lock();
+    if (it != heaps.end())
+      heap = it->second.lock();
   }
   // Flutter may retire the last Dart owner without calling the JS bridge.
   // Check Dart ownership without claiming that the JS heap changed.
-  if (heap && !heap->closed_ && !heap->cells_.empty()) heap->ScheduleIdle(false);
+  if (heap && !heap->closed_ && !heap->cells_.empty())
+    heap->ScheduleIdle(false);
 }
 
 void JointHeap::Shutdown() {
-  if (closed_.exchange(true)) return;
-  if (std::this_thread::get_id() != owner_ || Dart_CurrentIsolate() != dart_isolate_)
+  if (closed_.exchange(true))
+    return;
+  if (std::this_thread::get_id() != owner_ ||
+      Dart_CurrentIsolate() != dart_isolate_)
     std::abort();
   Dart_FlaxSetCollector(nullptr, nullptr);
   v8::Locker locker(isolate_);
   v8::Isolate::Scope scope(isolate_);
   isolate_->RemoveGCEpilogueCallback(JsCollected, this);
-  while (!cells_.empty()) Remove(cells_.begin()->first);
+  while (!cells_.empty())
+    Remove(cells_.begin()->first);
   peers_key_.Reset();
 }
 
@@ -128,11 +141,15 @@ JointHeap::~JointHeap() {
   isolate_->Dispose();
 }
 
-JointCell* JointHeap::Bind(const void* session, v8::Local<v8::Object> value,
-                     Dart_Handle target, Dart_Handle origin,
-                     void (*cleanup)(void*), void* cleanup_data) {
+JointCell* JointHeap::Bind(const void* session,
+                           v8::Local<v8::Object> value,
+                           Dart_Handle target,
+                           Dart_Handle origin,
+                           void (*cleanup)(void*),
+                           void* cleanup_data) {
   if (closed_ || std::this_thread::get_id() != owner_)
-    throw std::runtime_error("Flax heap is closed or belongs to another thread");
+    throw std::runtime_error(
+        "Flax heap is closed or belongs to another thread");
   auto cell = std::make_unique<JointCell>();
   cell->heap = this;
   cell->session = session;
@@ -140,13 +157,15 @@ JointCell* JointHeap::Bind(const void* session, v8::Local<v8::Object> value,
   cell->cleanup_data = cleanup_data;
   auto* raw = cell.get();
   auto weak = [raw](Dart_Handle handle, bool is_origin) {
-    if (!handle || Dart_IsNull(handle)) return Dart_WeakPersistentHandle{};
-    auto result = Dart_NewWeakPersistentHandle(handle, raw, 0,
-        [](void*, void* peer) {
+    if (!handle || Dart_IsNull(handle))
+      return Dart_WeakPersistentHandle{};
+    auto result =
+        Dart_NewWeakPersistentHandle(handle, raw, 0, [](void*, void* peer) {
           static_cast<JointCell*>(peer)->heap->Request(false);
         });
     if (!result || !Dart_FlaxRegisterHandle(result, is_origin)) {
-      if (result) Dart_DeleteWeakPersistentHandle(result);
+      if (result)
+        Dart_DeleteWeakPersistentHandle(result);
       throw std::runtime_error("Dart conditional handle registration failed");
     }
     return result;
@@ -154,24 +173,34 @@ JointCell* JointHeap::Bind(const void* session, v8::Local<v8::Object> value,
   auto ctx = isolate_->GetCurrentContext();
   v8::Local<v8::Value> previous;
   auto key = peers_key_.Get(isolate_);
-  if (!value->GetPrivate(ctx, key).ToLocal(&previous)) std::abort();
+  if (!value->GetPrivate(ctx, key).ToLocal(&previous))
+    std::abort();
   JointPeer* peer;
   if (previous->IsObject()) {
-    peer = v8::Object::Unwrap<tag, JointPeer>(isolate_, previous.As<v8::Object>());
+    peer =
+        v8::Object::Unwrap<tag, JointPeer>(isolate_, previous.As<v8::Object>());
   } else {
-    peer = cppgc::MakeGarbageCollected<JointPeer>(isolate_->GetCppHeap()->GetAllocationHandle());
-    auto carrier = v8::FunctionTemplate::New(isolate_)->GetFunction(ctx)
-                       .ToLocalChecked()->NewInstance(ctx).ToLocalChecked();
+    peer = cppgc::MakeGarbageCollected<JointPeer>(
+        isolate_->GetCppHeap()->GetAllocationHandle());
+    auto carrier = v8::FunctionTemplate::New(isolate_)
+                       ->GetFunction(ctx)
+                       .ToLocalChecked()
+                       ->NewInstance(ctx)
+                       .ToLocalChecked();
     v8::Object::Wrap<tag>(isolate_, carrier, peer);
-    if (!value->SetPrivate(ctx, key, carrier).FromMaybe(false)) std::abort();
+    if (!value->SetPrivate(ctx, key, carrier).FromMaybe(false))
+      std::abort();
   }
-  if (!peer) std::abort();
+  if (!peer)
+    std::abort();
   // Repeated typed reads of the same wrapper must not add permanent metadata.
   // Facade cells own individual ABI value IDs and are deliberately not deduped.
   if (!cleanup) {
     auto same = [](Dart_WeakPersistentHandle saved, Dart_Handle input) {
-      if (!input || Dart_IsNull(input)) return !saved;
-      return saved && Dart_IdentityEquals(Dart_HandleFromWeakPersistent(saved), input);
+      if (!input || Dart_IsNull(input))
+        return !saved;
+      return saved &&
+             Dart_IdentityEquals(Dart_HandleFromWeakPersistent(saved), input);
     };
     for (auto* existing : peer->cells) {
       if (!existing->cleanup && existing->session == session &&
@@ -183,14 +212,16 @@ JointCell* JointHeap::Bind(const void* session, v8::Local<v8::Object> value,
   try {
     cell->target = weak(target, false);
   } catch (...) {
-    if (cell->origin) Dart_DeleteWeakPersistentHandle(cell->origin);
+    if (cell->origin)
+      Dart_DeleteWeakPersistentHandle(cell->origin);
     throw;
   }
   cell->root = peer;
   cell->peer = peer;
   peer->value.Reset(isolate_, value);
   peer->cells.push_back(raw);
-  if (cell->origin) origins_.emplace(cell->origin, raw);
+  if (cell->origin)
+    origins_.emplace(cell->origin, raw);
   cells_.emplace(raw, std::move(cell));
   ScheduleIdle();
   return raw;
@@ -198,39 +229,47 @@ JointCell* JointHeap::Bind(const void* session, v8::Local<v8::Object> value,
 
 void JointHeap::ScheduleIdle(bool js_changed) {
   // Pure preparation has no Dart peers and must not mutate UI-owned idle state.
-  if (std::this_thread::get_id() != owner_) return;
+  if (std::this_thread::get_id() != owner_)
+    return;
   dirty_ |= js_changed;
-  if (idle_pending_) return;
+  if (idle_pending_)
+    return;
   idle_pending_ = true;
   // Batch newly registered edges. Idle sessions need no caller-managed gc(),
   // and an intervening pressure collection consumes the same dirty batch.
-  runner_->PostDelayedTask([weak = weak_from_this()] {
-    auto heap = weak.lock();
-    if (!heap || heap->closed_) return;
-    heap->idle_pending_ = false;
-    auto state = heap->dart_state_.lock();
-    if (!state || state->IsShuttingDown() || heap->cells_.empty()) return;
-    auto* configuration = static_cast<flutter::UIDartState*>(state.get())
-                              ->platform_configuration();
-    // Match Hermes: a timer between animation frames is not a GC idle window.
-    // Pressure collections still request joint tracing without this deferral.
-    if (configuration &&
-        fml::TimePoint::Now() - configuration->GetLastFrameTime() <
-            fml::TimeDelta::FromMilliseconds(100)) {
-      TRACE_EVENT0("flutter", "FlaxDeferFrameGC");
-      heap->ScheduleIdle(false);
-      return;
-    }
-    TRACE_EVENT0("flutter", "FlaxRequestIdleGC");
-    heap->Request(true);
-  }, fml::TimeDelta::FromMilliseconds(1000));
+  runner_->PostDelayedTask(
+      [weak = weak_from_this()] {
+        auto heap = weak.lock();
+        if (!heap || heap->closed_)
+          return;
+        heap->idle_pending_ = false;
+        auto state = heap->dart_state_.lock();
+        if (!state || state->IsShuttingDown() || heap->cells_.empty())
+          return;
+        auto* configuration = static_cast<flutter::UIDartState*>(state.get())
+                                  ->platform_configuration();
+        // Match Hermes: a timer between animation frames is not a GC idle
+        // window. Pressure collections still request joint tracing without this
+        // deferral.
+        if (configuration &&
+            fml::TimePoint::Now() - configuration->GetLastFrameTime() <
+                fml::TimeDelta::FromMilliseconds(100)) {
+          TRACE_EVENT0("flutter", "FlaxDeferFrameGC");
+          heap->ScheduleIdle(false);
+          return;
+        }
+        TRACE_EVENT0("flutter", "FlaxRequestIdleGC");
+        heap->Request(true);
+      },
+      fml::TimeDelta::FromMilliseconds(1000));
 }
 
 void JointHeap::Remove(JointCell* cell) {
   if (cell->peer) {
     auto& peers = cell->peer->cells;
     peers.erase(std::remove(peers.begin(), peers.end(), cell), peers.end());
-    if (peers.empty()) cell->peer->value.Reset();
+    if (peers.empty())
+      cell->peer->value.Reset();
   }
   cell->root.Clear();
   cell->peer.Clear();
@@ -238,15 +277,18 @@ void JointHeap::Remove(JointCell* cell) {
     origins_.erase(cell->origin);
     Dart_DeleteWeakPersistentHandle(cell->origin);
   }
-  if (cell->target) Dart_DeleteWeakPersistentHandle(cell->target);
-  if (cell->cleanup) cell->cleanup(cell->cleanup_data);
+  if (cell->target)
+    Dart_DeleteWeakPersistentHandle(cell->target);
+  if (cell->cleanup)
+    cell->cleanup(cell->cleanup_data);
   cells_.erase(cell);
 }
 
 void JointHeap::CloseSession(const void* session) {
   for (auto it = cells_.begin(); it != cells_.end();) {
     auto* cell = (it++)->first;
-    if (cell->session == session) Remove(cell);
+    if (cell->session == session)
+      Remove(cell);
   }
 }
 
@@ -256,7 +298,8 @@ void JointHeap::Prune() {
     auto* cell = (it++)->first;
     if (cell->cpp_dead ||
         (cell->origin && !cell->target &&
-         Dart_IsNull(Dart_HandleFromWeakPersistent(cell->origin)))) Remove(cell);
+         Dart_IsNull(Dart_HandleFromWeakPersistent(cell->origin))))
+      Remove(cell);
   }
 }
 
@@ -264,7 +307,8 @@ void JointHeap::RestoreRoots() {
   TRACE_EVENT0("flutter", "FlaxRestoreRoots");
   for (auto& [cell, owned] : cells_) {
     if (cell->origin && joint_->is_marked(joint_->context, cell->origin)) {
-      if (!cell->peer) std::abort();
+      if (!cell->peer)
+        std::abort();
       cell->root = cell->peer.Get();
     }
   }
@@ -274,16 +318,21 @@ void JointHeap::Collect(void* peer, const Dart_FlaxGC* gc) {
   auto& heap = *static_cast<JointHeap*>(peer);
   // An empty bridge has no conditional Dart edges and needs no V8 lock. This
   // also lets Dart GC complete while pure initialization owns the empty heap.
-  if (heap.closed_ || !heap.isolate_ || heap.cells_.empty()) return;
-  if (std::this_thread::get_id() != heap.owner_ || heap.joint_) std::abort();
+  if (heap.closed_ || !heap.isolate_ || heap.cells_.empty())
+    return;
+  if (std::this_thread::get_id() != heap.owner_ || heap.joint_)
+    std::abort();
   v8::Locker locker(heap.isolate_);
   v8::Isolate::Scope scope(heap.isolate_);
   // A Dart allocation may collect while a JS-to-Dart call is active. Preserve
-  // that JS job (including WeakRef kept objects), then collect after it returns.
+  // that JS job (including WeakRef kept objects), then collect after it
+  // returns.
   if (heap.isolate_->InContext()) {
     for (auto& [cell, owned] : heap.cells_) {
-      if (cell->origin) gc->mark(gc->context, cell->origin);
-      if (cell->target) gc->mark(gc->context, cell->target);
+      if (cell->origin)
+        gc->mark(gc->context, cell->origin);
+      if (cell->target)
+        gc->mark(gc->context, cell->target);
     }
     TRACE_EVENT0("flutter", "FlaxDeferActiveDartGC");
     heap.Request(true);
@@ -293,10 +342,12 @@ void JointHeap::Collect(void* peer, const Dart_FlaxGC* gc) {
   TRACE_EVENT0("flutter", "FlaxJointGC");
   {
     TRACE_EVENT0("flutter", "FlaxRootPreparation");
-    for (auto& [cell, owned] : heap.cells_) cell->root.Clear();
+    for (auto& [cell, owned] : heap.cells_)
+      cell->root.Clear();
     while (auto origin = gc->next_marked_origin(gc->context)) {
       auto* cell = heap.origins_.at(origin);
-      if (!cell->peer) std::abort();
+      if (!cell->peer)
+        std::abort();
       auto* reachable = cell->peer.Get();
       cell->root = reachable;
       // A Dart root reaches this exact JS value, so its direct Dart targets
@@ -308,10 +359,11 @@ void JointHeap::Collect(void* peer, const Dart_FlaxGC* gc) {
     }
   }
   if (!heap.force_js_collection_ &&
-      std::all_of(heap.cells_.begin(), heap.cells_.end(), [&](const auto& entry) {
-        auto* cell = entry.first;
-        return !cell->target || gc->is_marked(gc->context, cell->target);
-      })) {
+      std::all_of(
+          heap.cells_.begin(), heap.cells_.end(), [&](const auto& entry) {
+            auto* cell = entry.first;
+            return !cell->target || gc->is_marked(gc->context, cell->target);
+          })) {
     TRACE_EVENT0("flutter", "FlaxDartRootsOnly");
     heap.joint_ = nullptr;
     return;
@@ -322,7 +374,8 @@ void JointHeap::Collect(void* peer, const Dart_FlaxGC* gc) {
     heap.isolate_->ClearKeptObjects();
     // Critical pressure completes a major GC on this locked owner thread.
     // LowMemoryNotification always repeats full GC, even with stable roots.
-    heap.isolate_->MemoryPressureNotification(v8::MemoryPressureLevel::kCritical);
+    heap.isolate_->MemoryPressureNotification(
+        v8::MemoryPressureLevel::kCritical);
     heap.RestoreRoots();
   }
   heap.force_js_collection_ = false;
@@ -330,21 +383,30 @@ void JointHeap::Collect(void* peer, const Dart_FlaxGC* gc) {
 }
 
 void JointHeap::Trace(JointCell* cell, cppgc::Visitor* visitor) {
-  if (!joint_) return;
-  if (std::this_thread::get_id() != owner_) std::abort();
-  if (cell->target) joint_->mark(joint_->context, cell->target);
+  if (!joint_)
+    return;
+  if (std::this_thread::get_id() != owner_)
+    std::abort();
+  if (cell->target)
+    joint_->mark(joint_->context, cell->target);
   while (auto origin = joint_->next_marked_origin(joint_->context)) {
     auto* reachable = origins_.at(origin);
-    if (!reachable->peer) std::abort();
+    if (!reachable->peer)
+      std::abort();
     visitor->Trace(cppgc::Member<JointPeer>(reachable->peer.Get()));
   }
 }
 
-void JointHeap::JsCollected(v8::Isolate*, v8::GCType type, v8::GCCallbackFlags, void* peer) {
+void JointHeap::JsCollected(v8::Isolate*,
+                            v8::GCType type,
+                            v8::GCCallbackFlags,
+                            void* peer) {
   auto& heap = *static_cast<JointHeap*>(peer);
-  if (heap.joint_) heap.RestoreRoots();
+  if (heap.joint_)
+    heap.RestoreRoots();
   // Minor/incremental/weak-callback phases do not complete JS heap tracing.
-  // Escalating each phase to a full Dart/V8 collection creates a GC feedback loop.
+  // Escalating each phase to a full Dart/V8 collection creates a GC feedback
+  // loop.
   else if ((type & v8::kGCTypeMarkSweepCompact) && !heap.cells_.empty()) {
     TRACE_EVENT0("flutter", "FlaxRequestV8GC");
     heap.Request(true);
@@ -359,15 +421,21 @@ void JointHeap::RequestFromDart(void* peer) {
 }
 
 void JointHeap::Request(bool collect) {
-  if (closed_) return;
-  if (collect) collect_requested_ = true;
-  if (queued_.exchange(true)) return;
-  // Always post: a GC callback must never reenter Dart or execute application code.
+  if (closed_)
+    return;
+  if (collect)
+    collect_requested_ = true;
+  if (queued_.exchange(true))
+    return;
+  // Always post: a GC callback must never reenter Dart or execute application
+  // code.
   runner_->PostTask([weak = weak_from_this()] {
     auto heap = weak.lock();
-    if (!heap || heap->closed_) return;
+    if (!heap || heap->closed_)
+      return;
     auto state = heap->dart_state_.lock();
-    if (!state || state->IsShuttingDown()) return;
+    if (!state || state->IsShuttingDown())
+      return;
     heap->queued_ = false;
     tonic::DartIsolateScope entered(state->isolate());
     Dart_EnterScope();
@@ -395,6 +463,7 @@ void JointPeer::Detach() {
 }
 void JointPeer::Trace(cppgc::Visitor* visitor) const {
   visitor->Trace(value);
-  for (auto* cell : cells) cell->heap->Trace(cell, visitor);
+  for (auto* cell : cells)
+    cell->heap->Trace(cell, visitor);
 }
 }  // namespace flax

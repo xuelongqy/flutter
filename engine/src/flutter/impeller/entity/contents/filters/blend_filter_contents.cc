@@ -243,12 +243,12 @@ static std::optional<Entity> AdvancedBlend(
     return std::nullopt;
   }
   fml::StatusOr<RenderTarget> render_target =
-      renderer.MakeSubpass("Advanced Blend Filter",                 //
+      renderer.MakeSubpass("Advanced Blend Filter",                  //
                            ISize::Ceil(subpass_coverage.GetSize()),  //
-                           command_buffer,                          //
-                           callback,                                //
-                           /*msaa_enabled=*/false,                  //
-                           /*depth_stencil_enabled=*/false          //
+                           command_buffer,                           //
+                           callback,                                 //
+                           /*msaa_enabled=*/false,                   //
+                           /*depth_stencil_enabled=*/false           //
       );
   if (!render_target.ok()) {
     return std::nullopt;
@@ -629,12 +629,12 @@ static std::optional<Entity> PipelineBlend(
   }
 
   fml::StatusOr<RenderTarget> render_target =
-      renderer.MakeSubpass("Pipeline Blend Filter",                 //
+      renderer.MakeSubpass("Pipeline Blend Filter",                  //
                            ISize::Ceil(subpass_coverage.GetSize()),  //
-                           command_buffer,                          //
-                           callback,                                //
-                           /*msaa_enabled=*/false,                  //
-                           /*depth_stencil_enabled=*/false          //
+                           command_buffer,                           //
+                           callback,                                 //
+                           /*msaa_enabled=*/false,                   //
+                           /*depth_stencil_enabled=*/false           //
       );
 
   if (!render_target.ok()) {

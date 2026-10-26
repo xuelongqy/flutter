@@ -54,18 +54,19 @@ void main() {
                    Sample(texture_sampler,
                           v_texture_coords + kernel_samples.sample_data[2].xy);
     if (frag_info.sample_count == 4.0) {
-      total_color += float16_t(kernel_samples.sample_data[3].z) *
-                     Sample(texture_sampler,
-                            v_texture_coords + kernel_samples.sample_data[3].xy);
+      total_color +=
+          float16_t(kernel_samples.sample_data[3].z) *
+          Sample(texture_sampler,
+                 v_texture_coords + kernel_samples.sample_data[3].xy);
     }
   } else
 #endif
   {
     for (int i = 0; i < int(frag_info.sample_count); i++) {
       float16_t coefficient = float16_t(kernel_samples.sample_data[i].z);
-      total_color += coefficient *
-                     Sample(texture_sampler,
-                            v_texture_coords + kernel_samples.sample_data[i].xy);
+      total_color += coefficient * Sample(texture_sampler,
+                                          v_texture_coords +
+                                              kernel_samples.sample_data[i].xy);
     }
   }
 

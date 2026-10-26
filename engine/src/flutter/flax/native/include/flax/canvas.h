@@ -1,5 +1,5 @@
-#ifndef FLAX_CANVAS_H_
-#define FLAX_CANVAS_H_
+#ifndef FLUTTER_FLAX_NATIVE_INCLUDE_FLAX_CANVAS_H_
+#define FLUTTER_FLAX_NATIVE_INCLUDE_FLAX_CANVAS_H_
 #include <stdint.h>
 typedef struct _Dart_Handle* Dart_Handle;
 #ifdef __cplusplus
@@ -17,14 +17,17 @@ uint32_t flax_canvas_version(void);
  * 10 count live hosts, surfaces and image registrations on this isolate;
  * 11 stroke hit id,bytes,[x,y,explicit]; 12 read Picture,[w,h,x,y,sw,sh];
  * 13 RGBA8 snapshot Picture,[w,h] (no host registration required).
- * 14 encode straight RGBA bytes,[w,h,format,quality] (1 JPEG,2 WebP; quality 0..100);
- * CPU-only encoding also accepts a Dart worker isolate, without a host.
- * 15 reference font metrics/family,FlaxFontCollection?.
- * Calls are synchronous, non-leaf and restricted to their owning UI isolate.
+ * 14 encode straight RGBA bytes,[w,h,format,quality] (1 JPEG,2 WebP; quality
+ * 0..100); CPU-only encoding also accepts a Dart worker isolate, without a
+ * host. 15 reference font metrics/family,FlaxFontCollection?. Calls are
+ * synchronous, non-leaf and restricted to their owning UI isolate.
  */
-Dart_Handle flax_canvas_dispatch(uint64_t host, uint32_t operation,
-                                Dart_Handle a, Dart_Handle b, Dart_Handle c);
+Dart_Handle flax_canvas_dispatch(uint64_t host,
+                                 uint32_t operation,
+                                 Dart_Handle a,
+                                 Dart_Handle b,
+                                 Dart_Handle c);
 #ifdef __cplusplus
 }
 #endif
-#endif
+#endif  // FLUTTER_FLAX_NATIVE_INCLUDE_FLAX_CANVAS_H_

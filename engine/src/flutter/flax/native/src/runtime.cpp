@@ -5,28 +5,28 @@ void flaxFfiExperimentShutdown(FlaxRuntime*);
 #endif
 #include <dart_flax_api.h>
 #include "engine.h"
-#include "joint_gc.h"
 #include "flax/engine_binding.h"
 #include "flax/engine_execution.h"
 #include "flax/engine_gc.h"
 #include "flutter/fml/build_config.h"
 #include "flutter/lib/ui/ui_dart_state.h"
+#include "joint_gc.h"
 #include "third_party/tonic/scopes/dart_isolate_scope.h"
 
 #include <atomic>
 #include <climits>
-#include <thread>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-#include "value_id.h"
 #include "canvas_decoder.inc"
+#include "value_id.h"
 
 namespace fbjsi = facebook::jsi;
 struct BoundValue;
@@ -187,7 +187,9 @@ struct Entry {
 };
 
 template <typename Action>
-int32_t enter(FlaxRuntime* runtime, FlaxError* error, Action action,
+int32_t enter(FlaxRuntime* runtime,
+              FlaxError* error,
+              Action action,
               bool allow_preparation = false) noexcept {
   return protect(error, [&] {
     if (!runtime)
@@ -251,20 +253,19 @@ void clearRuntime(FlaxRuntime* runtime) {
   runtime->bufferView.reset();
   runtime->members.clear();
   runtime->memberLookup.reset();
-  if (runtime->js) flax::closeEngineRuntime(*runtime->js);
+  if (runtime->js)
+    flax::closeEngineRuntime(*runtime->js);
   runtime->js.reset();
 }
 
 void initializeRuntime(FlaxRuntime* runtime) {
   runtime->js = flax::createEngineRuntime(&runtime->depth);
   runtime->arrayBufferConstructor = std::make_unique<fbjsi::Function>(
-      runtime->js->global().getPropertyAsFunction(*runtime->js,
-                                                  "ArrayBuffer"));
+      runtime->js->global().getPropertyAsFunction(*runtime->js, "ArrayBuffer"));
   runtime->bigIntConstructor = std::make_unique<fbjsi::Function>(
       runtime->js->global().getPropertyAsFunction(*runtime->js, "BigInt"));
   runtime->bigIntText = std::make_unique<fbjsi::Function>(
-      runtime->bigIntConstructor
-          ->getPropertyAsObject(*runtime->js, "prototype")
+      runtime->bigIntConstructor->getPropertyAsObject(*runtime->js, "prototype")
           .getPropertyAsFunction(*runtime->js, "toString"));
   // Reinterpret views over the existing byte lease; no payload copy or GC
   // path.
@@ -428,10 +429,13 @@ int32_t evaluate(FlaxRuntime* runtime,
       auto compiled = std::move(runtime->preparedEntry);
       runtime->preparedSource.clear();
       runtime->preparedUrl.clear();
-      *output = keep(runtime, runtime->js->evaluatePreparedJavaScript(compiled));
+      *output =
+          keep(runtime, runtime->js->evaluatePreparedJavaScript(compiled));
     } else {
-      auto buffer = std::make_shared<fbjsi::StringBuffer>(std::move(source_text));
-      *output = keep(runtime, runtime->js->evaluateJavaScript(buffer, source_url));
+      auto buffer =
+          std::make_shared<fbjsi::StringBuffer>(std::move(source_text));
+      *output =
+          keep(runtime, runtime->js->evaluateJavaScript(buffer, source_url));
     }
   });
 }
@@ -481,7 +485,8 @@ int32_t makeValue(FlaxRuntime* runtime,
   });
 }
 
-void describeValue(FlaxRuntime* runtime, const fbjsi::Value& v,
+void describeValue(FlaxRuntime* runtime,
+                   const fbjsi::Value& v,
                    FlaxValueInfo* info) {
   *info = {};
   if (v.isUndefined())
@@ -517,32 +522,42 @@ void describeValue(FlaxRuntime* runtime, const fbjsi::Value& v,
   }
 }
 
-int32_t inspect(FlaxRuntime* runtime, FlaxValueId id, FlaxValueInfo* info,
+int32_t inspect(FlaxRuntime* runtime,
+                FlaxValueId id,
+                FlaxValueInfo* info,
                 FlaxError* error) {
-  return enter(runtime, error, [&] {
-    describeValue(runtime, value(runtime, id), info);
-  });
+  return enter(runtime, error,
+               [&] { describeValue(runtime, value(runtime, id), info); });
 }
 
-// Primitives cross by value; only objects need an owned table entry and GC peer.
-void resultValue(FlaxRuntime* runtime, fbjsi::Value result,
-                 FlaxValueId* output, FlaxValueInfo* info) {
+// Primitives cross by value; only objects need an owned table entry and GC
+// peer.
+void resultValue(FlaxRuntime* runtime,
+                 fbjsi::Value result,
+                 FlaxValueId* output,
+                 FlaxValueInfo* info) {
   describeValue(runtime, result, info);
-  if (result.isObject()) *output = keep(runtime, std::move(result));
+  if (result.isObject())
+    *output = keep(runtime, std::move(result));
 }
 
-int32_t getPropertyResult(FlaxRuntime* runtime, FlaxValueId id,
-                          const uint16_t* name, size_t length,
-                          FlaxValueId* output, FlaxValueInfo* info,
+int32_t getPropertyResult(FlaxRuntime* runtime,
+                          FlaxValueId id,
+                          const uint16_t* name,
+                          size_t length,
+                          FlaxValueId* output,
+                          FlaxValueInfo* info,
                           FlaxError* error) {
   return enter(runtime, error, [&] {
     if (!output || !info)
       throw BridgeError(FLAX_ARGUMENT_ERROR, "Null property result");
     *output = 0;
     *info = {};
-    resultValue(runtime, object(runtime, id).getProperty(
-                             *runtime->js, propertyName(runtime, name, length)),
-                output, info);
+    resultValue(
+        runtime,
+        object(runtime, id)
+            .getProperty(*runtime->js, propertyName(runtime, name, length)),
+        output, info);
   });
 }
 
@@ -947,9 +962,11 @@ int32_t invokeMember(FlaxRuntime* runtime,
   });
 }
 
-fbjsi::Value callValue(FlaxRuntime* runtime, FlaxValueId id,
+fbjsi::Value callValue(FlaxRuntime* runtime,
+                       FlaxValueId id,
                        const FlaxBindingArgument* receiver,
-                       const FlaxBindingArgument* arguments, size_t count) {
+                       const FlaxBindingArgument* arguments,
+                       size_t count) {
   if (!receiver)
     throw BridgeError(FLAX_ARGUMENT_ERROR, "Null call receiver");
   auto& js = *runtime->js;
@@ -959,10 +976,13 @@ fbjsi::Value callValue(FlaxRuntime* runtime, FlaxValueId id,
   return js.call(fn, target, args.data(), args.size());
 }
 
-int32_t bindingCall(FlaxRuntime* runtime, FlaxValueId id,
+int32_t bindingCall(FlaxRuntime* runtime,
+                    FlaxValueId id,
                     const FlaxBindingArgument* receiver,
-                    const FlaxBindingArgument* arguments, size_t count,
-                    FlaxValueId* output, FlaxError* error) {
+                    const FlaxBindingArgument* arguments,
+                    size_t count,
+                    FlaxValueId* output,
+                    FlaxError* error) {
   return enter(runtime, error, [&] {
     if (!output)
       throw BridgeError(FLAX_ARGUMENT_ERROR, "Null call output");
@@ -970,10 +990,14 @@ int32_t bindingCall(FlaxRuntime* runtime, FlaxValueId id,
   });
 }
 
-int32_t callResult(FlaxRuntime* runtime, FlaxValueId id,
+int32_t callResult(FlaxRuntime* runtime,
+                   FlaxValueId id,
                    const FlaxBindingArgument* receiver,
-                   const FlaxBindingArgument* arguments, size_t count,
-                   FlaxValueId* output, FlaxValueInfo* info, FlaxError* error) {
+                   const FlaxBindingArgument* arguments,
+                   size_t count,
+                   FlaxValueId* output,
+                   FlaxValueInfo* info,
+                   FlaxError* error) {
   return enter(runtime, error, [&] {
     if (!output || !info)
       throw BridgeError(FLAX_ARGUMENT_ERROR, "Null call result");
@@ -1014,8 +1038,7 @@ int32_t copyBuffer(FlaxRuntime* runtime,
     Dart_TypedData_Type type;
     void* data = nullptr;
     intptr_t acquiredLength = 0;
-    checkDart(
-        Dart_TypedDataAcquireData(bytes, &type, &data, &acquiredLength));
+    checkDart(Dart_TypedDataAcquireData(bytes, &type, &data, &acquiredLength));
     const bool compatible =
         type == Dart_TypedData_kUint8 && acquiredLength == length;
     // No JS or allocating Dart calls while the borrowed Dart address is
@@ -1141,7 +1164,8 @@ Dart_Handle readBuffer(FlaxRuntime* runtime,
   return result;
 }
 
-Dart_Handle instanceType(FlaxRuntime* runtime, Dart_Handle value,
+Dart_Handle instanceType(FlaxRuntime* runtime,
+                         Dart_Handle value,
                          FlaxError* error) {
   Dart_Handle result = Dart_Null();
   enter(runtime, error, [&] {
@@ -1151,7 +1175,9 @@ Dart_Handle instanceType(FlaxRuntime* runtime, Dart_Handle value,
   return error && error->code != FLAX_OK ? Dart_Null() : result;
 }
 
-Dart_Handle typeParts(FlaxRuntime* runtime, Dart_Handle type, FlaxError* error) {
+Dart_Handle typeParts(FlaxRuntime* runtime,
+                      Dart_Handle type,
+                      FlaxError* error) {
   Dart_Handle result = Dart_Null();
   enter(runtime, error, [&] {
     result = Dart_FlaxTypeParts(type);
@@ -1160,7 +1186,9 @@ Dart_Handle typeParts(FlaxRuntime* runtime, Dart_Handle type, FlaxError* error) 
   return error && error->code != FLAX_OK ? Dart_Null() : result;
 }
 
-Dart_Handle nullableType(FlaxRuntime* runtime, Dart_Handle type, FlaxError* error) {
+Dart_Handle nullableType(FlaxRuntime* runtime,
+                         Dart_Handle type,
+                         FlaxError* error) {
   Dart_Handle result = Dart_Null();
   enter(runtime, error, [&] {
     result = Dart_FlaxNullableType(type);
@@ -1169,8 +1197,10 @@ Dart_Handle nullableType(FlaxRuntime* runtime, Dart_Handle type, FlaxError* erro
   return error && error->code != FLAX_OK ? Dart_Null() : result;
 }
 
-Dart_Handle instantiate(FlaxRuntime* runtime, Dart_Handle closure,
-                        Dart_Handle types, FlaxError* error) {
+Dart_Handle instantiate(FlaxRuntime* runtime,
+                        Dart_Handle closure,
+                        Dart_Handle types,
+                        FlaxError* error) {
   Dart_Handle result = Dart_Null();
   enter(runtime, error, [&] {
     result = Dart_FlaxInstantiate(closure, types);
@@ -1303,9 +1333,11 @@ extern "C" void flax_engine_shutdown_current_isolate() {
     if (it != runtimes.end())
       live.assign(it->second.begin(), it->second.end());
   }
-  for (auto* runtime : live) cancelStartup(runtime);
+  for (auto* runtime : live)
+    cancelStartup(runtime);
 #if defined(FLAX_ENABLE_FFI)
-  for (auto* runtime : live) flaxFfiExperimentShutdown(runtime);
+  for (auto* runtime : live)
+    flaxFfiExperimentShutdown(runtime);
 #endif
   flax::shutdownJointHeap();
   for (auto* runtime : live) {
@@ -1323,13 +1355,17 @@ extern "C" void flax_engine_notify_idle_current_isolate() {
 #include "ffi/runtime.inc"
 #endif
 
-int32_t inspectArguments(FlaxRuntime* runtime, FlaxValueId receiver,
-                         const FlaxValueId* arguments, size_t count,
-                         FlaxValueInfo* infos, FlaxError* error) {
+int32_t inspectArguments(FlaxRuntime* runtime,
+                         FlaxValueId receiver,
+                         const FlaxValueId* arguments,
+                         size_t count,
+                         FlaxValueInfo* infos,
+                         FlaxError* error) {
   return enter(runtime, error, [&] {
     if (!infos || (count && !arguments))
       throw BridgeError(FLAX_ARGUMENT_ERROR, "Null host argument descriptions");
-    for (size_t i = 0; i <= count; ++i) infos[i] = {};
+    for (size_t i = 0; i <= count; ++i)
+      infos[i] = {};
     try {
       describeValue(runtime, value(runtime, receiver), infos);
       for (size_t i = 0; i < count; ++i)
@@ -1347,11 +1383,14 @@ int32_t inspectArguments(FlaxRuntime* runtime, FlaxValueId receiver,
 #include "startup.inc"
 
 extern "C" __attribute__((visibility("default")))
-const FlaxEngineExecutionApi* flax_get_engine_execution_api(
-    uint32_t version) {
-  static const FlaxEngineExecutionApi results{
-      FLAX_ENGINE_EXECUTION_VERSION,
-      sizeof(FlaxEngineExecutionApi), callResult, getPropertyResult,
-      inspectArguments, prepareStartup, pollStartup, cancelStartupEntry};
+const FlaxEngineExecutionApi* flax_get_engine_execution_api(uint32_t version) {
+  static const FlaxEngineExecutionApi results{FLAX_ENGINE_EXECUTION_VERSION,
+                                              sizeof(FlaxEngineExecutionApi),
+                                              callResult,
+                                              getPropertyResult,
+                                              inspectArguments,
+                                              prepareStartup,
+                                              pollStartup,
+                                              cancelStartupEntry};
   return version == results.version ? &results : nullptr;
 }

@@ -1,17 +1,19 @@
-#ifndef FLAX_JOINT_GC_H
-#define FLAX_JOINT_GC_H
+#ifndef FLUTTER_FLAX_NATIVE_SRC_JOINT_GC_H_
+#define FLUTTER_FLAX_NATIVE_SRC_JOINT_GC_H_
 
-#include "v8_core.h"
-#include <dart_flax_api.h>
 #include <cppgc/persistent.h>
 #include <cppgc/prefinalizer.h>
+#include <dart_flax_api.h>
 #include <v8-cppgc.h>
 #include <atomic>
 #include <thread>
 #include <unordered_map>
 #include <vector>
 #include "flutter/fml/task_runner.h"
-namespace tonic { class DartState; }
+#include "v8_core.h"
+namespace tonic {
+class DartState;
+}
 
 namespace flax {
 class JointHeap;
@@ -52,9 +54,12 @@ class JointHeap : public std::enable_shared_from_this<JointHeap> {
   void EndPreparation();
   ~JointHeap();
   v8::Isolate* isolate() const { return isolate_; }
-  JointCell* Bind(const void* session, v8::Local<v8::Object> value,
-            Dart_Handle target, Dart_Handle origin,
-            void (*cleanup)(void*) = nullptr, void* cleanup_data = nullptr);
+  JointCell* Bind(const void* session,
+                  v8::Local<v8::Object> value,
+                  Dart_Handle target,
+                  Dart_Handle origin,
+                  void (*cleanup)(void*) = nullptr,
+                  void* cleanup_data = nullptr);
   void CloseSession(const void* session);
   void Release(JointCell* cell) { Remove(cell); }
   void Trace(JointCell* cell, cppgc::Visitor* visitor);
@@ -86,4 +91,4 @@ class JointHeap : public std::enable_shared_from_this<JointHeap> {
   bool preparing_ = false;
 };
 }  // namespace flax
-#endif
+#endif  // FLUTTER_FLAX_NATIVE_SRC_JOINT_GC_H_
