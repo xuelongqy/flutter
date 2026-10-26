@@ -16,6 +16,7 @@ constexpr auto tag = v8::CppHeapPointerTag::kFirstObjectWrappableTag;
 }
 
 std::shared_ptr<JointHeap> JointHeap::Current(const v8rt::IsolateConfig& config) {
+  CheckPreparation();
   auto* state = flutter::UIDartState::Current();
   if (!state || !state->IsRootIsolate() ||
       !state->GetTaskRunners().GetUITaskRunner()->RunsTasksOnCurrentThread()) {
@@ -27,6 +28,35 @@ std::shared_ptr<JointHeap> JointHeap::Current(const v8rt::IsolateConfig& config)
   auto heap = std::shared_ptr<JointHeap>(new JointHeap(config));
   entry = heap;
   return heap;
+}
+
+void JointHeap::CheckPreparation() {
+  std::lock_guard<std::mutex> lock(heaps_mutex);
+  auto it = heaps.find(Dart_CurrentIsolate());
+  auto heap = it == heaps.end() ? nullptr : it->second.lock();
+  if (heap && heap->preparing_)
+    throw std::runtime_error("Flax heap is preparing JavaScript");
+}
+
+std::shared_ptr<JointHeap> JointHeap::BeginPreparation() {
+  std::lock_guard<std::mutex> lock(heaps_mutex);
+  auto it = heaps.find(Dart_CurrentIsolate());
+  auto heap = it == heaps.end() ? nullptr : it->second.lock();
+  if (!heap || heap->closed_ || heap->preparing_ || !heap->cells_.empty())
+    return nullptr;
+  heap->preparing_ = true;
+  return heap;
+}
+
+void JointHeap::CancelPreparation() {
+  if (preparing_) isolate_->TerminateExecution();
+}
+
+void JointHeap::EndPreparation() {
+  v8::Locker locker(isolate_);
+  v8::Isolate::Scope scope(isolate_);
+  isolate_->CancelTerminateExecution();
+  preparing_ = false;
 }
 
 JointHeap::JointHeap(const v8rt::IsolateConfig& config)
@@ -167,6 +197,8 @@ JointCell* JointHeap::Bind(const void* session, v8::Local<v8::Object> value,
 }
 
 void JointHeap::ScheduleIdle(bool js_changed) {
+  // Pure preparation has no Dart peers and must not mutate UI-owned idle state.
+  if (std::this_thread::get_id() != owner_) return;
   dirty_ |= js_changed;
   if (idle_pending_) return;
   idle_pending_ = true;
@@ -240,7 +272,9 @@ void JointHeap::RestoreRoots() {
 
 void JointHeap::Collect(void* peer, const Dart_FlaxGC* gc) {
   auto& heap = *static_cast<JointHeap*>(peer);
-  if (heap.closed_ || !heap.isolate_) return;
+  // An empty bridge has no conditional Dart edges and needs no V8 lock. This
+  // also lets Dart GC complete while pure initialization owns the empty heap.
+  if (heap.closed_ || !heap.isolate_ || heap.cells_.empty()) return;
   if (std::this_thread::get_id() != heap.owner_ || heap.joint_) std::abort();
   v8::Locker locker(heap.isolate_);
   v8::Isolate::Scope scope(heap.isolate_);

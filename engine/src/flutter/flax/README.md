@@ -166,6 +166,39 @@ keeps fixed-entry identities stable and preserves existing Dart/JS instances; SD
 unsupported class-shape changes still require a restart. This compiler extension does
 not change the native ABI, UI protocol or joint-GC ownership.
 
+Incremental compilation also invalidates serialized dependency groups when fixed
+helpers are added to a previously cached library. Their owning libraries are emitted
+in the reload delta. The revision-checked patch includes this repair for cold mixed
+SDK/application caches; `dart-startup.patch` upgrades earlier patched checkouts
+without resetting unrelated Dart edits.
+
+## JavaScript startup and execution
+
+The optional `engine_execution.h` table (version 1) combines native results with their
+value descriptions and reads borrowed callback arguments in one batch. Its canonical
+header is mirrored from Flax; no application-specific symbols or helper libraries are
+required. Native ABI 2 and binding extension 8 are unchanged.
+
+Normal owning FlaxViews prepare module factories and compile the business entry on a
+worker, then install Dart host callbacks and activate that same V8 context on UI.
+Preparation is currently enabled only on macOS for a sole pristine runtime with no
+Dart peers, external handles or FFI installation. Existing sessions, configured
+runtimes and other platforms use staged UI startup. A module factory requiring Dart
+falls back in the same runtime after clearing its pristine preparation context.
+Business evaluation and synchronous Builder/LayoutBuilder callbacks remain on UI.
+
+A new synchronous runtime interrupts an unfinished pristine worker and releases the
+heap before creation. Polling then discards that incomplete context and selects UI
+initialization; completed preparation can still be adopted. Runtime-specific guards
+prevent access to partial globals until polling finishes.
+
+Preparation holds the shared V8 heap exclusively. Dart GC skips that lock while the
+bridge has no Dart peers; cancellation, disposal and hot restart terminate and join
+the worker before retiring the heap. A worker cannot call Dart host callbacks. These
+rules preserve joint-GC ownership and avoid blocking another live Session on a worker.
+Build the ordinary Debug/Release targets above to include the extension and compiler
+repair; the verified V8 SDK and its locks remain unchanged.
+
 ## Ownership
 
 Dart's ordinary parallel marking remains enabled. Conditional tracing then

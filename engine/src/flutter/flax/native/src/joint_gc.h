@@ -46,6 +46,10 @@ class JointHeap : public std::enable_shared_from_this<JointHeap> {
   static std::shared_ptr<JointHeap> Current(const v8rt::IsolateConfig& config);
   static void ShutdownCurrent();
   static void NotifyIdleCurrent();
+  static std::shared_ptr<JointHeap> BeginPreparation();
+  static void CheckPreparation();
+  void CancelPreparation();
+  void EndPreparation();
   ~JointHeap();
   v8::Isolate* isolate() const { return isolate_; }
   JointCell* Bind(const void* session, v8::Local<v8::Object> value,
@@ -79,6 +83,7 @@ class JointHeap : public std::enable_shared_from_this<JointHeap> {
   bool force_js_collection_ = false;
   std::atomic<bool> queued_{false}, collect_requested_{false}, closed_{false};
   bool idle_pending_ = false, dirty_ = false;
+  bool preparing_ = false;
 };
 }  // namespace flax
 #endif
