@@ -26,14 +26,32 @@ def apply(dart: Path, patch: Path, expected: str) -> None:
     print("Flax Dart patch applied")
 
 
+def apply_all(dart: Path, flax: Path) -> None:
+    revision = (flax / "patches/dart_revision").read_text().strip()
+    base = flax / "patches/dart.patch"
+    upgrade = flax / "patches/dart-startup.patch"
+    actual = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=dart, text=True).strip()
+    # Upgrade an existing maintained checkout without reverting its local patches.
+    # Fresh checkouts use the consolidated base; edited hunks still fail safely.
+    if actual == revision and subprocess.run(
+        ["git", "apply", "--reverse", "--check", str(base)], cwd=dart,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    ).returncode != 0 and subprocess.run(
+        ["git", "apply", "--check", str(upgrade)], cwd=dart,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    ).returncode == 0:
+        apply(dart, upgrade, revision)
+    for name in ("dart.patch", "dart-ffi.patch"):
+        apply(dart, flax / "patches" / name, revision)
+
+
 def main() -> None:
     flax = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dart-source", type=Path,
                         default=flax.parent / "third_party/dart")
     args = parser.parse_args()
-    apply(args.dart_source, flax / "patches/dart.patch",
-          (flax / "patches/dart_revision").read_text().strip())
+    apply_all(args.dart_source, flax)
 
 
 if __name__ == "__main__":

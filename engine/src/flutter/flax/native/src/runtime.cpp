@@ -5,11 +5,17 @@ void flaxFfiExperimentShutdown(FlaxRuntime*);
 #endif
 #include <dart_flax_api.h>
 #include "engine.h"
+#include "joint_gc.h"
 #include "flax/engine_binding.h"
+#include "flax/engine_execution.h"
 #include "flax/engine_gc.h"
+#include "flutter/fml/build_config.h"
 #include "flutter/lib/ui/ui_dart_state.h"
 #include "third_party/tonic/scopes/dart_isolate_scope.h"
 
+#include <atomic>
+#include <climits>
+#include <thread>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -24,6 +30,9 @@ void flaxFfiExperimentShutdown(FlaxRuntime*);
 
 namespace fbjsi = facebook::jsi;
 struct BoundValue;
+struct FlaxStartup;
+void cancelStartup(FlaxRuntime*);
+void sharePreparedHeap();
 
 struct ProxyMember {
   fbjsi::String name;
@@ -37,6 +46,7 @@ struct ProxyMember {
 
 struct FlaxRuntime {
   ~FlaxRuntime() {
+    cancelStartup(this);
     if (js)
       flax::closeEngineRuntime(*js);
   }
@@ -44,6 +54,7 @@ struct FlaxRuntime {
   std::recursive_mutex mutex;
   size_t depth = 0;
   bool disposing = false;
+  bool cold = true;
   std::unique_ptr<fbjsi::Runtime> js;
   // Declared after js so references are released before the engine.
   std::unique_ptr<fbjsi::Function> byteView;
@@ -55,6 +66,9 @@ struct FlaxRuntime {
   std::vector<std::unique_ptr<ProxyMember>> members;
   std::unordered_map<FlaxValueId, fbjsi::Value> values;
   std::unordered_map<FlaxValueId, BoundValue*> boundValues;
+  std::shared_ptr<FlaxStartup> startup;
+  std::shared_ptr<const fbjsi::PreparedJavaScript> preparedEntry;
+  std::string preparedSource, preparedUrl;
 };
 
 struct BoundValue {
@@ -147,7 +161,7 @@ int32_t protect(FlaxError* error, Action action) noexcept {
 struct Entry {
   FlaxRuntime& runtime;
   std::unique_lock<std::recursive_mutex> lock;
-  explicit Entry(FlaxRuntime* runtime)
+  explicit Entry(FlaxRuntime* runtime, bool allow_preparation = false)
       : runtime(*runtime), lock(runtime->mutex, std::try_to_lock) {
     if (!lock.owns_lock()) {
       throw BridgeError(FLAX_STATE_ERROR, "Concurrent runtime access");
@@ -158,6 +172,12 @@ struct Entry {
     if (runtime->owner != Dart_CurrentIsolate())
       throw BridgeError(FLAX_STATE_ERROR,
                         "Runtime belongs to another Dart isolate");
+    if (!allow_preparation) {
+      if (runtime->startup)
+        throw BridgeError(FLAX_STATE_ERROR, "Runtime is preparing JavaScript");
+      flax::JointHeap::CheckPreparation();
+      runtime->cold = false;
+    }
     ++runtime->depth;
   }
   ~Entry() {
@@ -167,11 +187,12 @@ struct Entry {
 };
 
 template <typename Action>
-int32_t enter(FlaxRuntime* runtime, FlaxError* error, Action action) noexcept {
+int32_t enter(FlaxRuntime* runtime, FlaxError* error, Action action,
+              bool allow_preparation = false) noexcept {
   return protect(error, [&] {
     if (!runtime)
       throw BridgeError(FLAX_STATE_ERROR, "Null runtime");
-    Entry entry(runtime);
+    Entry entry(runtime, allow_preparation);
     action();
   });
 }
@@ -221,121 +242,140 @@ fbjsi::PropNameID propertyName(FlaxRuntime* runtime,
   return fbjsi::PropNameID::forUtf16(*runtime->js, utf16(name, length), length);
 }
 
+void clearRuntime(FlaxRuntime* runtime) {
+  runtime->values.clear();
+  runtime->byteView.reset();
+  runtime->arrayBufferConstructor.reset();
+  runtime->bigIntConstructor.reset();
+  runtime->bigIntText.reset();
+  runtime->bufferView.reset();
+  runtime->members.clear();
+  runtime->memberLookup.reset();
+  if (runtime->js) flax::closeEngineRuntime(*runtime->js);
+  runtime->js.reset();
+}
+
+void initializeRuntime(FlaxRuntime* runtime) {
+  runtime->js = flax::createEngineRuntime(&runtime->depth);
+  runtime->arrayBufferConstructor = std::make_unique<fbjsi::Function>(
+      runtime->js->global().getPropertyAsFunction(*runtime->js,
+                                                  "ArrayBuffer"));
+  runtime->bigIntConstructor = std::make_unique<fbjsi::Function>(
+      runtime->js->global().getPropertyAsFunction(*runtime->js, "BigInt"));
+  runtime->bigIntText = std::make_unique<fbjsi::Function>(
+      runtime->bigIntConstructor
+          ->getPropertyAsObject(*runtime->js, "prototype")
+          .getPropertyAsFunction(*runtime->js, "toString"));
+  // Reinterpret views over the existing byte lease; no payload copy or GC
+  // path.
+  auto views = std::make_shared<fbjsi::StringBuffer>(R"JS((() => {
+    const constructors = [null, Int8Array, Uint8Array, Uint8ClampedArray,
+      Int16Array, Uint16Array, Int32Array, Uint32Array, BigInt64Array,
+      BigUint64Array, Float32Array, Float64Array, DataView];
+    const names = ['', 'Int8Array', 'Uint8Array', 'Uint8ClampedArray',
+      'Int16Array', 'Uint16Array', 'Int32Array', 'Uint32Array', 'BigInt64Array',
+      'BigUint64Array', 'Float32Array', 'Float64Array', 'DataView'];
+    const widths = [1, 1, 1, 1, 2, 2, 4, 4, 8, 8, 4, 8, 1];
+    const apply = Reflect.apply;
+    const getter = (p, n) => Object.getOwnPropertyDescriptor(p, n).get;
+    const typed = Object.getPrototypeOf(Uint8Array.prototype);
+    const tag = getter(typed, Symbol.toStringTag);
+    const tb = getter(typed, 'buffer'), to = getter(typed, 'byteOffset');
+    const tl = getter(typed, 'byteLength');
+    const db = getter(DataView.prototype, 'buffer');
+    const dO = getter(DataView.prototype, 'byteOffset');
+    const dl = getter(DataView.prototype, 'byteLength');
+    const bl = getter(ArrayBuffer.prototype, 'byteLength');
+    const Uint8 = Uint8Array;
+    return (kind, value, offset, length) => {
+      if (kind < 0 || kind >= constructors.length || kind % 1 !== 0)
+        throw new TypeError('Unknown native buffer kind');
+      if (offset === undefined) {
+        let buffer;
+        if (kind === 0) {
+          buffer = value; offset = 0; length = apply(bl, value, []);
+        } else if (kind === 12) {
+          buffer = apply(db, value, []); offset = apply(dO, value, []);
+          length = apply(dl, value, []);
+        } else {
+          if (apply(tag, value, []) !== names[kind])
+            throw new TypeError('Expected an actual ' + names[kind]);
+          buffer = apply(tb, value, []); offset = apply(to, value, []);
+          length = apply(tl, value, []);
+        }
+        return new Uint8(buffer, offset, length);
+      }
+      if (kind === 0) {
+        if (offset !== 0 || length !== apply(bl, value, []))
+          throw new TypeError('Expected the complete ByteBuffer range');
+        return value;
+      }
+      return new constructors[kind](value, offset, length / widths[kind]);
+    };
+  })())JS");
+  runtime->bufferView = std::make_unique<fbjsi::Function>(
+      runtime->js->evaluateJavaScript(views, "flax:shared-buffers")
+          .getObject(*runtime->js)
+          .getFunction(*runtime->js));
+  // Capture intrinsic getters: a view's own buffer/offset properties may lie.
+  auto helper = std::make_shared<fbjsi::StringBuffer>(R"JS((() => {
+    const getter = (p, n) => Object.getOwnPropertyDescriptor(p, n).get;
+    const typed = Object.getPrototypeOf(Uint8Array.prototype);
+    const tb = getter(typed, 'buffer'), to = getter(typed, 'byteOffset');
+    const tl = getter(typed, 'byteLength');
+    const db = getter(DataView.prototype, 'buffer');
+    const dO = getter(DataView.prototype, 'byteOffset');
+    const dl = getter(DataView.prototype, 'byteLength');
+    const length = getter(ArrayBuffer.prototype, 'byteLength');
+    const isView = ArrayBuffer.isView;
+    return v => {
+      if (!isView(v)) return [v, 0, length.call(v)];
+      try { return [tb.call(v), to.call(v), tl.call(v)]; }
+      catch (_) { return [db.call(v), dO.call(v), dl.call(v)]; }
+    };
+  })())JS");
+  runtime->byteView = std::make_unique<fbjsi::Function>(
+      runtime->js->evaluateJavaScript(helper, "flax:bytes")
+          .getObject(*runtime->js)
+          .getFunction(*runtime->js));
+  // Capture intrinsics before application JS can replace them. Detection
+  // never invokes an accessor; a method getter is evaluated once by normal
+  // access.
+  runtime->memberLookup = std::make_unique<fbjsi::Function>(
+      runtime->js
+          ->evaluateJavaScript(
+              std::make_shared<fbjsi::StringBuffer>(R"JS((() => {
+        const own = Object.getOwnPropertyDescriptor;
+        const prototype = Object.getPrototypeOf;
+        const get = Reflect.get, has = Reflect.has;
+        const Error = TypeError;
+        return (receiver, name, kind) => {
+          if (kind === 0) {
+            const value = get(receiver, name);
+            if (value === undefined && !has(receiver, name)) return undefined;
+            if (typeof value !== 'function') throw new Error('Missing proxy method');
+            return value;
+          }
+          for (let object = receiver; object !== null; object = prototype(object)) {
+            const descriptor = own(object, name);
+            if (!descriptor) continue;
+            if ('value' in descriptor) return descriptor.writable ? 1 : 0;
+            return kind === 1 ? descriptor.get : descriptor.set;
+          }
+          return -1;
+        };
+      })())JS"),
+              "flax:member-lookup")
+          .getObject(*runtime->js)
+          .getFunction(*runtime->js));
+}
+
 int32_t create(FlaxRuntime** output, FlaxError* error) {
   return protect(error, [&] {
+    sharePreparedHeap();
+    flax::JointHeap::CheckPreparation();
     auto runtime = std::make_unique<FlaxRuntime>();
-    runtime->js = flax::createEngineRuntime(&runtime->depth);
-    runtime->arrayBufferConstructor = std::make_unique<fbjsi::Function>(
-        runtime->js->global().getPropertyAsFunction(*runtime->js,
-                                                    "ArrayBuffer"));
-    runtime->bigIntConstructor = std::make_unique<fbjsi::Function>(
-        runtime->js->global().getPropertyAsFunction(*runtime->js, "BigInt"));
-    runtime->bigIntText = std::make_unique<fbjsi::Function>(
-        runtime->bigIntConstructor
-            ->getPropertyAsObject(*runtime->js, "prototype")
-            .getPropertyAsFunction(*runtime->js, "toString"));
-    // Reinterpret views over the existing byte lease; no payload copy or GC
-    // path.
-    auto views = std::make_shared<fbjsi::StringBuffer>(R"JS((() => {
-      const constructors = [null, Int8Array, Uint8Array, Uint8ClampedArray,
-        Int16Array, Uint16Array, Int32Array, Uint32Array, BigInt64Array,
-        BigUint64Array, Float32Array, Float64Array, DataView];
-      const names = ['', 'Int8Array', 'Uint8Array', 'Uint8ClampedArray',
-        'Int16Array', 'Uint16Array', 'Int32Array', 'Uint32Array', 'BigInt64Array',
-        'BigUint64Array', 'Float32Array', 'Float64Array', 'DataView'];
-      const widths = [1, 1, 1, 1, 2, 2, 4, 4, 8, 8, 4, 8, 1];
-      const apply = Reflect.apply;
-      const getter = (p, n) => Object.getOwnPropertyDescriptor(p, n).get;
-      const typed = Object.getPrototypeOf(Uint8Array.prototype);
-      const tag = getter(typed, Symbol.toStringTag);
-      const tb = getter(typed, 'buffer'), to = getter(typed, 'byteOffset');
-      const tl = getter(typed, 'byteLength');
-      const db = getter(DataView.prototype, 'buffer');
-      const dO = getter(DataView.prototype, 'byteOffset');
-      const dl = getter(DataView.prototype, 'byteLength');
-      const bl = getter(ArrayBuffer.prototype, 'byteLength');
-      const Uint8 = Uint8Array;
-      return (kind, value, offset, length) => {
-        if (kind < 0 || kind >= constructors.length || kind % 1 !== 0)
-          throw new TypeError('Unknown native buffer kind');
-        if (offset === undefined) {
-          let buffer;
-          if (kind === 0) {
-            buffer = value; offset = 0; length = apply(bl, value, []);
-          } else if (kind === 12) {
-            buffer = apply(db, value, []); offset = apply(dO, value, []);
-            length = apply(dl, value, []);
-          } else {
-            if (apply(tag, value, []) !== names[kind])
-              throw new TypeError('Expected an actual ' + names[kind]);
-            buffer = apply(tb, value, []); offset = apply(to, value, []);
-            length = apply(tl, value, []);
-          }
-          return new Uint8(buffer, offset, length);
-        }
-        if (kind === 0) {
-          if (offset !== 0 || length !== apply(bl, value, []))
-            throw new TypeError('Expected the complete ByteBuffer range');
-          return value;
-        }
-        return new constructors[kind](value, offset, length / widths[kind]);
-      };
-    })())JS");
-    runtime->bufferView = std::make_unique<fbjsi::Function>(
-        runtime->js->evaluateJavaScript(views, "flax:shared-buffers")
-            .getObject(*runtime->js)
-            .getFunction(*runtime->js));
-    // Capture intrinsic getters: a view's own buffer/offset properties may lie.
-    auto helper = std::make_shared<fbjsi::StringBuffer>(R"JS((() => {
-      const getter = (p, n) => Object.getOwnPropertyDescriptor(p, n).get;
-      const typed = Object.getPrototypeOf(Uint8Array.prototype);
-      const tb = getter(typed, 'buffer'), to = getter(typed, 'byteOffset');
-      const tl = getter(typed, 'byteLength');
-      const db = getter(DataView.prototype, 'buffer');
-      const dO = getter(DataView.prototype, 'byteOffset');
-      const dl = getter(DataView.prototype, 'byteLength');
-      const length = getter(ArrayBuffer.prototype, 'byteLength');
-      const isView = ArrayBuffer.isView;
-      return v => {
-        if (!isView(v)) return [v, 0, length.call(v)];
-        try { return [tb.call(v), to.call(v), tl.call(v)]; }
-        catch (_) { return [db.call(v), dO.call(v), dl.call(v)]; }
-      };
-    })())JS");
-    runtime->byteView = std::make_unique<fbjsi::Function>(
-        runtime->js->evaluateJavaScript(helper, "flax:bytes")
-            .getObject(*runtime->js)
-            .getFunction(*runtime->js));
-    // Capture intrinsics before application JS can replace them. Detection
-    // never invokes an accessor; a method getter is evaluated once by normal
-    // access.
-    runtime->memberLookup = std::make_unique<fbjsi::Function>(
-        runtime->js
-            ->evaluateJavaScript(
-                std::make_shared<fbjsi::StringBuffer>(R"JS((() => {
-          const own = Object.getOwnPropertyDescriptor;
-          const prototype = Object.getPrototypeOf;
-          const get = Reflect.get, has = Reflect.has;
-          const Error = TypeError;
-          return (receiver, name, kind) => {
-            if (kind === 0) {
-              const value = get(receiver, name);
-              if (value === undefined && !has(receiver, name)) return undefined;
-              if (typeof value !== 'function') throw new Error('Missing proxy method');
-              return value;
-            }
-            for (let object = receiver; object !== null; object = prototype(object)) {
-              const descriptor = own(object, name);
-              if (!descriptor) continue;
-              if ('value' in descriptor) return descriptor.writable ? 1 : 0;
-              return kind === 1 ? descriptor.get : descriptor.set;
-            }
-            return -1;
-          };
-        })())JS"),
-                "flax:member-lookup")
-            .getObject(*runtime->js)
-            .getFunction(*runtime->js));
+    initializeRuntime(runtime.get());
     std::lock_guard<std::mutex> lock(runtimesMutex);
     runtimes[runtime->owner].insert(runtime.get());
     *output = runtime.release();
@@ -355,17 +395,10 @@ int32_t destroy(FlaxRuntime* runtime, FlaxError* error) {
       if (flaxFfiExperimentInstalled(runtime))
         throw BridgeError(FLAX_STATE_ERROR, "FFI retirement is incomplete");
 #endif
+      cancelStartup(runtime);
+      runtime->preparedEntry.reset();
       runtime->disposing = true;
-      runtime->values.clear();
-      runtime->byteView.reset();
-      runtime->arrayBufferConstructor.reset();
-      runtime->bigIntConstructor.reset();
-      runtime->bigIntText.reset();
-      runtime->bufferView.reset();
-      runtime->members.clear();
-      runtime->memberLookup.reset();
-      flax::closeEngineRuntime(*runtime->js);
-      runtime->js.reset();
+      clearRuntime(runtime);
     }
     {
       std::lock_guard<std::mutex> lock(runtimesMutex);
@@ -388,10 +421,18 @@ int32_t evaluate(FlaxRuntime* runtime,
                  FlaxValueId* output,
                  FlaxError* error) {
   return enter(runtime, error, [&] {
-    auto buffer =
-        std::make_shared<fbjsi::StringBuffer>(text(source, sourceLength));
-    *output = keep(
-        runtime, runtime->js->evaluateJavaScript(buffer, text(url, urlLength)));
+    auto source_text = text(source, sourceLength);
+    auto source_url = text(url, urlLength);
+    if (runtime->preparedEntry && runtime->preparedSource == source_text &&
+        runtime->preparedUrl == source_url) {
+      auto compiled = std::move(runtime->preparedEntry);
+      runtime->preparedSource.clear();
+      runtime->preparedUrl.clear();
+      *output = keep(runtime, runtime->js->evaluatePreparedJavaScript(compiled));
+    } else {
+      auto buffer = std::make_shared<fbjsi::StringBuffer>(std::move(source_text));
+      *output = keep(runtime, runtime->js->evaluateJavaScript(buffer, source_url));
+    }
   });
 }
 
@@ -440,44 +481,68 @@ int32_t makeValue(FlaxRuntime* runtime,
   });
 }
 
-int32_t inspect(FlaxRuntime* runtime,
-                FlaxValueId id,
-                FlaxValueInfo* info,
+void describeValue(FlaxRuntime* runtime, const fbjsi::Value& v,
+                   FlaxValueInfo* info) {
+  *info = {};
+  if (v.isUndefined())
+    info->kind = FLAX_UNDEFINED;
+  else if (v.isNull())
+    info->kind = FLAX_NULL;
+  else if (v.isBool()) {
+    info->kind = FLAX_BOOLEAN;
+    info->number = v.getBool();
+  } else if (v.isNumber()) {
+    info->kind = FLAX_NUMBER;
+    info->number = v.getNumber();
+  } else if (v.isString() || v.isBigInt()) {
+    info->kind = v.isBigInt() ? FLAX_BIGINT : FLAX_STRING;
+    auto& js = *runtime->js;
+    auto string = v.isBigInt() ? js.call(*runtime->bigIntText, v, nullptr, 0)
+                                     .getString(js)
+                                     .utf16(js)
+                               : v.getString(js).utf16(js);
+    info->string_data = reinterpret_cast<uint16_t*>(
+        copyBytes(reinterpret_cast<const uint8_t*>(string.data()),
+                  string.size() * sizeof(char16_t)));
+    if (!info->string_data && !string.empty())
+      throw std::bad_alloc();
+    info->string_length = string.size();
+  } else if (v.isObject()) {
+    info->kind = v.getObject(*runtime->js).isFunction(*runtime->js)
+                     ? FLAX_FUNCTION
+                     : FLAX_OBJECT;
+  } else {
+    throw BridgeError(FLAX_ARGUMENT_ERROR,
+                      "Symbol conversion is not implemented");
+  }
+}
+
+int32_t inspect(FlaxRuntime* runtime, FlaxValueId id, FlaxValueInfo* info,
                 FlaxError* error) {
   return enter(runtime, error, [&] {
+    describeValue(runtime, value(runtime, id), info);
+  });
+}
+
+// Primitives cross by value; only objects need an owned table entry and GC peer.
+void resultValue(FlaxRuntime* runtime, fbjsi::Value result,
+                 FlaxValueId* output, FlaxValueInfo* info) {
+  describeValue(runtime, result, info);
+  if (result.isObject()) *output = keep(runtime, std::move(result));
+}
+
+int32_t getPropertyResult(FlaxRuntime* runtime, FlaxValueId id,
+                          const uint16_t* name, size_t length,
+                          FlaxValueId* output, FlaxValueInfo* info,
+                          FlaxError* error) {
+  return enter(runtime, error, [&] {
+    if (!output || !info)
+      throw BridgeError(FLAX_ARGUMENT_ERROR, "Null property result");
+    *output = 0;
     *info = {};
-    auto& v = value(runtime, id);
-    if (v.isUndefined())
-      info->kind = FLAX_UNDEFINED;
-    else if (v.isNull())
-      info->kind = FLAX_NULL;
-    else if (v.isBool()) {
-      info->kind = FLAX_BOOLEAN;
-      info->number = v.getBool();
-    } else if (v.isNumber()) {
-      info->kind = FLAX_NUMBER;
-      info->number = v.getNumber();
-    } else if (v.isString() || v.isBigInt()) {
-      info->kind = v.isBigInt() ? FLAX_BIGINT : FLAX_STRING;
-      auto& js = *runtime->js;
-      auto string = v.isBigInt() ? js.call(*runtime->bigIntText, v, nullptr, 0)
-                                       .getString(js)
-                                       .utf16(js)
-                                 : v.getString(js).utf16(js);
-      info->string_data = reinterpret_cast<uint16_t*>(
-          copyBytes(reinterpret_cast<const uint8_t*>(string.data()),
-                    string.size() * sizeof(char16_t)));
-      if (!info->string_data && !string.empty())
-        throw std::bad_alloc();
-      info->string_length = string.size();
-    } else if (v.isObject()) {
-      info->kind = v.getObject(*runtime->js).isFunction(*runtime->js)
-                       ? FLAX_FUNCTION
-                       : FLAX_OBJECT;
-    } else {
-      throw BridgeError(FLAX_ARGUMENT_ERROR,
-                        "Symbol conversion is not implemented");
-    }
+    resultValue(runtime, object(runtime, id).getProperty(
+                             *runtime->js, propertyName(runtime, name, length)),
+                output, info);
   });
 }
 
@@ -606,6 +671,8 @@ int32_t registerHostPeer(FlaxRuntime* runtime,
         [runtime, callback, context](
             fbjsi::Runtime& js, const fbjsi::Value& receiver,
             const fbjsi::Value* arguments, size_t count) {
+          if (runtime->owner && runtime->owner != Dart_CurrentIsolate())
+            throw fbjsi::JSError(js, "Dart callbacks require the UI thread");
           CallbackValues frame{runtime};
           frame.ids.reserve(count + 1);
           const auto thisId = frame.add(receiver);
@@ -880,21 +947,40 @@ int32_t invokeMember(FlaxRuntime* runtime,
   });
 }
 
-int32_t bindingCall(FlaxRuntime* runtime,
-                    FlaxValueId id,
+fbjsi::Value callValue(FlaxRuntime* runtime, FlaxValueId id,
+                       const FlaxBindingArgument* receiver,
+                       const FlaxBindingArgument* arguments, size_t count) {
+  if (!receiver)
+    throw BridgeError(FLAX_ARGUMENT_ERROR, "Null call receiver");
+  auto& js = *runtime->js;
+  auto fn = object(runtime, id).getFunction(js);
+  auto args = bindingArguments(runtime, arguments, count);
+  auto target = bindingArgument(runtime, *receiver);
+  return js.call(fn, target, args.data(), args.size());
+}
+
+int32_t bindingCall(FlaxRuntime* runtime, FlaxValueId id,
                     const FlaxBindingArgument* receiver,
-                    const FlaxBindingArgument* arguments,
-                    size_t count,
-                    FlaxValueId* output,
-                    FlaxError* error) {
+                    const FlaxBindingArgument* arguments, size_t count,
+                    FlaxValueId* output, FlaxError* error) {
   return enter(runtime, error, [&] {
-    if (!output || !receiver)
-      throw BridgeError(FLAX_ARGUMENT_ERROR, "Null call output or receiver");
-    auto& js = *runtime->js;
-    auto fn = object(runtime, id).getFunction(js);
-    auto args = bindingArguments(runtime, arguments, count);
-    auto target = bindingArgument(runtime, *receiver);
-    *output = keep(runtime, js.call(fn, target, args.data(), args.size()));
+    if (!output)
+      throw BridgeError(FLAX_ARGUMENT_ERROR, "Null call output");
+    *output = keep(runtime, callValue(runtime, id, receiver, arguments, count));
+  });
+}
+
+int32_t callResult(FlaxRuntime* runtime, FlaxValueId id,
+                   const FlaxBindingArgument* receiver,
+                   const FlaxBindingArgument* arguments, size_t count,
+                   FlaxValueId* output, FlaxValueInfo* info, FlaxError* error) {
+  return enter(runtime, error, [&] {
+    if (!output || !info)
+      throw BridgeError(FLAX_ARGUMENT_ERROR, "Null call result");
+    *output = 0;
+    *info = {};
+    resultValue(runtime, callValue(runtime, id, receiver, arguments, count),
+                output, info);
   });
 }
 
@@ -1217,6 +1303,7 @@ extern "C" void flax_engine_shutdown_current_isolate() {
     if (it != runtimes.end())
       live.assign(it->second.begin(), it->second.end());
   }
+  for (auto* runtime : live) cancelStartup(runtime);
 #if defined(FLAX_ENABLE_FFI)
   for (auto* runtime : live) flaxFfiExperimentShutdown(runtime);
 #endif
@@ -1235,3 +1322,36 @@ extern "C" void flax_engine_notify_idle_current_isolate() {
 #if defined(FLAX_ENABLE_FFI)
 #include "ffi/runtime.inc"
 #endif
+
+int32_t inspectArguments(FlaxRuntime* runtime, FlaxValueId receiver,
+                         const FlaxValueId* arguments, size_t count,
+                         FlaxValueInfo* infos, FlaxError* error) {
+  return enter(runtime, error, [&] {
+    if (!infos || (count && !arguments))
+      throw BridgeError(FLAX_ARGUMENT_ERROR, "Null host argument descriptions");
+    for (size_t i = 0; i <= count; ++i) infos[i] = {};
+    try {
+      describeValue(runtime, value(runtime, receiver), infos);
+      for (size_t i = 0; i < count; ++i)
+        describeValue(runtime, value(runtime, arguments[i]), infos + i + 1);
+    } catch (...) {
+      for (size_t i = 0; i <= count; ++i) {
+        free(infos[i].string_data);
+        infos[i] = {};
+      }
+      throw;
+    }
+  });
+}
+
+#include "startup.inc"
+
+extern "C" __attribute__((visibility("default")))
+const FlaxEngineExecutionApi* flax_get_engine_execution_api(
+    uint32_t version) {
+  static const FlaxEngineExecutionApi results{
+      FLAX_ENGINE_EXECUTION_VERSION,
+      sizeof(FlaxEngineExecutionApi), callResult, getPropertyResult,
+      inspectArguments, prepareStartup, pollStartup, cancelStartupEntry};
+  return version == results.version ? &results : nullptr;
+}

@@ -8,7 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-from apply_dart_patch import apply
+from apply_dart_patch import apply_all
 
 
 def main() -> None:
@@ -31,10 +31,7 @@ def main() -> None:
     flax = Path(__file__).resolve().parents[1]
     source = flax.parents[1]
     checkout = source.parents[1]
-    apply(flax.parent / "third_party/dart", flax / "patches/dart.patch",
-          (flax / "patches/dart_revision").read_text().strip())
-    apply(flax.parent / "third_party/dart", flax / "patches/dart-ffi.patch",
-          (flax / "patches/dart_revision").read_text().strip())
+    apply_all(flax.parent / "third_party/dart", flax)
     sdk = str(args.sdk.resolve())
     subprocess.run([sys.executable, str(flax / "tools/sdk_info.py"), sdk, args.target],
                    check=True, stdout=subprocess.DEVNULL)

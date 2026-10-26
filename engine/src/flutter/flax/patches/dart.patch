@@ -1,3 +1,63 @@
+diff --git a/pkg/front_end/lib/src/base/incremental_compiler.dart b/pkg/front_end/lib/src/base/incremental_compiler.dart
+index 4c0c1d1f..bc5ae18f 100644
+--- a/pkg/front_end/lib/src/base/incremental_compiler.dart
++++ b/pkg/front_end/lib/src/base/incremental_compiler.dart
+@@ -565,6 +565,15 @@ class IncrementalCompiler implements IncrementalKernelGenerator {
+             c,
+             cleanedUpBuilders: cleanedUpBuilders,
+           );
++      if (currentKernelTarget.libraryChanges.isNotEmpty) {
++        for (final library in currentKernelTarget.libraryChanges) {
++          _incrementalSerializer?.invalidate(library.fileUri);
++        }
++        outputLibraries = {
++          ...outputLibraries,
++          ...currentKernelTarget.libraryChanges,
++        }.toList();
++      }
+       if (experimentalInvalidation != null &&
+           experimentalInvalidation.invalidatedMixinApplicationLibraries !=
+               null) {
+@@ -2884,6 +2893,7 @@ class IncrementalKernelTarget extends KernelTarget
+     implements ChangedStructureNotifier {
+   Set<Class>? classHierarchyChanges;
+   Set<Class>? classMemberChanges;
++  final Set<Library> libraryChanges = {};
+   Set<Library> librariesUsed = {};
+
+   new(
+@@ -2903,6 +2913,11 @@ class IncrementalKernelTarget extends KernelTarget
+   @override
+   ChangedStructureNotifier get changedStructureNotifier => this;
+
++  @override
++  void registerLibraryChange(Library library) {
++    libraryChanges.add(library);
++  }
++
+   @override
+   // Coverage-ignore(suite): Not run.
+   void registerClassMemberChange(Class c) {
+diff --git a/pkg/kernel/lib/target/changed_structure_notifier.dart b/pkg/kernel/lib/target/changed_structure_notifier.dart
+index e1b2c7f1..7596987d 100644
+--- a/pkg/kernel/lib/target/changed_structure_notifier.dart
++++ b/pkg/kernel/lib/target/changed_structure_notifier.dart
+@@ -2,11 +2,14 @@
+ // for details. All rights reserved. Use of this source code is governed by a
+ // BSD-style license that can be found in the LICENSE file.
+
+-import 'package:kernel/ast.dart' show Class;
++import 'package:kernel/ast.dart' show Class, Library;
+
+ /// Meant for notifying the backend (the compiler) that the structure has
+ /// changed, in turn allowing it to update its internal model.
+ abstract class ChangedStructureNotifier {
++  /// Mark a library changed by a backend transformation for output and caching.
++  void registerLibraryChange(Library library);
++
+   /// Mark the members of class [cls] have changed.
+   void registerClassMemberChange(Class cls);
+
 diff --git a/pkg/vm/lib/modular/target/vm.dart b/pkg/vm/lib/modular/target/vm.dart
 index 7d91430c..1ad5d3d5 100644
 --- a/pkg/vm/lib/modular/target/vm.dart
@@ -1551,10 +1611,10 @@ index 00000000..f8a90c6f
 +#endif
 diff --git a/pkg/vm/lib/modular/transformations/flax_default_calls.dart b/pkg/vm/lib/modular/transformations/flax_default_calls.dart
 new file mode 100644
-index 00000000..371a80ea
+index 00000000..57b86ef4
 --- /dev/null
 +++ b/pkg/vm/lib/modular/transformations/flax_default_calls.dart
-@@ -0,0 +1,942 @@
+@@ -0,0 +1,944 @@
 +// Copyright (c) 2026, the Dart project authors. Please see the AUTHORS file
 +// for details. All rights reserved. Use of this source code is governed by a
 +// BSD-style license that can be found in the LICENSE file.
@@ -1827,6 +1887,7 @@ index 00000000..371a80ea
 +    );
 +    result.accept(_GeneratedLocations(0));
 +    library.addProcedure(result);
++    changedStructureNotifier?.registerLibraryChange(library);
 +    return result;
 +  }
 +
@@ -2142,6 +2203,7 @@ index 00000000..371a80ea
 +      owner.addProcedure(procedure);
 +      changedStructureNotifier?.registerClassMemberChange(owner);
 +    }
++    changedStructureNotifier?.registerLibraryChange(library);
 +    entries[key] = procedure;
 +    return procedure;
 +  }
