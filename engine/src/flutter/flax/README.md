@@ -74,6 +74,14 @@ GN selects Xcode's linker for its SDK's TAPI format. Tool pins remain intact.
 Framework dependencies are copied into `FlutterMacOS.framework/Versions/A/Libraries`;
 the test executable uses an adjacent `Libraries` directory.
 
+Apple Release builds strip debug and local symbols from the delivered engine framework
+and bundled V8 libraries with `strip -S -x`, retaining global exports. The helper
+re-signs these prepared binaries ad hoc; application builds still perform their ordinary
+final signing. Debug and Profile are unchanged. Keep the verified SDK inputs, unstripped
+linker outputs and matching dSYMs for native crash symbolication; they are not shipped
+inside the application bundle. This changes packaging only, without disabling runtime
+features or changing SDK locks.
+
 The Canvas mobile experiment builds complete isolated targets, including renderer
 shaders and framework/JAR packaging. Android exports the Canvas dispatch symbols. The companion `experiments/canvas_native/run_mobile.dart` runs the shared
 Canvas command, UI, bitmap/font and original-threshold WPT cases in an installed app.
