@@ -1,5 +1,5 @@
-#ifndef FLAX_ENGINE_GC_H
-#define FLAX_ENGINE_GC_H
+#ifndef FLUTTER_FLAX_NATIVE_INCLUDE_FLAX_ENGINE_GC_H_
+#define FLUTTER_FLAX_NATIVE_INCLUDE_FLAX_ENGINE_GC_H_
 #include "runtime.h"
 #ifdef __cplusplus
 extern "C" {
@@ -13,11 +13,22 @@ typedef struct FlaxEngineGcApi {
   size_t struct_size;
   const char* flutter_revision;
   const char* dart_revision;
-  int32_t (*bind_value)(FlaxRuntime*, FlaxValueId, Dart_Handle origin, FlaxError*);
-  int32_t (*bind_peer)(FlaxRuntime*, FlaxValueId, Dart_Handle target,
-                       Dart_Handle origin, FlaxError*);
-  int32_t (*register_host)(FlaxRuntime*, const uint16_t*, size_t,
-                           FlaxHostCallback, void*, Dart_Handle, FlaxError*);
+  int32_t (*bind_value)(FlaxRuntime*,
+                        FlaxValueId,
+                        Dart_Handle origin,
+                        FlaxError*);
+  int32_t (*bind_peer)(FlaxRuntime*,
+                       FlaxValueId,
+                       Dart_Handle target,
+                       Dart_Handle origin,
+                       FlaxError*);
+  int32_t (*register_host)(FlaxRuntime*,
+                           const uint16_t*,
+                           size_t,
+                           FlaxHostCallback,
+                           void*,
+                           Dart_Handle,
+                           FlaxError*);
   uint64_t (*cell_count)(FlaxRuntime*);
 } FlaxEngineGcApi;
 const FlaxApi* flax_engine_get_api(uint32_t version);
@@ -29,4 +40,4 @@ int32_t flax_engine_defer_idle_gc_current_isolate(void);
 #ifdef __cplusplus
 }
 #endif
-#endif
+#endif  // FLUTTER_FLAX_NATIVE_INCLUDE_FLAX_ENGINE_GC_H_

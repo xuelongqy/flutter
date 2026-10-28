@@ -31,9 +31,10 @@ vec4 ReadDestination() {
 }
 
 void main() {
-  f16vec4 sampled = f16vec4(supports_decal > 1
-                              ? texture(texture_sampler_src, v_src_texture_coords)
-                              : IPSampleDecal(texture_sampler_src, v_src_texture_coords));
+  f16vec4 sampled =
+      f16vec4(supports_decal > 1
+                  ? texture(texture_sampler_src, v_src_texture_coords)
+                  : IPSampleDecal(texture_sampler_src, v_src_texture_coords));
   // Zero source is identity in Canvas RGBA8; retain destination MSAA samples.
   if (sampled.a == 0.0) {
     discard;
