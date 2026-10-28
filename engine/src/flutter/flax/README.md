@@ -84,6 +84,8 @@ by the verified V8 SDK's
 C++ headers and the SDK's immutable `libc++_shared.so`; Flutter's pinned compiler,
 C sysroot and compiler runtime remain unchanged. The SDK libraries are packaged
 in the existing Flutter engine JAR, so applications carry one V8 library set.
+The build helper also refreshes `flutter.jar`, the native architecture JAR and
+`artifacts.zip`; ordinary APK builds therefore receive the newly built engine.
 
 ```sh
 ANDROID_HOME=/path/to/android-sdk python3 engine/src/flutter/flax/tools/build_engine.py --target android-arm64 --sdk /path/to/verified/v8-android-arm64 --mode debug

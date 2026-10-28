@@ -84,6 +84,7 @@ struct ContentContextOptions {
   bool has_depth_stencil_attachments = true;
   bool depth_write_enabled = false;
   bool is_for_rrect_blur_clear = false;
+  bool is_canvas_screen = false;
 
   constexpr uint64_t ToKey() const {
     static_assert(sizeof(sample_count) == 1);
@@ -98,6 +99,7 @@ struct ContentContextOptions {
            (0) << 1 |  // // Unused, previously wireframe.
            (has_depth_stencil_attachments ? 1llu : 0llu) << 2 |
            (depth_write_enabled ? 1llu : 0llu) << 3 |
+           (is_canvas_screen ? 1llu : 0llu) << 4 |
            // enums
            static_cast<uint64_t>(color_attachment_pixel_format) << 8 |
            static_cast<uint64_t>(primitive_type) << 16 |
@@ -154,6 +156,7 @@ class ContentContext {
   PipelineRef GetClearBlendPipeline(ContentContextOptions opts) const;
   PipelineRef GetClipPipeline(ContentContextOptions opts) const;
   PipelineRef GetColorMatrixColorFilterPipeline(ContentContextOptions opts) const;
+  PipelineRef GetCanvasColorMatrixScreenPipeline(ContentContextOptions opts) const;
   PipelineRef GetConicalGradientFillPipeline(ContentContextOptions opts, ConicalKind kind) const;
   PipelineRef GetConicalGradientSSBOFillPipeline(ContentContextOptions opts, ConicalKind kind) const;
   PipelineRef GetConicalGradientUniformFillPipeline(ContentContextOptions opts, ConicalKind kind) const;
@@ -181,6 +184,9 @@ class ContentContext {
   PipelineRef GetFramebufferBlendOverlayPipeline(ContentContextOptions opts) const;
   PipelineRef GetFramebufferBlendSaturationPipeline(ContentContextOptions opts) const;
   PipelineRef GetFramebufferBlendScreenPipeline(ContentContextOptions opts) const;
+#if defined(FML_OS_ANDROID) && defined(IMPELLER_ENABLE_OPENGLES)
+  PipelineRef GetCanvasFramebufferScreenPipeline(ContentContextOptions opts) const;
+#endif
   PipelineRef GetFramebufferBlendSoftLightPipeline(ContentContextOptions opts) const;
   PipelineRef GetGaussianBlurPipeline(ContentContextOptions opts) const;
   PipelineRef GetGlyphAtlasPipeline(ContentContextOptions opts) const;
@@ -241,6 +247,14 @@ class ContentContext {
 
   bool EnqueueSubpassCommandBuffer(
       std::shared_ptr<CommandBuffer> command_buffer) const;
+
+  // Raster-thread scope, restored after replaying the owning display list.
+  void SetSubpassPixelFormat(std::optional<PixelFormat> format) const {
+    subpass_pixel_format_ = format;
+  }
+  std::optional<PixelFormat> GetSubpassPixelFormat() const {
+    return subpass_pixel_format_;
+  }
 
   using SubpassCallback =
       std::function<bool(const ContentContext&, RenderPass&)>;
@@ -397,6 +411,7 @@ class ContentContext {
       texture_cache_;
 
   std::shared_ptr<CommandBuffer> subpass_command_buffer_;
+  mutable std::optional<PixelFormat> subpass_pixel_format_;
 
   ContentContext(const ContentContext&) = delete;
 

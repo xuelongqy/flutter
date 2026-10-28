@@ -8,6 +8,7 @@
 #include <cstdint>
 
 #include "impeller/entity/contents/content_context.h"
+#include "impeller/entity/entity.h"
 #include "impeller/entity/entity_pass_target.h"
 #include "impeller/renderer/context.h"
 #include "impeller/renderer/render_pass.h"
@@ -28,6 +29,10 @@ class InlinePassContext {
   std::shared_ptr<Texture> GetTexture();
 
   bool HasDeferredTexture() const;
+
+  const std::optional<Entity>& GetDeferredColorMatrix() const;
+
+  void DeferColorMatrix(Entity entity);
 
   Point GetDeferredTexturePosition() const;
 
@@ -57,6 +62,8 @@ class InlinePassContext {
   std::shared_ptr<Texture> deferred_texture_;
   Point deferred_texture_position_;
   uint32_t deferred_clip_depth_ = 0;
+
+  std::optional<Entity> deferred_color_matrix_;
 
   InlinePassContext(const InlinePassContext&) = delete;
 

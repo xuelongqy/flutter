@@ -59,6 +59,12 @@ class TextureContents final : public Contents {
 
   void SetTexture(std::shared_ptr<Texture> texture);
 
+  void SetSnapshotTextureCoverage(std::optional<Rect> coverage);
+
+#if defined(FML_OS_ANDROID)
+  void SetCanvasInkBounds(std::optional<Rect> bounds);
+#endif
+
   std::shared_ptr<Texture> GetTexture() const;
 
   void SetSamplerDescriptor(const SamplerDescriptor& desc);
@@ -137,6 +143,10 @@ class TextureContents final : public Contents {
   std::shared_ptr<Texture> texture_;
   SamplerDescriptor sampler_descriptor_ = {};
   Rect source_rect_;
+  std::optional<Rect> snapshot_texture_coverage_;
+#if defined(FML_OS_ANDROID)
+  std::optional<Rect> canvas_ink_bounds_;
+#endif
   bool strict_source_rect_enabled_ = false;
   Scalar opacity_ = 1.0f;
   Scalar inherited_opacity_ = 1.0f;

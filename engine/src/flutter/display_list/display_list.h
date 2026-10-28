@@ -302,6 +302,7 @@ class DisplayList : public SkRefCnt {
 
   bool can_apply_group_opacity() const { return can_apply_group_opacity_; }
   bool isUIThreadSafe() const { return is_ui_thread_safe_; }
+  bool uses_unorm8_layers() const { return use_unorm8_layers_; }
 
   /// @brief     Indicates if there are any rendering operations in this
   ///            DisplayList that will modify a surface of transparent black
@@ -514,7 +515,8 @@ class DisplayList : public SkRefCnt {
               DlBlendMode max_root_blend_mode,
               bool root_has_backdrop_filter,
               bool root_is_unbounded,
-              sk_sp<const DlRTree> rtree);
+              sk_sp<const DlRTree> rtree,
+              bool use_unorm8_layers);
 
   static uint32_t next_unique_id();
 
@@ -538,6 +540,7 @@ class DisplayList : public SkRefCnt {
   const bool modifies_transparent_black_;
   const bool root_has_backdrop_filter_;
   const bool root_is_unbounded_;
+  const bool use_unorm8_layers_;
   const DlBlendMode max_root_blend_mode_;
 
   const sk_sp<const DlRTree> rtree_;

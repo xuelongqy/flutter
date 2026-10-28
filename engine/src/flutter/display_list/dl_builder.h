@@ -251,7 +251,8 @@ class DisplayListBuilder final : public virtual DlCanvas,
   // |DlCanvas|
   void Flush() override {}
 
-  sk_sp<DisplayList> Build();
+  // Pixel surfaces may require lossless unorm8 storage for nested layers.
+  sk_sp<DisplayList> Build(bool use_unorm8_layers = false);
 
  private:
   void Init(bool prepare_rtree);

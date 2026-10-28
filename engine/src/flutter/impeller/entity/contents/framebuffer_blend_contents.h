@@ -40,7 +40,8 @@ class FramebufferBlendContents final : public ColorSourceContents {
 
   void SetBlendMode(BlendMode blend_mode);
 
-  void SetChildContents(std::shared_ptr<Contents> child_contents);
+  void SetChildContents(std::shared_ptr<Contents> child_contents,
+                        const Geometry* sparse_stroke_geometry = nullptr);
 
  private:
   // |Contents|
@@ -53,6 +54,8 @@ class FramebufferBlendContents final : public ColorSourceContents {
 
   BlendMode blend_mode_;
   std::shared_ptr<Contents> child_contents_;
+  // Same immediate draw lifetime as the child contents' geometry.
+  const Geometry* sparse_stroke_geometry_ = nullptr;
 
   FramebufferBlendContents(const FramebufferBlendContents&) = delete;
 

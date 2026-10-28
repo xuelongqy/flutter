@@ -110,9 +110,13 @@ impeller_shaders("framebuffer_blend_entity_shaders") {
   }
 
   shaders = [
+    "shaders/blending/canvas_color_matrix_screen.frag",
     "shaders/blending/framebuffer_blend.vert",
     "shaders/blending/framebuffer_blend.frag",
   ]
+  if (is_android && impeller_enable_opengles) {
+    shaders += [ "shaders/blending/canvas_framebuffer_screen.frag" ]
+  }
 }
 
 impeller_component("entity") {

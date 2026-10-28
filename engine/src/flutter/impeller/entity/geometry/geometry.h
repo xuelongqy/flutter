@@ -103,6 +103,13 @@ class Geometry {
   ///        `transform` argument.
   virtual std::optional<Rect> GetCoverage(const Matrix& transform) const = 0;
 
+#if defined(FML_OS_ANDROID)
+  // Optional ink bounds for limiting work without changing snapshot coverage.
+  virtual std::optional<Rect> GetTightCoverage(const Matrix& transform) const {
+    return std::nullopt;
+  }
+#endif
+
   /// @brief Compute an alpha value to simulate lower coverage of fractional
   ///        pixel strokes.
   static Scalar ComputeStrokeAlphaCoverage(const Matrix& entity,

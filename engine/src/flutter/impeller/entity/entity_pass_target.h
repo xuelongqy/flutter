@@ -18,6 +18,10 @@ class EntityPassTarget {
                             bool supports_read_from_resolve,
                             bool supports_implicit_msaa);
 
+  EntityPassTarget(const ContentContext& renderer,
+                   ISize size,
+                   Color clear_color);
+
   /// @brief  Flips the backdrop and returns a readable texture that can be
   ///         bound/sampled to restore the previous pass.
   ///
@@ -29,6 +33,16 @@ class EntityPassTarget {
 
   RenderTarget& GetRenderTarget();
 
+  ISize GetRenderTargetSize() const;
+
+  PixelFormat GetColorFormat() const;
+
+  bool IsColorLossless() const;
+
+  Color GetClearColor() const;
+
+  void SetClearColor(Color color);
+
   /// @brief Remove the cached secondary color texture.
   void RemoveSecondary();
 
@@ -37,6 +51,14 @@ class EntityPassTarget {
  private:
   RenderTarget target_;
   std::shared_ptr<Texture> secondary_color_texture_;
+
+  struct PendingTarget {
+    const ContentContext* renderer;
+    ISize size;
+    std::optional<PixelFormat> format;
+    Color clear_color;
+  };
+  std::optional<PendingTarget> pending_target_;
 
   bool supports_read_from_resolve_;
   bool supports_implicit_msaa_;
