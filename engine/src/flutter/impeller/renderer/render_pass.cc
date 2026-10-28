@@ -116,6 +116,19 @@ void RenderPass::SetScissor(IRect32 scissor) {
   pending_.scissor = scissor;
 }
 
+std::optional<IRect32> RenderPass::GetScissor() const {
+  if (pending_.scissor.has_value()) {
+    return pending_.scissor;
+  }
+  for (auto command = commands_.rbegin(); command != commands_.rend();
+       ++command) {
+    if (command->scissor.has_value()) {
+      return command->scissor;
+    }
+  }
+  return std::nullopt;
+}
+
 void RenderPass::SetElementCount(size_t count) {
   pending_.element_count = count;
 }

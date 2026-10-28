@@ -341,7 +341,15 @@ bool RuntimeController::NotifyIdle(fml::TimeDelta deadline) {
     return false;
   }
 
+#if defined(FLAX_ENGINE_EMBEDDED) && defined(FML_OS_ANDROID)
+  // A short inter-frame gap cannot fit synchronous tracing of the shared JS
+  // heap.
+  if (!flax_engine_defer_idle_gc_current_isolate()) {
+    Dart_NotifyIdle(deadline.ToMicroseconds());
+  }
+#else
   Dart_NotifyIdle(deadline.ToMicroseconds());
+#endif
 #if defined(FLAX_ENGINE_EMBEDDED)
   flax_engine_notify_idle_current_isolate();
 #endif

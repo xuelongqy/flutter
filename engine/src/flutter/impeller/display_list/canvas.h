@@ -111,9 +111,19 @@ class LazyRenderingConfig {
 
   InlinePassContext* GetInlinePassContext() const;
 
+#if defined(FML_OS_ANDROID)
+  void SetCanvasInkBounds(Rect bounds, size_t previous_command_count);
+
+  std::optional<Rect> GetCanvasInkBounds() const;
+#endif
+
  private:
   std::unique_ptr<EntityPassTarget> entity_pass_target_;
   std::unique_ptr<InlinePassContext> inline_pass_context_;
+#if defined(FML_OS_ANDROID)
+  std::optional<Rect> canvas_ink_bounds_;
+  size_t canvas_ink_command_count_ = 0;
+#endif
 };
 
 class Canvas {
@@ -397,7 +407,10 @@ class Canvas {
       bool reuse_depth = false,
       const std::optional<Matrix>& shape_transform = std::nullopt);
 
-  void AddRenderEntityToCurrentPass(Entity& entity, bool reuse_depth = false);
+  void AddRenderEntityToCurrentPass(
+      Entity& entity,
+      bool reuse_depth = false,
+      const Geometry* sparse_stroke_geometry = nullptr);
 
   /// Returns true if this operation is consistent with a DrawShadow-like
   /// operation.

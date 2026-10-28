@@ -115,6 +115,26 @@ void JointHeap::NotifyIdleCurrent() {
     heap->ScheduleIdle(false);
 }
 
+extern "C" int32_t flax_engine_defer_idle_gc_current_isolate() {
+  std::lock_guard<std::mutex> lock(heaps_mutex);
+  const auto found = heaps.find(Dart_CurrentIsolate());
+  if (found == heaps.end())
+    return false;
+  const auto heap = found->second.lock();
+  if (!heap || !heap->cell_count())
+    return false;
+  const auto* configuration =
+      flutter::UIDartState::Current()->platform_configuration();
+  const bool recent_frame =
+      configuration &&
+      fml::TimePoint::Now() - configuration->GetLastFrameTime() <
+          fml::TimeDelta::FromMilliseconds(100);
+  if (recent_frame) {
+    TRACE_EVENT0("flutter", "FlaxDeferDartIdleGC");
+  }
+  return recent_frame;
+}
+
 void JointHeap::Shutdown() {
   if (closed_.exchange(true))
     return;

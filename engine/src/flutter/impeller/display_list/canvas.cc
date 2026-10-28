@@ -19,6 +19,7 @@
 #include "display_list/effects/image_filters/dl_compose_image_filter.h"
 #include "display_list/image/dl_image.h"
 #include "flutter/display_list/effects/image_filters/dl_blur_image_filter.h"
+#include "flutter/fml/build_config.h"
 #include "flutter/fml/logging.h"
 #include "flutter/fml/trace_event.h"
 #include "flutter/impeller/geometry/round_superellipse_param.h"
@@ -35,6 +36,7 @@
 #include "impeller/entity/contents/color_source_contents.h"
 #include "impeller/entity/contents/complex_rse_contents.h"
 #include "impeller/entity/contents/content_context.h"
+#include "impeller/entity/contents/filters/color_matrix_filter_contents.h"
 #include "impeller/entity/contents/filters/filter_contents.h"
 #include "impeller/entity/contents/filters/gaussian_blur_filter_contents.h"
 #include "impeller/entity/contents/framebuffer_blend_contents.h"
@@ -132,13 +134,52 @@ static bool CanBatchFilterSubpasses(const flutter::DlImageFilter& filter) {
   }
 }
 
-static void ApplyFramebufferBlend(Entity& entity) {
+static void ApplyFramebufferBlend(Entity& entity,
+                                  const Geometry* sparse_stroke_geometry) {
   auto src_contents = entity.GetContents();
   auto contents = std::make_shared<FramebufferBlendContents>();
-  contents->SetChildContents(src_contents);
+  contents->SetChildContents(src_contents, sparse_stroke_geometry);
   contents->SetBlendMode(entity.GetBlendMode());
   entity.SetContents(std::move(contents));
   entity.SetBlendMode(BlendMode::kSrc);
+}
+
+static bool IsPlainScreenLayer(const Paint& paint) {
+  return paint.blend_mode == BlendMode::kScreen && paint.color.alpha == 1 &&
+         !paint.image_filter && !paint.color_filter && !paint.invert_colors &&
+         !paint.mask_blur_descriptor;
+}
+
+#if defined(FML_OS_MACOSX)
+static bool IsBlurColorMatrixFilter(const flutter::DlImageFilter* filter) {
+  const auto* compose = filter ? filter->asCompose() : nullptr;
+  if (!compose || !compose->inner() || !compose->outer() ||
+      !compose->inner()->asBlur()) {
+    return false;
+  }
+  const auto* color = compose->outer()->asColorFilter();
+  return color && color->color_filter() && color->color_filter()->asMatrix();
+}
+#endif
+
+static bool HasUnscaledDecalBlurInput(const flutter::DlImageFilter* filter,
+                                      const Matrix& transform) {
+  if (!transform.IsTranslationOnly()) {
+    return false;
+  }
+  while (filter && filter->asCompose()) {
+    filter = filter->asCompose()->inner().get();
+  }
+  const auto* blur = filter ? filter->asBlur() : nullptr;
+  if (!blur || blur->tile_mode() != flutter::DlTileMode::kDecal) {
+    return false;
+  }
+  const auto x = GaussianBlurFilterContents::ScaleSigma(blur->sigma_x());
+  const auto y = GaussianBlurFilterContents::ScaleSigma(blur->sigma_y());
+  // Resampling another grid can change rounding before the blur quantizes.
+  return x >= kEhCloseEnough && y >= kEhCloseEnough &&
+         GaussianBlurFilterContents::CalculateScale(x) == 1 &&
+         GaussianBlurFilterContents::CalculateScale(y) == 1;
 }
 
 /// @brief Create the subpass restore contents, appling any filters or opacity
@@ -148,12 +189,18 @@ static std::shared_ptr<Contents> CreateContentsForSubpassTarget(
     const Paint& paint,
     const std::shared_ptr<Texture>& target,
     const Matrix& effect_transform,
-    Point texture_position) {
+    Point texture_position,
+    std::optional<Rect> texture_coverage,
+    [[maybe_unused]] std::optional<Rect> canvas_ink_bounds) {
   auto contents = TextureContents::MakeRect(
       Rect::MakeOriginSize(texture_position, Size(target->GetSize())));
   contents->SetTexture(target);
   contents->SetLabel("Subpass");
   contents->SetSourceRect(Rect::MakeSize(target->GetSize()));
+  contents->SetSnapshotTextureCoverage(texture_coverage);
+#if defined(FML_OS_ANDROID)
+  contents->SetCanvasInkBounds(canvas_ink_bounds);
+#endif
   contents->SetOpacity(paint.color.alpha);
   contents->SetDeferApplyingOpacity(true);
 
@@ -161,60 +208,16 @@ static std::shared_ptr<Contents> CreateContentsForSubpassTarget(
                                            effect_transform);
 }
 
-static const constexpr RenderTarget::AttachmentConfig kDefaultStencilConfig =
-    RenderTarget::AttachmentConfig{
-        .storage_mode = StorageMode::kDeviceTransient,
-        .load_action = LoadAction::kDontCare,
-        .store_action = StoreAction::kDontCare,
-    };
-
 static std::unique_ptr<EntityPassTarget> CreateRenderTarget(
     ContentContext& renderer,
     ISize size,
-    const Color& clear_color) {
-  const std::shared_ptr<Context>& context = renderer.GetContext();
-
-  /// All of the load/store actions are managed by `InlinePassContext` when
-  /// `RenderPasses` are created, so we just set them to `kDontCare` here.
-  /// What's important is the `StorageMode` of the textures, which cannot be
-  /// changed for the lifetime of the textures.
-
-  RenderTarget target;
-  if (context->GetCapabilities()->SupportsOffscreenMSAA()) {
-    target = renderer.GetRenderTargetCache()->CreateOffscreenMSAA(
-        /*context=*/*context,
-        /*size=*/size,
-        /*mip_count=*/1,
-        /*label=*/"EntityPass",
-        /*color_attachment_config=*/
-        RenderTarget::AttachmentConfigMSAA{
-            .storage_mode = StorageMode::kDeviceTransient,
-            .resolve_storage_mode = StorageMode::kDevicePrivate,
-            .load_action = LoadAction::kDontCare,
-            .store_action = StoreAction::kMultisampleResolve,
-            .clear_color = clear_color},
-        /*stencil_attachment_config=*/kDefaultStencilConfig);
-  } else {
-    target = renderer.GetRenderTargetCache()->CreateOffscreen(
-        *context,  // context
-        size,      // size
-        /*mip_count=*/1,
-        "EntityPass",  // label
-        RenderTarget::AttachmentConfig{
-            .storage_mode = StorageMode::kDevicePrivate,
-            .load_action = LoadAction::kDontCare,
-            .store_action = StoreAction::kDontCare,
-            .clear_color = clear_color,
-        },                     // color_attachment_config
-        kDefaultStencilConfig  //
-    );
+    const Color& clear_color,
+    bool defer_allocation = false) {
+  auto target = std::make_unique<EntityPassTarget>(renderer, size, clear_color);
+  if (!defer_allocation) {
+    target->GetRenderTarget();
   }
-
-  return std::make_unique<EntityPassTarget>(
-      target,                                                           //
-      renderer.GetDeviceCapabilities().SupportsReadFromResolve(),       //
-      renderer.GetDeviceCapabilities().SupportsImplicitResolvingMSAA()  //
-  );
+  return target;
 }
 
 /// @brief  Expands the rectangle to satisfy a 1-device-pixel minimum size using
@@ -1639,7 +1642,11 @@ void Canvas::SetupRenderPass() {
         renderer_.GetContext()->GetCapabilities()->SupportsOffscreenMSAA() &&
             color0.texture->GetTextureDescriptor().sample_count >
                 SampleCount::kCount1,
-        "ImpellerOnscreen", kDefaultStencilConfig);
+        "ImpellerOnscreen",
+        RenderTarget::AttachmentConfig{
+            .storage_mode = StorageMode::kDeviceTransient,
+            .load_action = LoadAction::kDontCare,
+            .store_action = StoreAction::kDontCare});
   }
 
   // Set up the clear color of the root pass.
@@ -1710,9 +1717,8 @@ std::optional<Rect> Canvas::GetLocalCoverageLimit() const {
 
   FML_CHECK(!render_passes_.empty());
   const LazyRenderingConfig& back_render_pass = render_passes_.back();
-  const auto back_size = back_render_pass.GetEntityPassTarget()
-                             ->GetRenderTarget()
-                             .GetRenderTargetSize();
+  const auto back_size =
+      back_render_pass.GetEntityPassTarget()->GetRenderTargetSize();
   FML_CHECK(!back_size.IsEmpty())
       << "Context is valid:"
       << back_render_pass.GetInlinePassContext()->IsValid();
@@ -1921,12 +1927,15 @@ void Canvas::SaveLayer(const Paint& paint,
   paint_copy.color.alpha *= transform_stack_.back().distributed_opacity;
   transform_stack_.back().distributed_opacity = 1.0;
 
-  render_passes_.push_back(
-      LazyRenderingConfig(renderer_,                                    //
-                          CreateRenderTarget(renderer_,                 //
-                                             subpass_size,              //
-                                             Color::BlackTransparent()  //
-                                             )));
+  render_passes_.push_back(LazyRenderingConfig(
+      renderer_,  //
+      CreateRenderTarget(
+          renderer_,     //
+          subpass_size,  //
+          Color::BlackTransparent(),
+          renderer_.GetSubpassPixelFormat() == PixelFormat::kR8G8B8A8UNormInt &&
+              renderer_.GetContext()->GetBackendType() ==
+                  Context::BackendType::kMetal)));
   save_layer_state_.push_back(SaveLayerState{
       paint_copy, subpass_coverage.Shift(-coverage_origin_adjustment)});
 
@@ -1996,8 +2005,10 @@ bool Canvas::Restore() {
     auto lazy_render_pass = std::move(render_passes_.back());
     render_passes_.pop_back();
     // Force the render pass to be constructed if it never was.
-    if (!lazy_render_pass.GetInlinePassContext()->HasDeferredTexture() &&
-        !lazy_render_pass.GetInlinePassContext()->GetRenderPass()) {
+    auto* source_context = lazy_render_pass.GetInlinePassContext();
+    if (!source_context->HasDeferredTexture() &&
+        !source_context->GetDeferredColorMatrix() &&
+        !source_context->GetRenderPass()) {
       return false;
     }
 
@@ -2026,11 +2037,38 @@ bool Canvas::Restore() {
 
     const auto& layer_paint = save_layer_state.paint;
     auto* parent_context = render_passes_.back().GetInlinePassContext();
-    const auto source_texture =
-        lazy_render_pass.GetInlinePassContext()->GetTexture();
+    if (source_context->GetDeferredColorMatrix() &&
+        IsPlainScreenLayer(layer_paint)) {
+      const auto& pending = source_context->GetDeferredColorMatrix().value();
+      auto matrix =
+          std::static_pointer_cast<ColorMatrixContents>(pending.GetContents());
+      Entity screen = pending.Clone();
+      screen.SetTransform(
+          Matrix::MakeTranslation(Vector3(subpass_texture_position)));
+      screen.SetClipDepth(++current_depth_);
+      const bool was_active = parent_context->IsActive();
+      auto pass = parent_context->GetRenderPass();
+      if (!pass)
+        return false;
+      if (!was_active) {
+        SetClipScissor(clip_coverage_stack_.ParentClipCoverage(), *pass,
+                       global_pass_position);
+      }
+      const bool rendered = matrix->RenderCanvasScreen(
+          renderer_, screen, *pass,
+          source_context->GetPassTarget().GetRenderTargetSize());
+      clip_coverage_stack_.PopSubpass();
+      transform_stack_.pop_back();
+      return rendered;
+    }
+    std::optional<Rect> canvas_ink_bounds;
+#if defined(FML_OS_ANDROID) && defined(IMPELLER_ENABLE_OPENGLES)
+    canvas_ink_bounds = lazy_render_pass.GetCanvasInkBounds();
+#endif
+    const auto source_texture = source_context->GetTexture();
+    if (!source_texture)
+      return false;
     const auto& source_descriptor = source_texture->GetTextureDescriptor();
-    const auto& parent_descriptor =
-        parent_context->GetTexture()->GetTextureDescriptor();
     const auto source_format = source_descriptor.format;
     const auto parent_clip = clip_coverage_stack_.ParentClipCoverage();
     const auto source_bounds = Rect::MakeOriginSize(
@@ -2038,13 +2076,23 @@ bool Canvas::Restore() {
     // Keep the input sample grid and lossless unorm quantization unchanged.
     const bool same_extent =
         subpass_texture_position == Point(0, 0) &&
-        source_texture->GetSize() == parent_context->GetTexture()->GetSize();
+        source_texture->GetSize() ==
+            parent_context->GetPassTarget().GetRenderTargetSize();
+    // Canvas blur can sample this resolved bitmap with transparent padding.
+    // Keep the original input viewport and integer sample origin below.
+    const bool direct_filter_input =
+        renderer_.GetSubpassPixelFormat() == PixelFormat::kR8G8B8A8UNormInt &&
+        renderer_.GetContext()->GetBackendType() ==
+            Context::BackendType::kMetal &&
+        !save_layer_state_.empty() &&
+        HasUnscaledDecalBlurInput(save_layer_state_.back().paint.image_filter,
+                                  transform_stack_.back().transform);
     // GLES stores uncompressed texels; Metal attachments can use lossy storage.
     const bool lossless_copy =
         renderer_.GetContext()->GetBackendType() ==
             Context::BackendType::kOpenGLES ||
         (source_descriptor.compression_type == CompressionType::kLossless &&
-         parent_descriptor.compression_type == CompressionType::kLossless);
+         parent_context->GetPassTarget().IsColorLossless());
     const bool defer_layer_copy =
         render_passes_.size() > 1 &&
         (renderer_.GetContext()->GetBackendType() ==
@@ -2053,29 +2101,27 @@ bool Canvas::Restore() {
              Context::BackendType::kOpenGLES) &&
         !parent_context->IsActive() && parent_context->GetPassCount() == 0 &&
         !parent_context->HasDeferredTexture() &&
-        parent_context->GetPassTarget()
-                .GetRenderTarget()
-                .GetColorAttachment(0)
-                .clear_color == Color::BlackTransparent() &&
+        !parent_context->GetDeferredColorMatrix() &&
+        parent_context->GetPassTarget().GetClearColor() ==
+            Color::BlackTransparent() &&
         !layer_paint.image_filter && !layer_paint.color_filter &&
         !layer_paint.invert_colors && !layer_paint.mask_blur_descriptor &&
         layer_paint.color.alpha == 1 &&
         (layer_paint.blend_mode == BlendMode::kSrc ||
          layer_paint.blend_mode == BlendMode::kSrcOver) &&
-        same_extent && lossless_copy &&
-        Rect::MakeSize(parent_context->GetTexture()->GetSize())
+        (same_extent || direct_filter_input) && lossless_copy &&
+        Rect::MakeSize(parent_context->GetPassTarget().GetRenderTargetSize())
             .Contains(source_bounds) &&
         source_texture->GetMipCount() == 1 &&
         (source_format == PixelFormat::kR8G8B8A8UNormInt ||
          source_format == PixelFormat::kB8G8R8A8UNormInt) &&
-        source_format ==
-            parent_context->GetTexture()->GetTextureDescriptor().format &&
+        source_format == parent_context->GetPassTarget().GetColorFormat() &&
         parent_clip.has_value() &&
         parent_clip->Shift(-global_pass_position).Contains(source_bounds);
     if (defer_layer_copy) {
       // Finish the source resolve before reuse, including implicit GLES MSAA.
       // The unused parent needs no second pass for an identical pixel copy.
-      if (!lazy_render_pass.GetInlinePassContext()->EndPass()) {
+      if (!source_context->EndPass()) {
         return false;
       }
       parent_context->DeferTexture(source_texture, subpass_texture_position,
@@ -2084,12 +2130,21 @@ bool Canvas::Restore() {
       transform_stack_.pop_back();
       return true;
     }
+    std::optional<Rect> texture_coverage;
+    const auto texture_position = source_context->GetDeferredTexturePosition();
+    if (source_context->HasDeferredTexture() && layer_paint.image_filter) {
+      const auto viewport = Rect::MakeOriginSize(
+          -texture_position,
+          Size(source_context->GetPassTarget().GetRenderTargetSize()));
+      if (viewport != Rect::MakeSize(source_texture->GetSize())) {
+        texture_coverage = viewport;
+      }
+    }
     std::shared_ptr<Contents> contents = CreateContentsForSubpassTarget(
-        renderer_, save_layer_state.paint,                         //
-        lazy_render_pass.GetInlinePassContext()->GetTexture(),     //
-        Matrix::MakeTranslation(Vector3{-global_pass_position}) *  //
-            transform_stack_.back().transform,                     //
-        lazy_render_pass.GetInlinePassContext()->GetDeferredTexturePosition());
+        renderer_, save_layer_state.paint, source_texture,
+        Matrix::MakeTranslation(Vector3{-global_pass_position}) *
+            transform_stack_.back().transform,
+        texture_position, texture_coverage, canvas_ink_bounds);
 
     // Keep the resolve/quantization boundary. Simple copies can continue in
     // an unused parent; filters must first prepare their dependent passes.
@@ -2138,14 +2193,52 @@ bool Canvas::Restore() {
           element_entity.GetContents());
       // Match Entity::Render without opening the destination encoder yet.
       if (!filter_contents->GetCoverageHint().has_value()) {
-        filter_contents->SetCoverageHint(
-            Rect::MakeSize(parent_context->GetPassTarget()
-                               .GetRenderTarget()
-                               .GetRenderTargetSize()));
+        filter_contents->SetCoverageHint(Rect::MakeSize(
+            parent_context->GetPassTarget().GetRenderTargetSize()));
       }
       auto filtered_entity = filter_contents->GetEntity(
           renderer_, element_entity, filter_contents->GetCoverageHint());
       renderer_.SetSubpassCommandBuffer(nullptr);
+#if defined(FML_OS_MACOSX)
+      // Desktop and iOS Metal retain their own attachment quantization.
+      const bool defer_canvas_color =
+          filtered_entity.has_value() &&
+          renderer_.GetSubpassPixelFormat() == PixelFormat::kR8G8B8A8UNormInt &&
+          renderer_.GetDeviceCapabilities().SupportsFramebufferFetch() &&
+          IsBlurColorMatrixFilter(layer_paint.image_filter) &&
+          !save_layer_state_.empty() &&
+          IsPlainScreenLayer(save_layer_state_.back().paint) &&
+          !parent_context->HasDeferredTexture() &&
+          !parent_context->GetDeferredColorMatrix() &&
+          parent_context->GetPassTarget().GetClearColor().IsTransparent() &&
+          parent_context->GetPassTarget().GetColorFormat() ==
+              PixelFormat::kR8G8B8A8UNormInt;
+#else
+      const bool defer_canvas_color = false;
+#endif
+      if (defer_canvas_color) {
+        auto matrix = std::static_pointer_cast<ColorMatrixContents>(
+            filtered_entity->GetContents());
+        const auto size = parent_context->GetPassTarget().GetRenderTargetSize();
+        const auto clip = clip_coverage_stack_.ParentClipCoverage();
+        // Match SetClipScissor without moving the viewport or pixel grid.
+        if (matrix->CanRenderCanvasScreen(filtered_entity.value(), size) &&
+            clip &&
+            IRect32::RoundOut(clip->Shift(-global_pass_position))
+                .Contains(IRect32::MakeSize(size))) {
+          // Preserve this unused layer's viewport and pixel grid. A later draw
+          // materializes the original matrix pass; screen can quantize inline.
+          filtered_entity->SetClipDepth(element_entity.GetClipDepth());
+          if (!renderer_.EnqueueSubpassCommandBuffer(
+                  std::move(filter_command_buffer))) {
+            return false;
+          }
+          parent_context->DeferColorMatrix(std::move(filtered_entity.value()));
+          clip_coverage_stack_.PopSubpass();
+          transform_stack_.pop_back();
+          return true;
+        }
+      }
       parent_context->ContinueWithCommandBuffer(
           std::move(filter_command_buffer));
       should_render = filtered_entity.has_value();
@@ -2157,7 +2250,8 @@ bool Canvas::Restore() {
 
     if (element_entity.GetBlendMode() > Entity::kLastPipelineBlendMode) {
       if (renderer_.GetDeviceCapabilities().SupportsFramebufferFetch()) {
-        ApplyFramebufferBlend(element_entity);
+        ApplyFramebufferBlend(element_entity,
+                              /*sparse_stroke_geometry=*/nullptr);
       } else {
         // End the active pass and flush the buffer before rendering "advanced"
         // blends. Advanced blends work by binding the current render target
@@ -2193,7 +2287,24 @@ bool Canvas::Restore() {
                      global_pass_position);
     }
     if (should_render) {
-      element_entity.Render(renderer_, parent_pass);
+      [[maybe_unused]] const size_t previous_commands =
+          parent_pass.GetCommands().size();
+      [[maybe_unused]] const bool rendered =
+          element_entity.Render(renderer_, parent_pass);
+#if defined(FML_OS_ANDROID) && defined(IMPELLER_ENABLE_OPENGLES)
+      if (rendered && canvas_ink_bounds &&
+          renderer_.GetContext()->GetBackendType() ==
+              Context::BackendType::kOpenGLES &&
+          !layer_paint.image_filter && !layer_paint.color_filter &&
+          !layer_paint.invert_colors && !layer_paint.mask_blur_descriptor &&
+          layer_paint.color.alpha == 1 &&
+          (layer_paint.blend_mode == BlendMode::kSrc ||
+           layer_paint.blend_mode == BlendMode::kSrcOver)) {
+        render_passes_.back().SetCanvasInkBounds(
+            canvas_ink_bounds->Shift(subpass_texture_position).Expand(2),
+            previous_commands);
+      }
+#endif
     }
     clip_coverage_stack_.PopSubpass();
     transform_stack_.pop_back();
@@ -2381,7 +2492,22 @@ void Canvas::AddRenderEntityWithFiltersToCurrentPass(
   if (!paint.color_filter && !paint.invert_colors && !paint.image_filter &&
       !paint.mask_blur_descriptor.has_value()) {
     entity.SetContents(std::move(contents));
-    AddRenderEntityToCurrentPass(entity, reuse_depth);
+    // Stroke ink can also bound the input of a later Canvas blur.
+#if defined(FML_OS_ANDROID) && defined(IMPELLER_ENABLE_OPENGLES)
+    const Geometry* sparse_stroke_geometry =
+        (entity.GetBlendMode() == BlendMode::kScreen ||
+         entity.GetBlendMode() == BlendMode::kSrcOver) &&
+                renderer_.GetSubpassPixelFormat() ==
+                    PixelFormat::kR8G8B8A8UNormInt &&
+                geometry &&
+                geometry->GetResultMode() ==
+                    GeometryResult::Mode::kPreventOverdraw
+            ? geometry
+            : nullptr;
+#else
+    constexpr const Geometry* sparse_stroke_geometry = nullptr;
+#endif
+    AddRenderEntityToCurrentPass(entity, reuse_depth, sparse_stroke_geometry);
     return;
   }
 
@@ -2452,7 +2578,10 @@ void Canvas::AddRenderEntityWithFiltersToCurrentPass(
   AddRenderEntityToCurrentPass(entity, reuse_depth);
 }
 
-void Canvas::AddRenderEntityToCurrentPass(Entity& entity, bool reuse_depth) {
+void Canvas::AddRenderEntityToCurrentPass(
+    Entity& entity,
+    bool reuse_depth,
+    const Geometry* sparse_stroke_geometry) {
   if (IsSkipping()) {
     return;
   }
@@ -2472,20 +2601,16 @@ void Canvas::AddRenderEntityToCurrentPass(Entity& entity, bool reuse_depth) {
   if (render_passes_.back().IsApplyingClearColor() &&
       !clip_coverage_stack_.HasSubpassClip()) {
     std::optional<Color> maybe_color = entity.AsBackgroundColor(
-        render_passes_.back().GetInlinePassContext()->GetTexture()->GetSize());
+        render_passes_.back().GetEntityPassTarget()->GetRenderTargetSize());
     if (maybe_color.has_value()) {
       Color color = maybe_color.value();
-      RenderTarget& render_target = render_passes_.back()
-                                        .GetInlinePassContext()
-                                        ->GetPassTarget()
-                                        .GetRenderTarget();
-      ColorAttachment attachment = render_target.GetColorAttachment(0);
+      auto& target = *render_passes_.back().GetEntityPassTarget();
       // Attachment.clear color needs to be premultiplied at all times, but the
       // Color::Blend function requires unpremultiplied colors.
-      attachment.clear_color = attachment.clear_color.Unpremultiply()
-                                   .Blend(color, entity.GetBlendMode())
-                                   .Premultiply();
-      render_target.SetColorAttachment(attachment, 0u);
+      target.SetClearColor(target.GetClearColor()
+                               .Unpremultiply()
+                               .Blend(color, entity.GetBlendMode())
+                               .Premultiply());
       return;
     }
   }
@@ -2502,7 +2627,7 @@ void Canvas::AddRenderEntityToCurrentPass(Entity& entity, bool reuse_depth) {
 
   if (entity.GetBlendMode() > Entity::kLastPipelineBlendMode) {
     if (renderer_.GetDeviceCapabilities().SupportsFramebufferFetch()) {
-      ApplyFramebufferBlend(entity);
+      ApplyFramebufferBlend(entity, sparse_stroke_geometry);
     } else {
       // End the active pass and flush the buffer before rendering "advanced"
       // blends. Advanced blends work by binding the current render target
@@ -2553,7 +2678,25 @@ void Canvas::AddRenderEntityToCurrentPass(Entity& entity, bool reuse_depth) {
                    GetGlobalPassPosition());
   }
 
-  entity.Render(renderer_, *result);
+  [[maybe_unused]] const size_t previous_commands =
+      result->GetCommands().size();
+#if defined(FML_OS_ANDROID) && defined(IMPELLER_ENABLE_OPENGLES)
+  std::optional<Rect> canvas_ink_bounds;
+  if (sparse_stroke_geometry && previous_commands == 0 &&
+      renderer_.GetContext()->GetBackendType() ==
+          Context::BackendType::kOpenGLES &&
+      entity.GetTransform().IsTranslationOnly()) {
+    canvas_ink_bounds =
+        sparse_stroke_geometry->GetTightCoverage(entity.GetTransform());
+  }
+#endif
+  [[maybe_unused]] const bool rendered = entity.Render(renderer_, *result);
+#if defined(FML_OS_ANDROID) && defined(IMPELLER_ENABLE_OPENGLES)
+  if (rendered && canvas_ink_bounds) {
+    render_passes_.back().SetCanvasInkBounds(canvas_ink_bounds->Expand(2),
+                                             previous_commands);
+  }
+#endif
 }
 
 RenderPass& Canvas::GetCurrentRenderPass() const {
@@ -2848,7 +2991,8 @@ LazyRenderingConfig::LazyRenderingConfig(
 
 bool LazyRenderingConfig::IsApplyingClearColor() const {
   return !inline_pass_context_->IsActive() &&
-         !inline_pass_context_->HasDeferredTexture();
+         !inline_pass_context_->HasDeferredTexture() &&
+         !inline_pass_context_->GetDeferredColorMatrix();
 }
 
 EntityPassTarget* LazyRenderingConfig::GetEntityPassTarget() const {
@@ -2858,5 +3002,37 @@ EntityPassTarget* LazyRenderingConfig::GetEntityPassTarget() const {
 InlinePassContext* LazyRenderingConfig::GetInlinePassContext() const {
   return inline_pass_context_.get();
 }
+
+#if defined(FML_OS_ANDROID)
+void LazyRenderingConfig::SetCanvasInkBounds(Rect bounds,
+                                             size_t previous_command_count) {
+  if (previous_command_count != 0 || !bounds.IsFinite() ||
+      !inline_pass_context_->IsActive() ||
+      inline_pass_context_->GetPassCount() != 1) {
+    return;
+  }
+  const auto& pass = inline_pass_context_->GetRenderPass();
+  const auto& color = pass->GetRenderTarget().GetColorAttachment(0);
+  if (color.load_action != LoadAction::kClear ||
+      color.clear_color != Color::BlackTransparent() ||
+      pass->GetCommands().empty()) {
+    return;
+  }
+  canvas_ink_bounds_ = bounds;
+  canvas_ink_command_count_ = pass->GetCommands().size();
+}
+
+std::optional<Rect> LazyRenderingConfig::GetCanvasInkBounds() const {
+  if (!canvas_ink_bounds_ || !inline_pass_context_->IsActive() ||
+      inline_pass_context_->GetPassCount() != 1) {
+    return std::nullopt;
+  }
+  // Any later draw or restarted pass invalidates this single-draw proof.
+  return inline_pass_context_->GetRenderPass()->GetCommands().size() ==
+                 canvas_ink_command_count_
+             ? canvas_ink_bounds_
+             : std::nullopt;
+}
+#endif
 
 }  // namespace impeller

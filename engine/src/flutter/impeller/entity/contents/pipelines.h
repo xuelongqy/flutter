@@ -9,6 +9,7 @@
 #include "impeller/entity/advanced_blend.frag.h"
 #include "impeller/entity/advanced_blend.vert.h"
 #include "impeller/entity/border_mask_blur.frag.h"
+#include "impeller/entity/canvas_color_matrix_screen.frag.h"
 #include "impeller/entity/circle.frag.h"
 #include "impeller/entity/circle.vert.h"
 #include "impeller/entity/clip.frag.h"
@@ -71,6 +72,9 @@
 #include "impeller/renderer/pipeline.h"
 
 #ifdef IMPELLER_ENABLE_OPENGLES
+#if defined(FML_OS_ANDROID)
+#include "impeller/entity/canvas_framebuffer_screen.frag.h"
+#endif
 #include "impeller/entity/texture_downsample_gles.frag.h"
 #include "impeller/entity/tiled_texture_fill_external.frag.h"
 #endif  // IMPELLER_ENABLE_OPENGLES
@@ -89,6 +93,12 @@ using AdvancedBlendPipelineHandle =
 using FramebufferBlendPipelineHandle =
     RenderPipelineHandle<FramebufferBlendVertexShader,
                          FramebufferBlendFragmentShader>;
+
+#if defined(FML_OS_ANDROID) && defined(IMPELLER_ENABLE_OPENGLES)
+using CanvasFramebufferScreenPipeline =
+    RenderPipelineHandle<FramebufferBlendVertexShader,
+                         CanvasFramebufferScreenFragmentShader>;
+#endif
 
 // clang-format off
 using BlendColorBurnPipeline = AdvancedBlendPipelineHandle;
@@ -110,6 +120,7 @@ using BorderMaskBlurPipeline = RenderPipelineHandle<FilterPositionUvVertexShader
 using CirclePipeline = RenderPipelineHandle<CircleVertexShader, CircleFragmentShader>;
 using ClipPipeline = RenderPipelineHandle<ClipVertexShader, ClipFragmentShader>;
 using ColorMatrixColorFilterPipeline = RenderPipelineHandle<FilterPositionUvVertexShader, ColorMatrixColorFilterFragmentShader>;
+using CanvasColorMatrixScreenPipeline = RenderPipelineHandle<FilterPositionUvVertexShader, CanvasColorMatrixScreenFragmentShader>;
 using ConicalGradientFillConicalPipeline = GradientPipelineHandle<ConicalGradientFillConicalFragmentShader>;
 using ConicalGradientFillRadialPipeline = GradientPipelineHandle<ConicalGradientFillRadialFragmentShader>;
 using ConicalGradientFillStripPipeline = GradientPipelineHandle<ConicalGradientFillStripFragmentShader>;

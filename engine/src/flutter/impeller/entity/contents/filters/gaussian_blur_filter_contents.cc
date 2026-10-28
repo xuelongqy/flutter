@@ -7,6 +7,7 @@
 #include <cmath>
 
 #include "flutter/fml/make_copyable.h"
+#include "fml/trace_event.h"
 #include "impeller/entity/contents/clip_contents.h"
 #include "impeller/entity/contents/content_context.h"
 #include "impeller/entity/entity.h"
@@ -178,6 +179,14 @@ Quad CalculateSnapshotUVs(
       blur_uvs[3] = uvs->GetRightBottom();
     }
   }
+  if (input_snapshot.texture_coverage) {
+    auto coverage = *input_snapshot.texture_coverage;
+    Matrix remap =
+        Matrix::MakeScale(1.0f / Vector2(input_snapshot.texture->GetSize())) *
+        Matrix::MakeTranslation(coverage.GetOrigin()) *
+        Matrix::MakeScale(coverage.GetSize());
+    blur_uvs = remap.Transform(blur_uvs);
+  }
   return blur_uvs;
 }
 
@@ -307,7 +316,13 @@ DownsamplePassArgs CalculateDownsamplePassArgs(
   //     .Contains(coverage_hint.value()))
 
   std::optional<Rect> snapshot_coverage = input_snapshot.GetCoverage();
-  if (input_snapshot.transform.Equals(snapshot_entity.GetTransform()) &&
+  auto input_origin = input_snapshot.transform;
+  if (input_snapshot.texture_coverage) {
+    input_origin =
+        input_origin *
+        Matrix::MakeTranslation(input_snapshot.texture_coverage->GetOrigin());
+  }
+  if (input_origin.Equals(snapshot_entity.GetTransform()) &&
       source_expanded_coverage_hint.has_value() &&
       snapshot_coverage.has_value() &&
       snapshot_coverage->Contains(source_expanded_coverage_hint.value())) {
@@ -356,7 +371,8 @@ DownsamplePassArgs CalculateDownsamplePassArgs(
   } else {
     //////////////////////////////////////////////////////////////////////////////
     auto input_snapshot_size = input_snapshot.texture->GetSize();
-    Rect source_rect = Rect::MakeSize(input_snapshot_size);
+    Rect source_rect = input_snapshot.texture_coverage.value_or(
+        Rect::MakeSize(input_snapshot_size));
     Rect source_rect_padded = source_rect.Expand(padding);
     Vector2 downsampled_size = source_rect_padded.GetSize() * downsample_scalar;
     ISize subpass_size =
@@ -395,7 +411,8 @@ DownsamplePassArgs CalculateDownsamplePassArgs(
         .uv_bounds = uv_bounds,
         .effective_scalar = effective_scalar,
         .transform = input_snapshot.transform *
-                     Matrix::MakeTranslation(-divisible_padding),
+                     Matrix::MakeTranslation(source_rect.GetOrigin() -
+                                             divisible_padding),
     };
   }
 }
@@ -557,7 +574,8 @@ fml::StatusOr<RenderTarget> MakeBlurSubpass(
     const BlurParameters& blur_info,
     std::optional<RenderTarget> destination_target,
     const Quad& blur_uvs,
-    const DownsamplePassArgs* source_mapping = nullptr) {
+    const DownsamplePassArgs* source_mapping = nullptr,
+    std::optional<IRect32> canvas_scissor = std::nullopt) {
   using VS = GaussianBlurVertexShader;
 
   if (blur_info.blur_sigma < kEhCloseEnough) {
@@ -581,6 +599,9 @@ fml::StatusOr<RenderTarget> MakeBlurSubpass(
         ContentContextOptions options = OptionsFromPass(pass);
         options.primitive_type = PrimitiveType::kTriangleStrip;
         pass.SetPipeline(renderer.GetGaussianBlurPipeline(options));
+        if (canvas_scissor) {
+          pass.SetScissor(*canvas_scissor);
+        }
 
         KernelSamples kernel_info = GenerateBlurInfo(blur_info);
         LerpHackResult lerped_kernel = LerpHackKernelSamples(kernel_info);
@@ -885,10 +906,11 @@ std::optional<Entity> GaussianBlurFilterContents::RenderFilter(
       source_expanded_coverage_hint, source_bounds, inputs[0], snapshot_entity);
 
   const auto input_size = input_snapshot->texture->GetSize();
-  const Quad padded_uvs = Rect::MakeSize(input_size)
-                              .Expand(blur_info.padding)
-                              .Scale(1.0f / Vector2(input_size))
-                              .GetPoints();
+  const Quad padded_uvs =
+      input_snapshot->texture_coverage.value_or(Rect::MakeSize(input_size))
+          .Expand(blur_info.padding)
+          .Scale(1.0f / Vector2(input_size))
+          .GetPoints();
   // An integer-aligned unorm copy only adds transparent padding. Decal sampling
   // can supply that padding in the vertical pass without changing quantization.
   const auto input_format =
@@ -904,7 +926,9 @@ std::optional<Entity> GaussianBlurFilterContents::RenderFilter(
       (input_format == PixelFormat::kR8G8B8A8UNormInt ||
        input_format == PixelFormat::kB8G8R8A8UNormInt ||
        input_format == PixelFormat::kB10G10R10A10XR) &&
-      input_format == renderer.GetDeviceCapabilities().GetDefaultColorFormat();
+      input_format ==
+          renderer.GetSubpassPixelFormat().value_or(
+              renderer.GetDeviceCapabilities().GetDefaultColorFormat());
   fml::StatusOr<RenderTarget> pass1_out = [&]() -> fml::StatusOr<RenderTarget> {
     if (skip_copy) {
       RenderTarget input_target;
@@ -927,6 +951,54 @@ std::optional<Entity> GaussianBlurFilterContents::RenderFilter(
 
   Quad blur_uvs = {Point(0, 0), Point(1, 0), Point(0, 1), Point(1, 1)};
 
+  std::optional<IRect32> canvas_y_scissor;
+  std::optional<IRect32> canvas_x_scissor;
+#if defined(FML_OS_ANDROID) && defined(IMPELLER_ENABLE_OPENGLES)
+  if (input_snapshot->canvas_ink_bounds && !skip_copy && !bounds_ &&
+      !input_snapshot->texture_coverage &&
+      input_snapshot->transform.IsTranslationOnly() &&
+      renderer.GetContext()->GetBackendType() ==
+          Context::BackendType::kOpenGLES &&
+      input_format == PixelFormat::kR8G8B8A8UNormInt &&
+      renderer.GetSubpassPixelFormat() == PixelFormat::kR8G8B8A8UNormInt &&
+      tile_mode_ == Entity::TileMode::kDecal &&
+      downsample_pass_args.effective_scalar == Vector2(1, 1) &&
+      downsample_pass_args.uvs == padded_uvs &&
+      blur_info.scaled_sigma.x >= kEhCloseEnough &&
+      blur_info.scaled_sigma.y >= kEhCloseEnough) {
+    // Keep every copy/store and its UV grid; clear the full target before
+    // scissoring ink.
+    const auto copied_ink =
+        input_snapshot->canvas_ink_bounds
+            ->Shift(Point(blur_info.padding.x, blur_info.padding.y))
+            .Expand(2);
+    const auto y_ink =
+        copied_ink.Expand(Point(2, std::ceil(blur_info.blur_radius.y) + 2));
+    const auto x_ink =
+        y_ink.Expand(Point(std::ceil(blur_info.blur_radius.x) + 2, 2));
+    const auto size = pass1_out.value().GetRenderTargetSize();
+    const int64_t full_area = static_cast<int64_t>(size.width) * size.height;
+    const auto clip_ink = [&](const Rect& ink) -> std::optional<IRect32> {
+      const auto clipped = IRect32::RoundOut(ink)
+                               .Intersection(IRect32::MakeSize(size))
+                               .value_or(IRect32());
+      const int64_t area =
+          static_cast<int64_t>(clipped.GetWidth()) * clipped.GetHeight();
+      // Small cuts can cost more GLES driver work than they save.
+      return area * 2 < full_area ? std::optional<IRect32>(clipped)
+                                  : std::nullopt;
+    };
+    canvas_y_scissor = clip_ink(y_ink);
+    canvas_x_scissor = clip_ink(x_ink);
+    if (canvas_y_scissor) {
+      TRACE_EVENT0("impeller", "CanvasGLES::SparseBlurY");
+    }
+    if (canvas_x_scissor) {
+      TRACE_EVENT0("impeller", "CanvasGLES::SparseBlurX");
+    }
+  }
+#endif
+
   std::shared_ptr<CommandBuffer> command_buffer_2 =
       combine_command_buffers ? command_buffer_1
                               : renderer.CreateSubpassCommandBuffer();
@@ -947,7 +1019,7 @@ std::optional<Entity> GaussianBlurFilterContents::RenderFilter(
           .apply_unpremultiply = false,
       },
       /*destination_target=*/std::nullopt, blur_uvs,
-      skip_copy ? &downsample_pass_args : nullptr);
+      skip_copy ? &downsample_pass_args : nullptr, canvas_y_scissor);
 
   if (!pass2_out.ok()) {
     return std::nullopt;
@@ -981,7 +1053,7 @@ std::optional<Entity> GaussianBlurFilterContents::RenderFilter(
           .step_size = 1,
           .apply_unpremultiply = bounds_.has_value(),
       },
-      pass3_destination, blur_uvs);
+      pass3_destination, blur_uvs, nullptr, canvas_x_scissor);
 
   if (!pass3_out.ok()) {
     return std::nullopt;

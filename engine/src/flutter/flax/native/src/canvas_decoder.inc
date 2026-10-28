@@ -1675,7 +1675,7 @@ bool decode(Host& host,
     black.setColor(DlColor::kBlack()).setBlendMode(DlBlendMode::kDstOver);
     b.DrawRect(DlRect::MakeLTRB(0, 0, width, height), black);
   }
-  const auto picture = b.Build();
+  const auto picture = b.Build(/*use_unorm8_layers=*/true);
   if (!picture->isUIThreadSafe())
     throw std::runtime_error("Canvas contains an unsafe image");
   target.DrawDisplayList(picture);

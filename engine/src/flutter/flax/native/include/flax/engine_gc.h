@@ -25,6 +25,7 @@ const FlaxEngineGcApi* flax_engine_get_gc_api(uint32_t version);
 /* Called by the embedder before tearing down the Dart UI isolate. */
 void flax_engine_shutdown_current_isolate(void);
 void flax_engine_notify_idle_current_isolate(void);
+int32_t flax_engine_defer_idle_gc_current_isolate(void);
 #ifdef __cplusplus
 }
 #endif

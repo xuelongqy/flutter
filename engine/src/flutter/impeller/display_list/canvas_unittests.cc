@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 #include <unordered_map>
+#include "flutter/display_list/dl_builder.h"
 #include "flutter/display_list/dl_tile_mode.h"
 #include "flutter/display_list/effects/dl_image_filter.h"
 #include "flutter/display_list/geometry/dl_geometry_types.h"
@@ -12,9 +13,13 @@
 #include "impeller/core/texture_descriptor.h"
 #include "impeller/display_list/aiks_unittests.h"
 #include "impeller/display_list/canvas.h"
+#include "impeller/display_list/dl_dispatcher.h"
 #include "impeller/display_list/dl_image_impeller.h"
 #include "impeller/display_list/dl_runtime_effect_impeller.h"
 #include "impeller/display_list/dl_vertices_geometry.h"
+#include "impeller/entity/contents/filters/color_matrix_filter_contents.h"
+#include "impeller/entity/contents/texture_contents.h"
+#include "impeller/entity/render_target_cache.h"
 #include "impeller/geometry/geometry_asserts.h"
 #include "impeller/playground/playground.h"
 #include "impeller/playground/widgets.h"
@@ -67,6 +72,157 @@ std::unique_ptr<Canvas> CreateTestCanvas(
   }
   return std::make_unique<Canvas>(context, render_target, /*is_onscreen=*/false,
                                   /*requires_readback=*/requires_readback);
+}
+
+TEST_P(AiksTest, DisplayListLayerFormatScope) {
+  ContentContext& context = GetContentContext();
+  auto canvas = CreateTestCanvas(context);
+  class FormatDispatcher final : public DlDispatcherBase {
+   public:
+    FormatDispatcher(Canvas& canvas, const ContentContext& context)
+        : canvas_(canvas), context_(context) {}
+    Canvas& GetCanvas() override { return canvas_; }
+    const ContentContext& GetContentContext() const override {
+      return context_;
+    }
+    void save() override { FML_UNREACHABLE(); }
+    using DlDispatcherBase::save;
+    void saveLayer(const DlRect&,
+                   const flutter::SaveLayerOptions,
+                   const flutter::DlImageFilter*,
+                   std::optional<int64_t>) override {
+      FML_UNREACHABLE();
+    }
+    using DlDispatcherBase::saveLayer;
+    void drawRect(const DlRect&) override {
+      formats.push_back(context_.GetSubpassPixelFormat());
+    }
+    std::vector<std::optional<PixelFormat>> formats;
+
+   private:
+    Canvas& canvas_;
+    const ContentContext& context_;
+  } dispatcher(*canvas, context);
+
+  flutter::DisplayListBuilder builder;
+  builder.DrawRect(DlRect::MakeXYWH(0, 0, 10, 10), flutter::DlPaint());
+  const auto ordinary = builder.Build();
+  builder.DrawDisplayList(ordinary);
+  const auto unorm8 = builder.Build(/*use_unorm8_layers=*/true);
+  for (const auto previous :
+       {std::optional<PixelFormat>(),
+        std::optional<PixelFormat>(PixelFormat::kR16G16B16A16Float)}) {
+    context.SetSubpassPixelFormat(previous);
+    dispatcher.drawDisplayList(unorm8, 1);
+    EXPECT_EQ(context.GetSubpassPixelFormat(), previous);
+    dispatcher.drawDisplayList(ordinary, 1);
+    EXPECT_EQ(context.GetSubpassPixelFormat(), previous);
+    EXPECT_EQ(
+        dispatcher.formats[dispatcher.formats.size() - 2],
+        context.GetContext()->GetBackendType() == Context::BackendType::kVulkan
+            ? previous
+            : std::optional<PixelFormat>(PixelFormat::kR8G8B8A8UNormInt));
+    EXPECT_EQ(dispatcher.formats.back(), previous);
+  }
+  context.SetSubpassPixelFormat(std::nullopt);
+}
+
+TEST_P(AiksTest, BitmapFilterInputPreservesViewport) {
+  ContentContext& context = GetContentContext();
+  TextureDescriptor descriptor;
+  descriptor.size = ISize(17, 11);
+  descriptor.format = PixelFormat::kR8G8B8A8UNormInt;
+  auto texture =
+      context.GetContext()->GetResourceAllocator()->CreateTexture(descriptor);
+  ASSERT_TRUE(texture);
+  auto contents = TextureContents::MakeRect(Rect::MakeXYWH(1, 2, 17, 11));
+  contents->SetTexture(texture);
+  contents->SetSourceRect(Rect::MakeSize(texture->GetSize()));
+  contents->SetSnapshotTextureCoverage(Rect::MakeXYWH(-1, -2, 20, 14));
+  Entity entity;
+  entity.SetTransform(Matrix::MakeTranslation(Vector2(9, 7)));
+  const auto snapshot = contents->RenderToSnapshot(context, entity, {});
+  ASSERT_TRUE(snapshot);
+  EXPECT_EQ(snapshot->texture, texture);
+  EXPECT_EQ(snapshot->transform, Matrix::MakeTranslation(Vector2(10, 9)));
+  EXPECT_EQ(snapshot->GetCoverage(), Rect::MakeXYWH(9, 7, 20, 14));
+  EXPECT_EQ(contents->GetCoverage(entity), snapshot->GetCoverage());
+  const auto uvs = *snapshot->GetCoverageUVs(Rect::MakeXYWH(10, 9, 17, 11));
+  EXPECT_NEAR(uvs[0].x, 0, 1e-6);
+  EXPECT_NEAR(uvs[0].y, 0, 1e-6);
+  EXPECT_NEAR(uvs[3].x, 1, 1e-6);
+  EXPECT_NEAR(uvs[3].y, 1, 1e-6);
+}
+
+TEST_P(AiksTest, UnusedCanvasTargetDoesNotAllocate) {
+  auto cache =
+      std::make_shared<RenderTargetCache>(GetContext()->GetResourceAllocator());
+  ContentContext context(GetContext(), nullptr, cache);
+  context.SetSubpassPixelFormat(PixelFormat::kR8G8B8A8UNormInt);
+  EntityPassTarget target(context, ISize(19, 13), Color::BlackTransparent());
+  InlinePassContext pass(context, target);
+  EXPECT_TRUE(pass.IsValid());
+  EXPECT_EQ(target.GetRenderTargetSize(), ISize(19, 13));
+  EXPECT_EQ(target.GetColorFormat(), PixelFormat::kR8G8B8A8UNormInt);
+  target.SetClearColor(Color::Red());
+  EXPECT_EQ(target.GetClearColor(), Color::Red());
+  EXPECT_EQ(cache->CachedTextureCount(), 0u);
+  context.SetSubpassPixelFormat(std::nullopt);
+  ASSERT_TRUE(pass.GetRenderPass());
+  EXPECT_EQ(cache->CachedTextureCount(), 1u);
+  EXPECT_EQ(pass.GetTexture()->GetSize(), ISize(19, 13));
+  EXPECT_EQ(pass.GetTexture()->GetTextureDescriptor().format,
+            PixelFormat::kR8G8B8A8UNormInt);
+  EXPECT_EQ(target.GetClearColor(), Color::Red());
+  ASSERT_TRUE(pass.EndPass());
+}
+
+TEST_P(AiksTest, CanvasColorMatrixScreenKeepsPixelGridAndFallback) {
+  auto cache =
+      std::make_shared<RenderTargetCache>(GetContext()->GetResourceAllocator());
+  ContentContext context(GetContext(), nullptr, cache);
+  context.SetSubpassPixelFormat(PixelFormat::kR8G8B8A8UNormInt);
+  TextureDescriptor descriptor;
+  descriptor.size = ISize(17, 11);
+  descriptor.format = PixelFormat::kR8G8B8A8UNormInt;
+  auto texture =
+      GetContext()->GetResourceAllocator()->CreateTexture(descriptor);
+  ASSERT_TRUE(texture);
+  ColorMatrix matrix = {
+      {1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0}};
+  Snapshot input = {.texture = texture,
+                    .transform = Matrix::MakeTranslation(Vector3(-2, -3, 0))};
+  auto contents = std::make_shared<ColorMatrixContents>(
+      input, matrix, 1, Rect::MakeSize(ISize(11, 7)));
+  Entity entity;
+  entity.SetContents(contents);
+  EXPECT_TRUE(contents->CanRenderCanvasScreen(entity, ISize(11, 7)));
+  EXPECT_TRUE(contents->CanRenderCanvasScreen(entity, ISize(16, 9)));
+  EXPECT_FALSE(contents->CanRenderCanvasScreen(entity, ISize()));
+  input.transform = Matrix::MakeTranslation(Vector3(3, 3, 0));
+  ColorMatrixContents padded(input, matrix, 1, Rect::MakeSize(ISize(23, 17)));
+  EXPECT_TRUE(padded.CanRenderCanvasScreen(entity, ISize(23, 17)));
+  entity.SetTransform(Matrix::MakeTranslation(Vector3(0.5, 0, 0)));
+  EXPECT_FALSE(contents->CanRenderCanvasScreen(entity, ISize(11, 7)));
+  entity.SetTransform(Matrix());
+  input.transform = Matrix::MakeTranslation(Vector3(-2.5, -3, 0));
+  ColorMatrixContents fractional(input, matrix, 1,
+                                 Rect::MakeSize(ISize(11, 7)));
+  EXPECT_FALSE(fractional.CanRenderCanvasScreen(entity, ISize(11, 7)));
+  input.transform = Matrix::MakeTranslation(Vector3(-2, -3, 0));
+  matrix.array[4] = 0.1;
+  ColorMatrixContents biased(input, matrix, 1, Rect::MakeSize(ISize(11, 7)));
+  EXPECT_FALSE(biased.CanRenderCanvasScreen(entity, ISize(11, 7)));
+  EntityPassTarget target(context, ISize(11, 7), Color::BlackTransparent());
+  InlinePassContext pass(context, target);
+  pass.DeferColorMatrix(entity.Clone());
+  EXPECT_TRUE(pass.GetDeferredColorMatrix().has_value());
+  EXPECT_EQ(cache->CachedTextureCount(), 0u);
+  ASSERT_TRUE(pass.GetRenderPass());
+  EXPECT_FALSE(pass.GetDeferredColorMatrix().has_value());
+  EXPECT_EQ(pass.GetTexture()->GetSize(), ISize(11, 7));
+  EXPECT_EQ(cache->CachedTextureCount(), 1u);
+  ASSERT_TRUE(pass.EndPass());
 }
 
 TEST_P(AiksTest, TransformMultipliesCorrectly) {

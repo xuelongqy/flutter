@@ -38,6 +38,9 @@ std::shared_ptr<Texture> InlinePassContext::GetTexture() {
   if (!IsValid()) {
     return nullptr;
   }
+  if (deferred_color_matrix_ && !GetRenderPass()) {
+    return nullptr;
+  }
   return deferred_texture_
              ? deferred_texture_
              : pass_target_.GetRenderTarget().GetRenderTargetTexture();
@@ -45,6 +48,16 @@ std::shared_ptr<Texture> InlinePassContext::GetTexture() {
 
 bool InlinePassContext::HasDeferredTexture() const {
   return deferred_texture_ != nullptr;
+}
+
+const std::optional<Entity>& InlinePassContext::GetDeferredColorMatrix() const {
+  return deferred_color_matrix_;
+}
+
+void InlinePassContext::DeferColorMatrix(Entity entity) {
+  FML_DCHECK(!IsActive() && !command_buffer_ && pass_count_ == 0 &&
+             !deferred_texture_ && !deferred_color_matrix_);
+  deferred_color_matrix_ = std::move(entity);
 }
 
 Point InlinePassContext::GetDeferredTexturePosition() const {
@@ -55,7 +68,7 @@ void InlinePassContext::DeferTexture(std::shared_ptr<Texture> texture,
                                      Point position,
                                      uint32_t clip_depth) {
   FML_DCHECK(!IsActive() && !command_buffer_ && pass_count_ == 0 &&
-             !deferred_texture_);
+             !deferred_texture_ && !deferred_color_matrix_);
   FML_DCHECK(texture);
   deferred_texture_ = std::move(texture);
   deferred_texture_position_ = position;
@@ -124,6 +137,11 @@ const std::shared_ptr<RenderPass>& InlinePassContext::GetRenderPass() {
   /// time this method is called, but it'll also run if the pass has been
   /// previously ended via `EndPass`.
 
+  if (!pass_target_.GetRenderTarget().IsValid()) {
+    VALIDATION_LOG << "Could not allocate render pass target.";
+    return pass_;
+  }
+
   if (!command_buffer_) {
     command_buffer_ = renderer_.GetContext()->CreateCommandBuffer();
   }
@@ -190,6 +208,15 @@ const std::shared_ptr<RenderPass>& InlinePassContext::GetRenderPass() {
   pass_->SetLabel("EntityPass Render Pass");
 
   ++pass_count_;
+  if (deferred_color_matrix_) {
+    // A later draw still needs the original RGBA8 matrix output and resolve.
+    auto entity = std::move(deferred_color_matrix_.value());
+    deferred_color_matrix_.reset();
+    if (!entity.Render(renderer_, *pass_)) {
+      VALIDATION_LOG << "Could not materialize deferred Canvas color matrix.";
+      pass_ = nullptr;
+    }
+  }
   if (deferred_texture_) {
     // Materialize the resolved copy only when another draw needs this target.
     auto bounds = Rect::MakeSize(deferred_texture_->GetSize());
