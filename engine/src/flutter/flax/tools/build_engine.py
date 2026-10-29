@@ -122,13 +122,15 @@ def main() -> None:
         shutil.copy2(Path(sdk) / "manifest.json", notices / "sdk-manifest.json")
     if args.mode == "release":
       for framework in frameworks:
-        binary = (framework / "Versions/A/FlutterMacOS" if platform == "mac" else
-                  framework / "Flutter")
+        binary = (
+            framework / "Versions/A/FlutterMacOS" if platform == "mac" else framework / "Flutter"
+        )
         # Keep global exports; full symbols remain in SDK inputs, link outputs and dSYMs.
         for library in [*binary.parent.glob("Libraries/*.dylib"), binary]:
           subprocess.run(["xcrun", "strip", "-S", "-x", str(library)], check=True)
           subprocess.run(["codesign", "--force", "--sign", "-", "--timestamp=none",
-                          str(library)], check=True)
+                          str(library)],
+                         check=True)
   host = output.name if platform == "mac" else f"flax_mac_{args.mode}_arm64"
   print(f"Local engine: --local-engine={output.name} --local-engine-host={host}")
 
