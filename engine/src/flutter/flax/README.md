@@ -1,7 +1,7 @@
 # Flax Engine Integration
 
-Experimental macOS, Android and iOS arm64 integration based on Flutter 3.47.6
-and Dart 3.13.5. macOS targets 15 or later; Android targets API 24 or later. The iOS
+Experimental macOS, Android and iOS arm64 integration based on Flutter 3.47.9
+and Dart 3.13.7. macOS targets 15 or later; Android targets API 24 or later. The iOS
 producer targets 16.3 or later and supports simulator debug and device release/AOT.
 The exact Flutter, Dart, bridge, V8 SDK revisions are in `source.lock.json`.
 The maintained branch is `flax/main`; version branches use `flax/<version>`.
