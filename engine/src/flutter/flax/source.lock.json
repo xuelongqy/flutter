@@ -1,7 +1,7 @@
 {
-  "flutter": "3.47.6",
-  "flutterRevision": "5fc346839b5d0eef006ed8404392afb4dfae428d",
-  "dartRevision": "04bcd1036cdc799ac6564988f159ee454d42c822",
+  "flutter": "3.47.9",
+  "flutterRevision": "c197ca5199e9ee5661e865596c9c07294dfab51c",
+  "dartRevision": "416e33b0ffaef062a60ec966bb8c82ed2b83f128",
   "flaxBridgeRevision": "10d4d8c07cefceaaceb1eef56d319f303133a038",
   "sdkVersion": "0.3.0",
   "v8Version": "15.4.80.15",
