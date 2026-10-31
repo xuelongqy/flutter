@@ -82,6 +82,9 @@ if (flax_enable_runtime) {
     ]
     deps = []
     defines = [ "FLAX_BUILDING_BRIDGE" ]
+    if (is_mac) {
+      defines += [ "FLAX_ENABLE_METAL_INTEROP" ]
+    }
     if (is_mac || is_ios) {
       defines += [ "FLAX_ENABLE_FFI" ]
       include_dirs += [

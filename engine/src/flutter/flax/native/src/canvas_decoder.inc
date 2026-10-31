@@ -2227,3 +2227,81 @@ flax_canvas_dispatch(uint64_t token,
     return Dart_NewStringFromCString(error.what());
   }
 }
+
+#include "third_party/skia/include/encode/SkPngEncoder.h"
+
+// Shared codecs and ImageBitmap storage do not require a Canvas 2D host.
+extern "C" __attribute__((visibility("default"))) uint32_t
+flax_image_version() {
+  return 1;
+}
+extern "C" __attribute__((visibility("default"))) Dart_Handle
+flax_image_dispatch(uint32_t operation,
+                    Dart_Handle a,
+                    Dart_Handle b,
+                    Dart_Handle c) {
+  using namespace flax::canvas;
+  try {
+    if (operation == 0 && integer(field(b, 2)) != 0)
+      return flax_canvas_dispatch(0, 14, a, b, c);
+    if (operation == 1)
+      return flax_canvas_dispatch(0, 16, a, b, c);
+    if (operation == 2)
+      return flax_canvas_dispatch(0, 17, a, b, c);
+    if (operation == 0) {
+      const auto width = integer(field(b, 0)), height = integer(field(b, 1));
+      const auto info = bitmap_info(width, height, false);
+      std::vector<uint8_t> encoded;
+      {
+        Bytes bytes(a);
+        if (bytes.size != intptr_t(width * height * 4))
+          throw std::runtime_error("Invalid PNG pixels");
+        SkDynamicMemoryWStream stream;
+        if (!SkPngEncoder::Encode(&stream,
+                                  SkPixmap(info, bytes.data, width * 4), {}))
+          throw std::runtime_error("PNG encoding failed");
+        auto data = stream.detachAsData();
+        encoded.assign(data->bytes(), data->bytes() + data->size());
+      }
+      return bytes_result(encoded);
+    }
+    if (!UIDartState::Current())
+      throw std::runtime_error("Image storage requires the Flutter UI isolate");
+    if (operation == 4) {
+      auto* picture = static_cast<Picture*>(wrapped(a, "Picture"));
+      auto display_list = picture->display_list();
+      if (!display_list)
+        throw std::runtime_error("Canvas picture is disposed");
+      const int width = integer(field(b, 0)), height = integer(field(b, 1));
+      int64_t sx, sy;
+      if (Dart_IsError(Dart_IntegerToInt64(field(b, 2), &sx)) ||
+          Dart_IsError(Dart_IntegerToInt64(field(b, 3), &sy)) || sx < INT_MIN ||
+          sx > INT_MAX || sy < INT_MIN || sy > INT_MAX)
+        throw std::runtime_error("Invalid canvas pixel origin");
+      const auto sw = integer(field(b, 4)), sh = integer(field(b, 5));
+      if (width <= 0 || height <= 0 || sw == 0 || sh == 0 || sw > INT_MAX / 4 ||
+          sh > INT_MAX || sw * sh > INT_MAX / 4)
+        throw std::runtime_error("Invalid canvas pixel dimensions");
+      const auto data =
+          read_pixels(std::move(display_list), width, height, sx, sy, sw, sh);
+      return bytes_result(data);
+    }
+    if (operation != 3)
+      throw std::runtime_error("Unknown shared image operation");
+    const auto width = integer(field(b, 0)), height = integer(field(b, 1));
+    if (width == 0 || height == 0 || width > INT_MAX / 4 || height > INT_MAX ||
+        width * height > INT_MAX / 4)
+      throw std::runtime_error("Invalid shared image dimensions");
+    sk_sp<DlImage> decoded;
+    {
+      Bytes bytes(a);
+      Reader reader{bytes.data, static_cast<size_t>(bytes.size)};
+      decoded = pixels(reader, width, height, false);
+    }
+    auto image = CanvasImage::Create();
+    image->set_image(std::move(decoded));
+    return image->CreateOuterWrapping();
+  } catch (const std::exception& error) {
+    return Dart_NewStringFromCString(error.what());
+  }
+}

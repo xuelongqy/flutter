@@ -30,3 +30,24 @@ The runtime implementation is copied from Flax revision recorded in
 `../../source.lock.json`; JSI and V8 adapter licenses remain in their source
 directories. Applications load these operations from the maintained Flutter framework,
 without building or packaging another bridge library.
+
+Dedicated Workers use `engine_workers.h` and `v8-jsi/src/jsi_abi/workers.inc`.
+Their V8 Isolates have no joint Dart heap; explicit handles and host callbacks belong
+to the creating background Dart isolate. V8 Lockers allow that isolate to migrate
+between scheduler threads. Foreground tasks wake its native port and microtasks run
+at host checkpoints. Dart-owned shared-buffer leases and object peers are rejected.
+Native channel interruption precedes runtime disposal and never calls Dart from a
+foreign thread. Ordinary runtime creation retains its Flutter UI isolate check.
+
+Ordinary V8 external-memory collection requests coalesce their Dart follow-ups for
+8 ms on the owner runner. This avoids a full Dart pass for every transferred buffer.
+V8 accounting/collection, ordinary JS allocation pressure, forced/last-resort
+collections and direct Dart requests keep their existing paths. An actual Dart trace
+cancels pending external work, and the delayed task holds only a weak heap reference.
+The fixed point and explicit disposal are unchanged; peak memory can increase and
+individual full-collection pauses remain.
+
+Detached Worker Promise rejection callbacks queue native Promise/reason references and
+release them when the owning host checkpoint drains the records. JS event handlers run
+after the microtask checkpoint. Error locations use captured exception frames rather
+than a new Message at the reporting helper.

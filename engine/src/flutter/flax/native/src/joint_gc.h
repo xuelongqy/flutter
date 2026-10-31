@@ -82,12 +82,14 @@ class JointHeap : public std::enable_shared_from_this<JointHeap> {
   std::weak_ptr<tonic::DartState> dart_state_;
   fml::RefPtr<fml::TaskRunner> runner_;
   v8::Global<v8::Private> peers_key_;
+  v8::Global<v8::FunctionTemplate> peer_template_;
   std::unordered_map<JointCell*, std::unique_ptr<JointCell>> cells_;
   std::unordered_map<Dart_WeakPersistentHandle, JointCell*> origins_;
   const Dart_FlaxGC* joint_ = nullptr;
   bool force_js_collection_ = false;
   std::atomic<bool> queued_{false}, collect_requested_{false}, closed_{false};
   bool idle_pending_ = false, dirty_ = false;
+  bool external_gc_pending_ = false;
   bool preparing_ = false;
 };
 }  // namespace flax

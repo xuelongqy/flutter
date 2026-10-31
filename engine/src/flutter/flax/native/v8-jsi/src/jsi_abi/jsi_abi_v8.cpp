@@ -28,6 +28,7 @@ thread_local bool flaxFfiDetachedRuntime = false;
 /// This file is designed to work without C++ exceptions.
 
 #include <dart_native_api.h>
+#include <array>
 #include <atomic>
 #include "../MurmurHash.h"
 #include "../v8_core.h"
@@ -38,6 +39,9 @@ thread_local bool flaxFfiDetachedRuntime = false;
 #include "jsi_abi/v8_jsi_config.h"
 #include "jsi_abi/v8_snapshot_container.h"
 #include "v8-profiler.h"
+namespace {
+void workerWasmStreaming(const v8::FunctionCallbackInfo<v8::Value>& args);
+}
 static std::atomic<unsigned> flaxJitEvents{0};
 unsigned flaxV8JitEventCount() {
   return flaxJitEvents.load();
@@ -48,10 +52,12 @@ unsigned flaxV8JitEventCount() {
 #endif
 
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <list>
 #include <map>
 #include <memory>
@@ -61,6 +67,7 @@ unsigned flaxV8JitEventCount() {
 #include <string>
 #include <tuple>
 #include <vector>
+#include "jsi_abi/JsiAbiRuntime.h"
 
 namespace abi = jsi::abi;
 
@@ -153,6 +160,10 @@ struct jsi_config_s {
     }
   }
 };
+
+namespace jsi::abi {
+jsi_value cloneAbiValue(facebook::jsi::Runtime&, const facebook::jsi::Value&);
+}
 
 namespace {
 extern const jsi_runtime_vtable g_vtable;
@@ -542,6 +553,13 @@ struct JsiRuntimeState : public jsi_runtime {
   // The PromiseRejectCallback finds the runtime via context embedder slot 0.
   bool ignore_unhandled_promises{false};
   std::unique_ptr<v8rt::UnhandledPromiseRejection> last_unhandled_promise;
+  struct WorkerRejection {
+    v8::Global<v8::Promise> promise;
+    v8::Global<v8::Value> reason;
+    bool handled;
+  };
+  bool worker_rejection_tracking = false;
+  std::vector<WorkerRejection> worker_rejections;
 
   // optional attached-owner hook. v8_attach_node_api stores the
   // V8RuntimeEnv pointer and a destroy callback here so the Node-API surface
@@ -633,10 +651,16 @@ class TryCatch : public v8::TryCatch {
       : v8::TryCatch(state->isolate), state_(state) {}
 
   ~TryCatch() {
-    if (HasCaught()) {
+    if (HasTerminated()) {
+      state_->setNativeError("Worker execution terminated");
+    } else if (HasCaught()) {
       v8::Local<v8::Value> exception = Exception();
       state_->pendingJSError = createJsiValue(state_->isolate, exception);
     }
+  }
+
+  jsi_error_code error() const {
+    return HasTerminated() ? jsi_error_native : jsi_error_js;
   }
 
   TryCatch(const TryCatch&) = delete;
@@ -976,6 +1000,7 @@ JsiRuntimeState* JsiRuntimeState::create(const jsi_config_s* config) {
   // deleting it with unique_ptr would double-finalize it during heap teardown.
   auto* microtasks =
       v8::MicrotaskQueue::New(isolate, v8::MicrotasksPolicy::kExplicit);
+  isolate->SetWasmStreamingCallback(workerWasmStreaming);
   v8::Local<v8::Context> context =
       v8rt::createContext(isolate, fromSnapshot, microtasks);
 
@@ -1149,6 +1174,9 @@ thread_local unsigned V8Scope::depth = 0;
 struct HostFunctionContext {
   jsi_runtime* runtime;
   jsi_host_function* hostFunction;
+  facebook::jsi::Runtime* numericRuntime = nullptr;
+  std::vector<uint8_t> numericTypes;
+  std::function<void(const uint64_t*, const char*)> numericCallback;
   v8::Global<v8::Function> weakRef;
   std::list<HostFunctionContext*>::iterator listIter;
   bool registered{false};
@@ -1217,6 +1245,7 @@ JsiRuntimeState::~JsiRuntimeState() {
     // Drop the unhandled-promise record (if any) before the isolate goes away;
     // its v8::Globals must release while the isolate is still live.
     last_unhandled_promise.reset();
+    worker_rejections.clear();
 
     for (HostFunctionContext* ctx : hostFunctionContexts) {
       ctx->registered = false;
@@ -1308,6 +1337,21 @@ void JsiRuntimeState::PromiseRejectCallback(v8::PromiseRejectMessage data) {
   if (!runtime)
     return;
 
+  if (runtime->worker_rejection_tracking) {
+    const auto event = data.GetEvent();
+    if (event == v8::kPromiseRejectWithNoHandler ||
+        event == v8::kPromiseHandlerAddedAfterReject) {
+      auto reason = data.GetValue();
+      if (reason.IsEmpty())
+        reason = v8::Undefined(isolate);
+      runtime->worker_rejections.push_back(
+          {v8::Global<v8::Promise>(isolate, promise),
+           v8::Global<v8::Value>(isolate, reason),
+           event == v8::kPromiseHandlerAddedAfterReject});
+    }
+    return;
+  }
+
   if (data.GetEvent() == v8::kPromiseHandlerAddedAfterReject) {
     runtime->RemoveUnhandledPromise(promise);
     return;
@@ -1362,18 +1406,74 @@ void JSI_CDECL HostFunctionCallbackTrampoline(
   auto* ctx = static_cast<HostFunctionContext*>(
       data->Value(v8::kExternalPointerTypeTagDefault));
 
-  std::vector<jsi_value> args;
-  args.reserve(info.Length());
-  for (int i = 0; i < info.Length(); ++i)
-    args.push_back(createJsiValue(isolate, info[i]));
+  // Owned string and buffer pointers retain the generic FFI conversion path.
+  if (ctx->numericCallback && (info.Length() == 0 || info[0]->IsBigInt() ||
+                               info[0]->IsNullOrUndefined())) {
+    uint64_t values[6]{};
+    const char* error = nullptr;
+    if (static_cast<size_t>(info.Length()) != ctx->numericTypes.size())
+      error = "Invalid FFI argument count";
+    for (size_t i = 0; !error && i < ctx->numericTypes.size(); ++i) {
+      auto value = info[static_cast<int>(i)];
+      if (ctx->numericTypes[i] == 0) {
+        if (value->IsNullOrUndefined())
+          continue;
+        if (!value->IsBigInt()) {
+          error = "Expected a bigint pointer or null";
+          break;
+        }
+        bool exact;
+        values[i] = value.As<v8::BigInt>()->Uint64Value(&exact);
+        if (!exact || values[i] > UINTPTR_MAX)
+          error = "FFI pointer address out of range";
+      } else {
+        if (!value->IsNumber()) {
+          error = "Expected an FFI integer";
+          break;
+        }
+        const double number = value.As<v8::Number>()->Value();
+        const bool signedValue = ctx->numericTypes[i] == 2;
+        if (!std::isfinite(number) || std::floor(number) != number ||
+            number < (signedValue ? INT32_MIN : 0.0) ||
+            number > (signedValue ? INT32_MAX : UINT32_MAX)) {
+          error = "FFI integer out of range";
+          break;
+        }
+        values[i] = signedValue
+                        ? static_cast<uint32_t>(static_cast<int32_t>(number))
+                        : static_cast<uint32_t>(number);
+      }
+    }
+    try {
+      ctx->numericCallback(values, error);
+    } catch (const facebook::jsi::JSError& exception) {
+      auto value =
+          jsi::abi::cloneAbiValue(*ctx->numericRuntime, exception.value());
+      isolate->ThrowException(toV8Value(isolate, &value));
+      abi::release_value(value);
+    } catch (const std::exception& exception) {
+      isolate->ThrowException(v8::Exception::Error(
+          v8::String::NewFromUtf8(isolate, exception.what()).ToLocalChecked()));
+    }
+    return;
+  }
+
+  std::array<jsi_value, 8> localArgs;
+  std::vector<jsi_value> heapArgs;
+  const size_t count = static_cast<size_t>(info.Length());
+  if (count > localArgs.size())
+    heapArgs.resize(count);
+  auto* args = count > localArgs.size() ? heapArgs.data() : localArgs.data();
+  for (size_t i = 0; i < count; ++i)
+    args[i] = createJsiValue(isolate, info[static_cast<int>(i)]);
 
   jsi_value thisVal = createJsiValue(isolate, info.This());
 
   jsi_value_or_error result = ctx->hostFunction->vtable->call(
-      ctx->hostFunction, ctx->runtime, &thisVal, args.data(), args.size());
+      ctx->hostFunction, ctx->runtime, &thisVal, args, count);
 
-  for (auto& arg : args)
-    abi::release_value(arg);
+  for (size_t i = 0; i < count; ++i)
+    abi::release_value(args[i]);
   abi::release_value(thisVal);
 
   if (abi::is_error(result)) {
@@ -1616,11 +1716,11 @@ jsi_evaluate_javascript_source(jsi_runtime* rt,
   v8::Local<v8::Script> compiled;
   if (!v8::Script::Compile(state->getContextLocal(), sourceStr, &origin)
            .ToLocal(&compiled))
-    return abi::create_value_or_error(jsi_error_js);
+    return abi::create_value_or_error(try_catch.error());
 
   v8::Local<v8::Value> resultValue;
   if (!compiled->Run(state->getContextLocal()).ToLocal(&resultValue))
-    return abi::create_value_or_error(jsi_error_js);
+    return abi::create_value_or_error(try_catch.error());
 
   return abi::create_value_or_error(createJsiValue(isolate, resultValue));
 }
@@ -1713,7 +1813,7 @@ jsi_prepare_javascript(jsi_runtime* rt,
   }
 
   if (!compile_ok)
-    return abi::create_prepared_javascript_or_error(jsi_error_js);
+    return abi::create_prepared_javascript_or_error(try_catch.error());
 
   v8::Local<v8::UnboundScript> unbound = compiled->GetUnboundScript();
 
@@ -1754,7 +1854,7 @@ jsi_evaluate_prepared_javascript(jsi_runtime* rt,
 
   v8::Local<v8::Value> resultValue;
   if (!script->Run(state->getContextLocal()).ToLocal(&resultValue))
-    return abi::create_value_or_error(jsi_error_js);
+    return abi::create_value_or_error(try_catch.error());
 
   return abi::create_value_or_error(createJsiValue(isolate, resultValue));
 }
@@ -2048,7 +2148,7 @@ jsi_error_code JSI_CDECL jsi_set_prototype_of(jsi_runtime* rt,
   v8::Maybe<bool> success =
       v8obj->SetPrototype(state->getContextLocal(), proto);
   if (success.IsNothing())
-    return jsi_error_js;
+    return try_catch.error();
   if (!success.FromJust()) {
     state->setNativeError("Failed to set prototype");
     return jsi_error_native;
@@ -2069,7 +2169,7 @@ jsi_has_object_property_from_propnameid(jsi_runtime* rt,
 
   v8::Maybe<bool> has = v8obj->Has(state->getContextLocal(), v8name);
   if (has.IsNothing())
-    return abi::create_bool_or_error(jsi_error_js);
+    return abi::create_bool_or_error(try_catch.error());
   return abi::create_bool_or_error(has.FromJust());
 }
 
@@ -2086,7 +2186,7 @@ jsi_get_object_property_from_propnameid(jsi_runtime* rt,
 
   v8::Local<v8::Value> val;
   if (!v8obj->Get(state->getContextLocal(), v8name).ToLocal(&val))
-    return abi::create_value_or_error(jsi_error_js);
+    return abi::create_value_or_error(try_catch.error());
 
   return abi::create_value_or_error(createJsiValue(state->isolate, val));
 }
@@ -2106,7 +2206,7 @@ jsi_set_object_property_from_propnameid(jsi_runtime* rt,
 
   v8::Maybe<bool> success = v8obj->Set(state->getContextLocal(), v8name, v8val);
   if (success.IsNothing())
-    return jsi_error_js;
+    return try_catch.error();
   return jsi_no_error;
 }
 
@@ -2123,7 +2223,7 @@ jsi_delete_property_from_propnameid(jsi_runtime* rt,
 
   v8::Maybe<bool> deleted = v8obj->Delete(state->getContextLocal(), v8name);
   if (deleted.IsNothing())
-    return jsi_error_js;
+    return try_catch.error();
   return jsi_no_error;
 }
 
@@ -2140,7 +2240,7 @@ jsi_has_object_property_from_value(jsi_runtime* rt,
 
   v8::Maybe<bool> has = v8obj->Has(state->getContextLocal(), v8key);
   if (has.IsNothing())
-    return abi::create_bool_or_error(jsi_error_js);
+    return abi::create_bool_or_error(try_catch.error());
   return abi::create_bool_or_error(has.FromJust());
 }
 
@@ -2157,7 +2257,7 @@ jsi_get_object_property_from_value(jsi_runtime* rt,
 
   v8::Local<v8::Value> val;
   if (!v8obj->Get(state->getContextLocal(), v8key).ToLocal(&val))
-    return abi::create_value_or_error(jsi_error_js);
+    return abi::create_value_or_error(try_catch.error());
 
   return abi::create_value_or_error(createJsiValue(state->isolate, val));
 }
@@ -2177,7 +2277,7 @@ jsi_set_object_property_from_value(jsi_runtime* rt,
 
   v8::Maybe<bool> success = v8obj->Set(state->getContextLocal(), v8key, v8val);
   if (success.IsNothing())
-    return jsi_error_js;
+    return try_catch.error();
   return jsi_no_error;
 }
 
@@ -2193,7 +2293,7 @@ jsi_error_code JSI_CDECL jsi_delete_property_from_value(jsi_runtime* rt,
 
   v8::Maybe<bool> deleted = v8obj->Delete(state->getContextLocal(), v8key);
   if (deleted.IsNothing())
-    return jsi_error_js;
+    return try_catch.error();
   return jsi_no_error;
 }
 
@@ -2213,7 +2313,7 @@ jsi_array_or_error JSI_CDECL jsi_get_object_property_names(jsi_runtime* rt,
                               v8::IndexFilter::kIncludeIndices,
                               v8::KeyConversionMode::kConvertToString)
            .ToLocal(&names))
-    return abi::create_array_or_error(jsi_error_js);
+    return abi::create_array_or_error(try_catch.error());
 
   return abi::create_array_or_error(
       static_cast<jsi_pointer*>(new ObjectHandle(state->isolate, names)));
@@ -2303,7 +2403,7 @@ jsi_value_or_error JSI_CDECL jsi_get_array_element(jsi_runtime* rt,
   v8::Local<v8::Value> val;
   if (!v8obj->Get(state->getContextLocal(), static_cast<uint32_t>(index))
            .ToLocal(&val))
-    return abi::create_value_or_error(jsi_error_js);
+    return abi::create_value_or_error(try_catch.error());
 
   return abi::create_value_or_error(createJsiValue(state->isolate, val));
 }
@@ -2322,7 +2422,7 @@ jsi_error_code JSI_CDECL jsi_set_array_element(jsi_runtime* rt,
   v8::Maybe<bool> success =
       v8obj->Set(state->getContextLocal(), static_cast<uint32_t>(index), v8val);
   if (success.IsNothing())
-    return jsi_error_js;
+    return try_catch.error();
   return jsi_no_error;
 }
 
@@ -2454,7 +2554,7 @@ jsi_value_or_error JSI_CDECL jsi_call(jsi_runtime* rt,
            ->Call(state->getContextLocal(), v8this, static_cast<int>(arg_count),
                   v8args.data())
            .ToLocal(&callResult))
-    return abi::create_value_or_error(jsi_error_js);
+    return abi::create_value_or_error(try_catch.error());
 
   return abi::create_value_or_error(createJsiValue(isolate, callResult));
 }
@@ -2486,7 +2586,7 @@ jsi_value_or_error JSI_CDECL jsi_call_as_constructor(jsi_runtime* rt,
            ->NewInstance(state->getContextLocal(), static_cast<int>(arg_count),
                          v8args.data())
            .ToLocal(&constructed))
-    return abi::create_value_or_error(jsi_error_js);
+    return abi::create_value_or_error(try_catch.error());
 
   return abi::create_value_or_error(
       abi::create_object_value(new ObjectHandle(isolate, constructed)));
@@ -2512,7 +2612,7 @@ jsi_create_function_from_host_function(jsi_runtime* rt,
            .ToLocal(&func)) {
     ctx->hostFunction = nullptr;  // caller still owns hf
     delete ctx;
-    return abi::create_function_or_error(jsi_error_js);
+    return abi::create_function_or_error(try_catch.error());
   }
 
   // Set up weak ref so ctx + hf are released when V8 GCs the function
@@ -2567,7 +2667,7 @@ jsi_create_object_from_host_object(jsi_runtime* rt, jsi_host_object* ho) {
 
   v8::Local<v8::Object> newObject;
   if (!constructor->NewInstance(context).ToLocal(&newObject))
-    return abi::create_object_or_error(jsi_error_js);
+    return abi::create_object_or_error(try_catch.error());
 
   auto* proxy = new AbiHostObjectProxy(rt, ho, isolate, newObject);
   newObject->SetInternalField(
@@ -2715,7 +2815,7 @@ jsi_bool_or_error JSI_CDECL jsi_instance_of(jsi_runtime* rt,
 
   v8::Maybe<bool> result = v8obj->InstanceOf(state->getContextLocal(), v8ctor);
   if (result.IsNothing())
-    return abi::create_bool_or_error(jsi_error_js);
+    return abi::create_bool_or_error(try_catch.error());
   return abi::create_bool_or_error(result.FromJust());
 }
 
@@ -2856,7 +2956,7 @@ jsi_string_or_error JSI_CDECL jsi_bigint_to_string(jsi_runtime* rt,
 
   v8::Local<v8::Object> bigintProto;
   if (!bi->ToObject(context).ToLocal(&bigintProto))
-    return abi::create_string_or_error(jsi_error_js);
+    return abi::create_string_or_error(try_catch.error());
 
   v8::Local<v8::String> toStringName =
       v8::String::NewFromUtf8Literal(isolate, "toString");
@@ -2873,7 +2973,7 @@ jsi_string_or_error JSI_CDECL jsi_bigint_to_string(jsi_runtime* rt,
   if (!v8::Local<v8::Function>::Cast(toStringFn)
            ->Call(context, bi, 1, &radixArg)
            .ToLocal(&resultValue))
-    return abi::create_string_or_error(jsi_error_js);
+    return abi::create_string_or_error(try_catch.error());
 
   if (!resultValue->IsString()) {
     state->setNativeError("BigInt.toString did not return a string");
@@ -3043,6 +3143,8 @@ flax::JointCell* bindDartPeer(jsi_runtime* runtime,
                               void (*cleanup)(void*),
                               void* cleanup_data) {
   auto* state = toState(runtime);
+  if (!state->heap)
+    throw std::runtime_error("Detached runtimes cannot bind Dart peers");
   V8Scope scope(state);
   auto* handle = toObjectHandle(object);
   auto value = handle->get(state->isolate);
@@ -3057,12 +3159,15 @@ flax::JointCell* bindDartPeer(jsi_runtime* runtime,
 
 void releaseDartPeer(jsi_runtime* runtime, flax::JointCell* cell) {
   auto* state = toState(runtime);
+  if (!state->heap)
+    throw std::runtime_error("Detached runtimes cannot bind Dart peers");
   V8Scope scope(state);
   state->heap->Release(cell);
 }
 
 size_t jointCellCount(jsi_runtime* runtime) {
-  return toState(runtime)->heap->cell_count();
+  auto* state = toState(runtime);
+  return state->heap ? state->heap->cell_count() : 0;
 }
 
 bool getEnableMultiThread(jsi_runtime* runtime) noexcept {
@@ -3516,6 +3621,65 @@ v8_jsi_config_set_task_runner(jsi_config config,
 #endif
 
 namespace flax {
+void numericHostFunction(
+    facebook::jsi::Runtime& runtime,
+    const facebook::jsi::Function& function,
+    const std::vector<uint8_t>& types,
+    std::function<void(const uint64_t*, const char*)> callback) {
+  auto* state = getState(jsi::abi::getAbiRuntime(runtime));
+  V8Scope scope(state);
+  auto object = toObjectHandle(jsi::abi::getAbiObject(runtime, function))
+                    ->get(state->isolate);
+  auto data =
+      object->GetPrivate(state->getContextLocal(), state->getHostFunctionKey())
+          .ToLocalChecked()
+          .As<v8::External>();
+  auto* host = static_cast<HostFunctionContext*>(
+      data->Value(v8::kExternalPointerTypeTagDefault));
+  host->numericRuntime = &runtime;
+  host->numericTypes = types;
+  host->numericCallback = std::move(callback);
+}
+void mappedArrayBuffer(facebook::jsi::Runtime& runtime,
+                       const facebook::jsi::Object& object,
+                       bool detach) {
+  auto* state = getState(jsi::abi::getAbiRuntime(runtime));
+  V8Scope scope(state);
+  auto local = toObjectHandle(jsi::abi::getAbiObject(runtime, object))
+                   ->get(state->isolate);
+  if (!local->IsArrayBuffer())
+    throw std::invalid_argument("Expected an ArrayBuffer");
+  auto buffer = local.As<v8::ArrayBuffer>();
+  auto context = state->isolate->GetCurrentContext();
+  auto slot = v8::Private::ForApi(
+      state->isolate,
+      v8::String::NewFromUtf8Literal(state->isolate, "flax.webgpu.mapping"));
+  v8::Local<v8::Value> key;
+  if (!buffer->GetPrivate(context, slot).ToLocal(&key))
+    throw std::invalid_argument("Cannot read mapped ArrayBuffer key");
+  if (detach) {
+    if (!key->IsSymbol())
+      throw std::invalid_argument("Expected a protected mapped ArrayBuffer");
+    if (!buffer->WasDetached() && !buffer->Detach(key).FromMaybe(false))
+      throw std::invalid_argument("Cannot detach mapped ArrayBuffer");
+  } else {
+    if (buffer->WasDetached() || !buffer->IsDetachable() || !key->IsUndefined())
+      throw std::invalid_argument(
+          "ArrayBuffer is already detached or protected");
+    key = v8::Symbol::New(state->isolate);
+    if (!buffer->SetPrivate(context, slot, key).FromMaybe(false))
+      throw std::invalid_argument("Cannot protect mapped ArrayBuffer");
+    buffer->SetDetachKey(key);
+  }
+}
+void protectMappedArrayBuffer(facebook::jsi::Runtime& runtime,
+                              const facebook::jsi::Object& object) {
+  mappedArrayBuffer(runtime, object, false);
+}
+void detachMappedArrayBuffer(facebook::jsi::Runtime& runtime,
+                             const facebook::jsi::Object& object) {
+  mappedArrayBuffer(runtime, object, true);
+}
 class V8Buffer final : public facebook::jsi::MutableBuffer {
  public:
   explicit V8Buffer(std::shared_ptr<v8::BackingStore> storage)
@@ -3539,6 +3703,13 @@ Uint8View readUint8Array(facebook::jsi::Runtime& runtime,
   auto buffer = array->Buffer();
   if (!buffer->IsArrayBuffer() || buffer->WasDetached())
     throw std::invalid_argument("Expected an attached, unshared ArrayBuffer");
+  auto mapping = v8::Private::ForApi(
+      state->isolate,
+      v8::String::NewFromUtf8Literal(state->isolate, "flax.webgpu.mapping"));
+  if (buffer->HasPrivate(state->isolate->GetCurrentContext(), mapping)
+          .FromMaybe(false))
+    throw std::invalid_argument(
+        "Mapped GPU buffers require copied byte access");
   if (!buffer->IsDetachable())
     throw std::invalid_argument(
         "Non-detachable buffers require copied byte access");
@@ -3602,3 +3773,5 @@ void installModuleController(facebook::jsi::Runtime& runtime,
 }  // namespace flax
 
 #include "ffi/callback_v8.inc"
+
+#include "workers.inc"

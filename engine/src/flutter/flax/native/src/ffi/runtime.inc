@@ -1,27 +1,35 @@
 // Shared JS -> C ABI implementation. Included after the engine-owned runtime.
-#include "flax/engine_ffi.h"
+#include <dart_flax_api.h>
+#include <dart_native_api.h>
+#include <dlfcn.h>
+#include <ffi.h>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <cmath>
-#include <cstddef>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdlib>
-#include <dart_flax_api.h>
-#include <dart_native_api.h>
 #include <deque>
-#include <dlfcn.h>
-#include <ffi.h>
 #include <functional>
 #include <limits>
 #include <optional>
 #include <thread>
 #include <type_traits>
+#include "flax/engine_ffi.h"
 
 void flaxFfiCollectJs(fbjsi::Runtime &);
 std::unique_ptr<fbjsi::Runtime> flaxFfiCreateCallbackRuntime();
 flax::Uint8View flaxFfiReadBytes(fbjsi::Runtime &, const fbjsi::Object &);
+
+namespace flax {
+void numericHostFunction(fbjsi::Runtime&,
+                         const fbjsi::Function&,
+                         const std::vector<uint8_t>&,
+                         std::function<void(const uint64_t*, const char*)>);
+}
 
 namespace ffi_dlopen {
 std::atomic<uint64_t> liveLibraries{0}, liveBindings{0}, livePointers{0},
@@ -140,10 +148,12 @@ void *pointer(fbjsi::Runtime &js, const fbjsi::Value &value, bool raw = false) {
     fail(js, "Expected a bigint pointer or null",
          raw ? "ERR_INVALID_ARG_TYPE" : "ERR_INVALID_ARG_VALUE");
   auto address = value.getBigInt(js);
-  if (!address.isUint64(js) || address.getUint64(js) > UINTPTR_MAX)
+  if (!address.isUint64(js))
     fail(js, "FFI pointer address out of range");
-  return reinterpret_cast<void *>(
-      static_cast<uintptr_t>(address.getUint64(js)));
+  const auto rawAddress = address.getUint64(js);
+  if (rawAddress > UINTPTR_MAX)
+    fail(js, "FFI pointer address out of range");
+  return reinterpret_cast<void*>(static_cast<uintptr_t>(rawAddress));
 }
 fbjsi::Value wrapPointer(fbjsi::Runtime &js, const void *address) {
   return fbjsi::BigInt::fromUint64(js, reinterpret_cast<uintptr_t>(address));
@@ -165,13 +175,21 @@ template <typename T> T integer(fbjsi::Runtime &js, const fbjsi::Value &value) {
   return static_cast<T>(number);
 }
 struct Slot {
+  // Most C ABI values fit here; aggregates retain aligned heap storage.
+  alignas(std::max_align_t)
+      uint8_t local[std::max(sizeof(ffi_arg), sizeof(std::max_align_t))]{};
   std::vector<std::max_align_t> words;
   std::vector<uint8_t> string;
   flax::Uint8View source{};
-  explicit Slot(size_t size = sizeof(ffi_arg))
-      : words((std::max(size, sizeof(ffi_arg)) + sizeof(std::max_align_t) - 1) /
-              sizeof(std::max_align_t)) {}
-  void *data() { return words.data(); }
+  explicit Slot(size_t size = sizeof(ffi_arg)) { resize(size); }
+  void resize(size_t size) {
+    if (size > sizeof(local))
+      words.resize((size + sizeof(std::max_align_t) - 1) /
+                   sizeof(std::max_align_t));
+  }
+  void* data() {
+    return words.empty() ? static_cast<void*>(local) : words.data();
+  }
 };
 template <class T> T load(const void *source) {
   T value;
@@ -283,6 +301,8 @@ void input(fbjsi::Runtime &js, State &state, const NativeType &type,
 #include "memory.inc"
 
 struct Binding {
+  uint8_t numericMode = 0;
+  bool variadic = false;
   Binding() { ++liveBindings; }
   ~Binding() { --liveBindings; }
   std::string name;
@@ -329,6 +349,7 @@ std::shared_ptr<Binding> prepare(fbjsi::Runtime &js,
   auto fixed = signature.getProperty(js, "fixedArguments");
   ffi_status status;
   if (!fixed.isUndefined()) {
+    binding->variadic = true;
     const auto count = checkedSize(js, fixed);
     if (count > binding->arguments.size())
       fail(js, "Invalid fixed variadic argument count");
@@ -350,22 +371,13 @@ std::shared_ptr<Binding> prepare(fbjsi::Runtime &js,
     fail(js, "Unsupported native ABI signature", "ERR_FFI_CALL_FAILED");
   return binding;
 }
-fbjsi::Value invoke(FlaxRuntime *runtime, fbjsi::Runtime &js, State &state,
-                    Binding &binding, const fbjsi::Value *args, size_t count,
-                    bool captureErrno = false) {
-  checkOpen(js, state, *binding.library);
-  if (count != binding.arguments.size())
-    fail(js, "Invalid FFI argument count for " + binding.name);
-  if (!runtime) state.sweep();
-  std::vector<Slot> slots;
-  std::vector<void *> addresses;
-  slots.reserve(count);
-  for (size_t i = 0; i < count; ++i) {
-    slots.emplace_back(binding.arguments[i]->size());
-    input(js, state, *binding.arguments[i], args[i], slots.back());
-    addresses.push_back(slots.back().data());
-  }
-  Slot result(binding.result->size());
+fbjsi::Value invokePrepared(FlaxRuntime* runtime,
+                            fbjsi::Runtime& js,
+                            State& state,
+                            Binding& binding,
+                            Slot& result,
+                            void** addresses,
+                            bool captureErrno) {
   checkOpen(js, state, *binding.library);
   auto savedError = std::move(state.callbackError);
   state.callbackError.clear();
@@ -374,8 +386,22 @@ fbjsi::Value invoke(FlaxRuntime *runtime, fbjsi::Runtime &js, State &state,
   OwnerCall ownerCall(state);
   state.cancelDeliveries();
   if (captureErrno) errno = 0;
-  ffi_call(&binding.cif, FFI_FN(binding.address), result.data(),
-           addresses.data());
+  if (binding.numericMode == 1) {
+    using Draw = void (*)(void*, uint32_t, uint32_t, uint32_t, uint32_t);
+    reinterpret_cast<Draw>(binding.address)(
+        load<void*>(addresses[0]), load<uint32_t>(addresses[1]),
+        load<uint32_t>(addresses[2]), load<uint32_t>(addresses[3]),
+        load<uint32_t>(addresses[4]));
+  } else if (binding.numericMode == 2) {
+    using DrawIndexed =
+        void (*)(void*, uint32_t, uint32_t, uint32_t, int32_t, uint32_t);
+    reinterpret_cast<DrawIndexed>(binding.address)(
+        load<void*>(addresses[0]), load<uint32_t>(addresses[1]),
+        load<uint32_t>(addresses[2]), load<uint32_t>(addresses[3]),
+        load<int32_t>(addresses[4]), load<uint32_t>(addresses[5]));
+  } else {
+    ffi_call(&binding.cif, FFI_FN(binding.address), result.data(), addresses);
+  }
   const int nativeError = errno;
   {
     std::lock_guard<std::mutex> lock(state.queueMutex);
@@ -396,6 +422,40 @@ fbjsi::Value invoke(FlaxRuntime *runtime, fbjsi::Runtime &js, State &state,
   captured.setProperty(js, "errno", nativeError);
   return captured;
 }
+fbjsi::Value invoke(FlaxRuntime* runtime,
+                    fbjsi::Runtime& js,
+                    State& state,
+                    Binding& binding,
+                    const fbjsi::Value* args,
+                    size_t count,
+                    bool captureErrno = false) {
+  checkOpen(js, state, *binding.library);
+  if (count != binding.arguments.size())
+    fail(js, "Invalid FFI argument count for " + binding.name);
+  if (!runtime)
+    state.sweep();
+  // Store ordinary call arguments on the stack; large signatures still grow.
+  std::array<Slot, 8> localSlots;
+  std::array<void*, 8> localAddresses;
+  std::vector<Slot> heapSlots;
+  std::vector<void*> heapAddresses;
+  Slot* slots = localSlots.data();
+  void** addresses = localAddresses.data();
+  if (count > localSlots.size()) {
+    heapSlots.resize(count);
+    heapAddresses.resize(count);
+    slots = heapSlots.data();
+    addresses = heapAddresses.data();
+  }
+  for (size_t i = 0; i < count; ++i) {
+    slots[i].resize(binding.arguments[i]->size());
+    input(js, state, *binding.arguments[i], args[i], slots[i]);
+    addresses[i] = slots[i].data();
+  }
+  Slot result(binding.result->size());
+  return invokePrepared(runtime, js, state, binding, result, addresses,
+                        captureErrno);
+}
 fbjsi::Function callable(FlaxRuntime *runtime, fbjsi::Runtime &js,
                          const std::shared_ptr<State> &state,
                          const std::shared_ptr<Binding> &binding) {
@@ -409,6 +469,44 @@ fbjsi::Function callable(FlaxRuntime *runtime, fbjsi::Runtime &js,
           entry.emplace(runtime);
         return invoke(runtime, js, *state, *binding, args, count);
       });
+  // Numeric void signatures keep call/retirement guards but avoid ABI handles.
+  const auto matches = [&](std::initializer_list<Type> kinds) {
+    if (binding->result->kind != Type::Void || binding->variadic ||
+        binding->arguments.size() != kinds.size())
+      return false;
+    size_t i = 0;
+    for (auto kind : kinds)
+      if (binding->arguments[i++]->kind != kind)
+        return false;
+    return true;
+  };
+  if (matches({Type::Pointer, Type::U32, Type::U32, Type::U32, Type::U32}))
+    binding->numericMode = 1;
+  else if (matches({Type::Pointer, Type::U32, Type::U32, Type::U32, Type::I32,
+                    Type::U32}))
+    binding->numericMode = 2;
+  if (runtime && binding->numericMode) {
+    std::vector<uint8_t> types;
+    for (const auto& type : binding->arguments)
+      types.push_back(type->kind == Type::Pointer ? 0
+                      : type->kind == Type::I32   ? 2
+                                                  : 1);
+    flax::numericHostFunction(
+        js, fn, types,
+        [runtime, state, binding, &js](const uint64_t* values,
+                                       const char* error) {
+          Entry entry(runtime);
+          checkOpen(js, *state, *binding->library);
+          if (error)
+            fail(js, error);
+          void* addresses[6];
+          for (size_t i = 0; i < binding->arguments.size(); ++i)
+            addresses[i] = const_cast<uint64_t*>(values + i);
+          Slot result;
+          invokePrepared(runtime, js, *state, *binding, result, addresses,
+                         false);
+        });
+  }
   fn.setProperty(js, "pointer", wrapPointer(js, binding->address));
   auto peer = std::make_shared<BindingPeer>(binding, state);
   fn.setNativeState(js, peer);

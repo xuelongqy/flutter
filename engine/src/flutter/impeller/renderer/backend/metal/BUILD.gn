@@ -2,9 +2,13 @@
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
 
+import("//flutter/flax/config.gni")
 import("../../../tools/impeller.gni")
 
 impeller_component("metal") {
+  if (flax_enable_runtime && is_mac) {
+    defines = [ "FLAX_ENABLE_METAL_INTEROP" ]
+  }
   sources = [
     "allocator_mtl.h",
     "allocator_mtl.mm",

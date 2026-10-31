@@ -17,6 +17,7 @@
 #include "jsi_abi/jsi_abi.h"
 #include "jsi_abi/jsi_abi_helpers.h"
 
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <cstring>
@@ -165,6 +166,9 @@ class JsiAbiRuntime : public facebook::jsi::Runtime {
   bool isInspectable() override;
 
   jsi_runtime *abiRuntime() const noexcept { return abiRt_; }
+  jsi_value cloneAbiValue(const facebook::jsi::Value& value) const {
+    return cloneToABIValue(value);
+  }
   jsi_object abiObject(const facebook::jsi::Object &object) const {
     return toABIObject(object);
   }
@@ -458,13 +462,17 @@ class JsiAbiRuntime::HostFunctionWrapper : public jsi_host_function {
     return rtw.abiRethrow(
         abi::create_value_or_error, [&]() -> jsi_value_or_error {
           facebook::jsi::Value jsThis = rtw.cloneToJSIValue(*thisArg);
-          std::vector<facebook::jsi::Value> jsArgs;
-          jsArgs.reserve(argCount);
+          std::array<facebook::jsi::Value, 8> localArgs;
+          std::vector<facebook::jsi::Value> heapArgs;
+          if (argCount > localArgs.size())
+            heapArgs.resize(argCount);
+          auto* jsArgs =
+              argCount > localArgs.size() ? heapArgs.data() : localArgs.data();
           for (size_t i = 0; i < argCount; ++i)
-            jsArgs.push_back(rtw.cloneToJSIValue(args[i]));
+            jsArgs[i] = rtw.cloneToJSIValue(args[i]);
 
           facebook::jsi::Value result =
-              wrapper->hf_(rtw, jsThis, jsArgs.data(), argCount);
+              wrapper->hf_(rtw, jsThis, jsArgs, argCount);
 
           return abi::create_value_or_error(rtw.cloneToABIValue(result));
         });
@@ -1564,6 +1572,11 @@ jsi_runtime *getAbiRuntime(facebook::jsi::Runtime &runtime) noexcept {
 jsi_object getAbiObject(facebook::jsi::Runtime &runtime,
                         const facebook::jsi::Object &object) noexcept {
   return static_cast<JsiAbiRuntime &>(runtime).abiObject(object);
+}
+
+jsi_value cloneAbiValue(facebook::jsi::Runtime& runtime,
+                        const facebook::jsi::Value& value) {
+  return static_cast<JsiAbiRuntime&>(runtime).cloneAbiValue(value);
 }
 
 } // namespace jsi::abi

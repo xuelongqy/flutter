@@ -313,6 +313,17 @@ fbjsi::Value memoryCall(FlaxRuntime *runtime, fbjsi::Runtime &js, State &state,
     auto base = source.storage->data();
     return wrapPointer(js, source.offset ? base + source.offset : base);
   }
+  if (name == "protectMappedArrayBuffer" || name == "detachMappedArrayBuffer") {
+    arity(1, 1);
+    if (!args[0].isObject())
+      fail(js, "Expected a mapped ArrayBuffer");
+    auto object = args[0].getObject(js);
+    if (name == "protectMappedArrayBuffer")
+      flax::protectMappedArrayBuffer(js, object);
+    else
+      flax::detachMappedArrayBuffer(js, object);
+    return {};
+  }
   if (name == "toArrayBuffer" || name == "toUint8Array") {
     arity(2, 3);
     auto address = pointer(js, args[0], true);
@@ -473,11 +484,12 @@ void installMemory(FlaxRuntime *runtime, fbjsi::Runtime &js,
                    const std::shared_ptr<State> &state) {
   installIntrinsics(js, *state);
   fbjsi::Object module(js);
-  for (const char *name :
+  for (const char* name :
        {"getRawPointer", "toString", "toUtf16String", "toArrayBuffer",
         "toUint8Array", "exportString", "exportArrayBuffer",
         "exportArrayBufferView", "layout", "read", "write", "allocate", "free",
-        "bindFunction", "finalizer"}) {
+        "bindFunction", "finalizer", "protectMappedArrayBuffer",
+        "detachMappedArrayBuffer"}) {
     module.setProperty(
         js, name,
         fbjsi::Function::createFromHostFunction(

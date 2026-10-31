@@ -8,7 +8,10 @@ void flaxFfiExperimentShutdown(FlaxRuntime*);
 #include "flax/engine_binding.h"
 #include "flax/engine_execution.h"
 #include "flax/engine_gc.h"
+#include "flax/engine_images.h"
 #include "flax/engine_modules.h"
+#include "flax/engine_webgpu.h"
+#include "flax/engine_workers.h"
 #include "flutter/fml/build_config.h"
 #include "flutter/lib/ui/ui_dart_state.h"
 #include "joint_gc.h"
@@ -56,6 +59,7 @@ struct FlaxRuntime {
   size_t depth = 0;
   bool disposing = false;
   bool cold = true;
+  bool detached = false;
   int64_t wakeupPort = 0;
   std::unique_ptr<fbjsi::Runtime> js;
   // Declared after js so references are released before the engine.
@@ -177,7 +181,8 @@ struct Entry {
     if (!allow_preparation) {
       if (runtime->startup)
         throw BridgeError(FLAX_STATE_ERROR, "Runtime is preparing JavaScript");
-      flax::JointHeap::CheckPreparation();
+      if (!runtime->detached)
+        flax::JointHeap::CheckPreparation();
       runtime->cold = false;
     }
     ++runtime->depth;
@@ -261,7 +266,8 @@ void clearRuntime(FlaxRuntime* runtime) {
 }
 
 void initializeRuntime(FlaxRuntime* runtime) {
-  runtime->js = flax::createEngineRuntime(&runtime->depth);
+  runtime->js = runtime->detached ? flax::createDetachedRuntime()
+                                  : flax::createEngineRuntime(&runtime->depth);
   if (runtime->wakeupPort)
     flax::setRuntimeWakeupPort(*runtime->js, runtime->wakeupPort);
   runtime->arrayBufferConstructor = std::make_unique<fbjsi::Function>(
@@ -1102,6 +1108,9 @@ int32_t shareBuffer(FlaxRuntime* runtime,
                     FlaxValueId* output,
                     FlaxError* error) {
   return enter(runtime, error, [&] {
+    if (runtime->detached)
+      throw BridgeError(FLAX_STATE_ERROR,
+                        "Workers cannot share Dart-owned buffers");
     if (!output)
       throw BridgeError(FLAX_ARGUMENT_ERROR, "Null shared buffer output");
     Dart_FlaxBuffer buffer{};
@@ -1133,6 +1142,9 @@ Dart_Handle readBuffer(FlaxRuntime* runtime,
                        FlaxError* error) {
   Dart_Handle result = Dart_Null();
   enter(runtime, error, [&] {
+    if (runtime->detached)
+      throw BridgeError(FLAX_STATE_ERROR,
+                        "Workers cannot share buffers with Dart");
     flax::Uint8View view;
     try {
       auto& js = *runtime->js;
@@ -1355,6 +1367,13 @@ extern "C" void flax_engine_notify_idle_current_isolate() {
   flax::notifyIdleJointHeap();
 }
 
+namespace flax {
+void protectMappedArrayBuffer(facebook::jsi::Runtime&,
+                              const facebook::jsi::Object&);
+void detachMappedArrayBuffer(facebook::jsi::Runtime&,
+                             const facebook::jsi::Object&);
+}  // namespace flax
+
 #if defined(FLAX_ENABLE_FFI)
 #include "ffi/runtime.inc"
 #endif
@@ -1450,3 +1469,79 @@ extern "C" __attribute__((visibility("default"))) const FlaxEngineModulesApi*
 flax_engine_get_modules_api(uint32_t version) {
   return version == FLAX_ENGINE_MODULES_VERSION ? &modulesApi : nullptr;
 }
+
+namespace {
+int32_t createWorkerRuntime(FlaxRuntime** output, FlaxError* error) {
+  return protect(error, [&] {
+    auto runtime = std::make_unique<FlaxRuntime>();
+    runtime->detached = true;
+    initializeRuntime(runtime.get());
+    std::lock_guard lock(runtimesMutex);
+    runtimes[runtime->owner].insert(runtime.get());
+    *output = runtime.release();
+  });
+}
+int32_t installWorkerBridge(FlaxRuntime* runtime,
+                            int64_t port,
+                            FlaxError* error) {
+  return enter(runtime, error,
+               [&] { flax::installWorkerBridge(*runtime->js, port); });
+}
+int32_t attachWorker(FlaxRuntime* runtime,
+                     uint64_t channel,
+                     int64_t port,
+                     FlaxError* error) {
+  return enter(runtime, error, [&] {
+    if (!runtime->detached)
+      throw std::invalid_argument("Expected detached worker runtime");
+    flax::attachWorker(*runtime->js, channel, port);
+  });
+}
+}  // namespace
+extern "C" __attribute__((visibility("default"))) const FlaxEngineWorkersApi*
+flax_engine_get_workers_api(uint32_t version) {
+  static const FlaxEngineWorkersApi api{
+      FLAX_ENGINE_WORKERS_VERSION,
+      sizeof(FlaxEngineWorkersApi),
+      createWorkerRuntime,
+      installWorkerBridge,
+      attachWorker,
+      flax::interruptWorker,
+      [](FlaxRuntime* runtime, FlaxError* error) {
+        return enter(runtime, error, [&] {
+          if (!runtime->detached)
+            throw std::invalid_argument("Expected detached worker runtime");
+          flax::retireWorkerRuntime(*runtime->js);
+        });
+      },
+      [](uint64_t* channels, uint64_t* detached) {
+        *channels = flax::workerChannelCount();
+        *detached = 0;
+        std::lock_guard lock(runtimesMutex);
+        for (auto& [owner, live] : runtimes)
+          for (auto* runtime : live)
+            if (runtime->detached)
+              ++*detached;
+      }};
+  return version == api.version ? &api : nullptr;
+}
+
+#if defined(FLAX_ENABLE_METAL_INTEROP)
+extern "C" __attribute__((visibility("default"))) uint32_t
+flax_webgpu_interop_version() {
+  return FLAX_ENGINE_WEBGPU_INTEROP_VERSION;
+}
+extern "C" __attribute__((visibility("default"))) uint32_t
+flax_webgpu_renderer_supported() {
+  try {
+    auto* state = flutter::UIDartState::Current();
+    return state && state->IsRootIsolate() && state->IsImpellerEnabled() &&
+                   state->GetRuntimeStageBackend() ==
+                       impeller::RuntimeStageBackend::kMetal
+               ? 1
+               : 0;
+  } catch (...) {
+    return 0;
+  }
+}
+#endif

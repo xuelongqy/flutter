@@ -14,6 +14,12 @@ struct Uint8View {
   size_t length;
 };
 Uint8View readUint8Array(facebook::jsi::Runtime&, const facebook::jsi::Object&);
+std::unique_ptr<facebook::jsi::Runtime> createDetachedRuntime();
+void installWorkerBridge(facebook::jsi::Runtime&, int64_t port);
+void attachWorker(facebook::jsi::Runtime&, uint64_t channel, int64_t port);
+void interruptWorker(uint64_t channel);
+uint64_t workerChannelCount();
+void retireWorkerRuntime(facebook::jsi::Runtime&);
 void setRuntimeWakeupPort(facebook::jsi::Runtime&, int64_t port);
 void installModuleController(facebook::jsi::Runtime&,
                              const facebook::jsi::Object& importer,

@@ -16,3 +16,13 @@ _flax_engine_get_ffi_api
 _flax_engine_get_modules_api
 _flax_canvas_version
 _flax_canvas_dispatch
+
+
+_flax_engine_get_workers_api
+
+_flax_image_version
+
+_flax_image_dispatch
+
+_flax_webgpu_interop_version
+_flax_webgpu_renderer_supported

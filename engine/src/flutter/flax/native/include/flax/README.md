@@ -15,3 +15,18 @@ Binding extension 1 registers shared member layouts and invokes current JS recei
 with flat typed arguments. Keep these headers identical to the Flax workspace copies.
 See
 [engine build and ownership](../../../README.md).
+
+`engine_workers.h` is an optional, separately versioned Dedicated Worker extension.
+It creates a detached V8 runtime with explicit references and no Dart object peers.
+The owning Dart isolate enters and disposes it; only channel interruption and
+lifecycle counts are thread safe. Native message queues retain serialized values and
+transferred BackingStores, while Dart native ports carry wakeups only.
+
+`engine_images.h` declares the optional shared image codec/bitmap operations. The same
+header is mirrored in Flax and generated into its Dart FFI bindings. CPU codecs require
+no Canvas 2D plugin; ui.Image/Picture operations remain on the owning UI isolate.
+
+`engine_webgpu.h` declares optional macOS interop profile 1 for mapped-buffer lifetime
+and Metal producer/consumer fences. It does not change the main ABI or Worker profile.
+`dawn_interop.h` is the internal Objective-C selector contract, compiled only under the
+maintained macOS interop define. Dawn itself remains a separately packaged native asset.

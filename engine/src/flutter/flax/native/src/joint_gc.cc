@@ -148,6 +148,7 @@ void JointHeap::Shutdown() {
   while (!cells_.empty())
     Remove(cells_.begin()->first);
   peers_key_.Reset();
+  peer_template_.Reset();
 }
 
 JointHeap::~JointHeap() {
@@ -202,7 +203,10 @@ JointCell* JointHeap::Bind(const void* session,
   } else {
     peer = cppgc::MakeGarbageCollected<JointPeer>(
         isolate_->GetCppHeap()->GetAllocationHandle());
-    auto carrier = v8::FunctionTemplate::New(isolate_)
+    // Reuse the type template; each Context still gets its own constructor.
+    if (peer_template_.IsEmpty())
+      peer_template_.Reset(isolate_, v8::FunctionTemplate::New(isolate_));
+    auto carrier = peer_template_.Get(isolate_)
                        ->GetFunction(ctx)
                        .ToLocalChecked()
                        ->NewInstance(ctx)
@@ -342,6 +346,7 @@ void JointHeap::Collect(void* peer, const Dart_FlaxGC* gc) {
     return;
   if (std::this_thread::get_id() != heap.owner_ || heap.joint_)
     std::abort();
+  heap.external_gc_pending_ = false;
   v8::Locker locker(heap.isolate_);
   v8::Isolate::Scope scope(heap.isolate_);
   // A Dart allocation may collect while a JS-to-Dart call is active. Preserve
@@ -419,7 +424,7 @@ void JointHeap::Trace(JointCell* cell, cppgc::Visitor* visitor) {
 
 void JointHeap::JsCollected(v8::Isolate*,
                             v8::GCType type,
-                            v8::GCCallbackFlags,
+                            v8::GCCallbackFlags flags,
                             void* peer) {
   auto& heap = *static_cast<JointHeap*>(peer);
   if (heap.joint_)
@@ -429,7 +434,29 @@ void JointHeap::JsCollected(v8::Isolate*,
   // loop.
   else if ((type & v8::kGCTypeMarkSweepCompact) && !heap.cells_.empty()) {
     TRACE_EVENT0("flutter", "FlaxRequestV8GC");
-    heap.Request(true);
+    const bool external = flags & v8::kGCCallbackFlagCollectAllExternalMemory;
+    const bool urgent =
+        flags & (v8::kGCCallbackFlagForced | v8::kGCCallbackFlagLastResort |
+                 v8::kGCCallbackFlagCollectAllAvailableGarbage);
+    if (!external || urgent) {
+      heap.external_gc_pending_ = false;
+      heap.Request(true);
+    } else if (!heap.external_gc_pending_) {
+      // Transfers repeatedly charge existing BackingStores as external memory.
+      // Merge their Dart follow-ups for 8 ms; V8 GC and Dart pressure stay
+      // immediate.
+      heap.external_gc_pending_ = true;
+      heap.runner_->PostDelayedTask(
+          [weak = heap.weak_from_this()] {
+            auto heap = weak.lock();
+            if (!heap || !heap->external_gc_pending_)
+              return;
+            heap->external_gc_pending_ = false;
+            if (!heap->closed_ && !heap->cells_.empty())
+              heap->Request(true);
+          },
+          fml::TimeDelta::FromMilliseconds(8));
+    }
   } else if (!heap.joint_) {
     TRACE_EVENT0("flutter", "FlaxV8IntermediateGC");
   }

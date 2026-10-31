@@ -329,3 +329,25 @@ other-effect, clipped and previously painted targets retain their existing passe
 Gradient dithering uses one RGBA8 code value (1/255), so its sub-half-step noise
 preserves exactly representable endpoints. The previous 1/64 amplitude could turn
 opaque primary-color plateaus into 254 during Metal readback.
+
+## Optional macOS WebGPU interop
+
+The ordinary maintained Debug/Release builds include shared image codecs, protected V8
+mapped buffers and macOS Metal texture/fence interop. These implementations supersede
+the companion Flax experiment's seven source overlays; no source-copy or Ninja-edge
+rewrite is part of the maintained build. Shared image operations are exported by both
+the framework and tester. Image argument errors return across the Dart boundary.
+
+`engine_webgpu.h` defines optional interop profile 1, independent of native ABI 2,
+UI protocol 24 and Dedicated Worker profile 2. The companion plugin checks this profile
+and mapped-buffer functions before creating a Dawn context. Mapped buffers reject
+structuredClone and Worker transfers before detaching any ordinary buffer, including
+protection introduced by a getter during serialization. Native detachment checks its
+key-aware result. Ordinary transfers retain native BackingStore ownership.
+
+The internal `FLAX_ENABLE_METAL_INTEROP` define enables the texture/fence selectors only
+for maintained macOS builds. Other engine platforms and ordinary Flutter texture paths
+retain their existing behavior. The engine's minimum macOS version remains 15; the
+optional pinned Dawn native asset requires macOS 26 and is packaged by its npm producer,
+not linked into the engine. The interop retains one Flutter Metal consumer queue.
+Broader platforms, graphics transfer and full WebGPU conformance remain unvalidated.

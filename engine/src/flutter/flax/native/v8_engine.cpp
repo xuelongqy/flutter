@@ -72,7 +72,9 @@ void releaseDartPeer(facebook::jsi::Runtime& runtime, JointCell* cell) {
 uint64_t jointCellCount(facebook::jsi::Runtime& runtime) {
   return v8rt_internal::jointCellCount(jsi::abi::getAbiRuntime(runtime));
 }
-void closeEngineRuntime(facebook::jsi::Runtime&) {}
+void closeEngineRuntime(facebook::jsi::Runtime& runtime) {
+  retireWorkerRuntime(runtime);
+}
 // V8 already schedules idle work when its outermost JSI scope exits.
 void notifyEngineWork(facebook::jsi::Runtime&) {}
 void shutdownJointHeap() {
