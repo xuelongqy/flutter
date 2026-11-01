@@ -64,16 +64,18 @@ class PatchTest(unittest.TestCase):
       git("init", "--quiet")
       git("config", "user.email", "patch-test@example.invalid")
       git("config", "user.name", "Patch test")
-      source, ffi = repo / "source", repo / "ffi"
+      source, ffi, gc = repo / "source", repo / "ffi", repo / "gc"
       source.write_text("base\n")
       ffi.write_text("before\n")
+      gc.write_text("upstream\n")
       git("add", ".")
       git("commit", "--quiet", "-m", "fixture")
       patches = root / "patches"
       patches.mkdir()
       (patches / "dart_revision").write_text(git("rev-parse", "HEAD").strip())
       source.write_text("current\n")
-      (patches / "dart.patch").write_text(git("diff", "--", "source"))
+      gc.write_text("after\n")
+      (patches / "dart.patch").write_text(git("diff", "--", "source", "gc"))
       ffi.write_text("after\n")
       (patches / "dart-ffi.patch").write_text(git("diff", "--", "ffi"))
       source.write_text("previous\n")
@@ -81,15 +83,30 @@ class PatchTest(unittest.TestCase):
       source.write_text("current\n")
       (patches / "dart-startup.patch").write_text(git("diff", "--", "source"))
       git("reset", "--quiet", "HEAD")
-      for initial in ("base", "previous", "current"):
+      gc.write_text("before\n")
+      git("add", "gc")
+      gc.write_text("after\n")
+      (patches / "dart-joint-gc.patch").write_text(git("diff", "--", "gc"))
+      git("reset", "--quiet", "HEAD")
+      for initial, gc_initial in (("base", "upstream"), ("previous", "before"),
+                                  ("current", "before"), ("current", "after")):
         source.write_text(initial + "\n")
         ffi.write_text("before\n")
+        gc.write_text(gc_initial + "\n")
         (repo / "unrelated").write_text("keep\n")
         apply_all(repo, root)
         apply_all(repo, root)
         self.assertEqual(source.read_text(), "current\n")
         self.assertEqual(ffi.read_text(), "after\n")
+        self.assertEqual(gc.read_text(), "after\n")
         self.assertEqual((repo / "unrelated").read_text(), "keep\n")
+      gc.write_text("conflicting edit\n")
+      with self.assertRaises(subprocess.CalledProcessError):
+        apply_all(repo, root)
+      self.assertEqual(source.read_text(), "current\n")
+      self.assertEqual(ffi.read_text(), "after\n")
+      self.assertEqual(gc.read_text(), "conflicting edit\n")
+      self.assertEqual((repo / "unrelated").read_text(), "keep\n")
 
 
 if __name__ == "__main__":
