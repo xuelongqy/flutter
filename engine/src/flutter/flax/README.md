@@ -50,7 +50,13 @@ python3 engine/src/flutter/flax/tools/build_engine.py --sdk /path/to/verified/v8
 The helper verifies the SDK manifest and library hashes and applies the Dart
 patch. DEPS also applies this patch after syncing the exact Dart revision.
 Repeated application is safe; a wrong revision or conflict fails without
-resetting local edits. Verify those boundaries with:
+resetting local edits.
+
+The macOS Debug target keeps the Debug runtime, JIT, Dart assertions, VM Service and
+hot reload, while using the engine's optimized compiler defaults. Android and
+iOS simulator Debug targets retain `--unoptimized` and `--dart-debug`.
+
+Verify the SDK and patch boundaries with:
 
 ```sh
 python3 engine/src/flutter/flax/tools/test_apply_dart_patch.py

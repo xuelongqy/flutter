@@ -69,7 +69,7 @@ def main() -> None:
       'flax_v8_sdk="' + sdk + '" flax_system_cxx=true mac_deployment_target="15.0.0"' +
       (' ios_deployment_target="16.3"' if ios else '')
   ]
-  if args.mode == "debug":
+  if args.mode == "debug" and args.target != "macos-arm64":
     command += ["--unoptimized", "--dart-debug"]
   subprocess.run(command, cwd=source, env=env, check=True)
   # Ninja may regenerate GN output once more before reading compile commands.
