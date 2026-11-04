@@ -1,3 +1,6 @@
+#ifndef FLUTTER_FLAX_NATIVE_INCLUDE_FLAX_ENGINE_WORKERS_H_
+#define FLUTTER_FLAX_NATIVE_INCLUDE_FLAX_ENGINE_WORKERS_H_
+// Preserve the shared guard when engine and companion copies are included.
 #ifndef FLAX_ENGINE_WORKERS_H_
 #define FLAX_ENGINE_WORKERS_H_
 #include "runtime.h"
@@ -21,4 +24,5 @@ const FlaxEngineWorkersApi* flax_engine_get_workers_api(uint32_t version);
 #ifdef __cplusplus
 }
 #endif
-#endif
+#endif  // FLAX_ENGINE_WORKERS_H_
+#endif  // FLUTTER_FLAX_NATIVE_INCLUDE_FLAX_ENGINE_WORKERS_H_

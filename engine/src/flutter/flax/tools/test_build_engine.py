@@ -24,9 +24,8 @@ class BuildEngineTest(unittest.TestCase):
         ("ios-device-arm64", "release", "ios", False),
     )
     # Require the caller's workspace temp root instead of falling back to /tmp.
-    with tempfile.TemporaryDirectory(
-        prefix="flax-build-engine-", dir=os.environ["TMPDIR"]
-    ) as directory:
+    with tempfile.TemporaryDirectory(prefix="flax-build-engine-",
+                                     dir=os.environ["TMPDIR"]) as directory:
       root = Path(directory).resolve()
       source = root / "engine/src"
       flax = source / "flutter/flax"
@@ -37,24 +36,27 @@ class BuildEngineTest(unittest.TestCase):
           simulator = target == "ios-simulator-arm64"
           output = source / "out" / f"flax_{platform}_{mode}_{'sim_' if simulator else ''}arm64"
           output.mkdir(parents=True)
-          argv = [str(script), "--sdk", str(sdk), "--target", target,
-                  "--mode", mode, "--configure-only"]
+          argv = [
+              str(script), "--sdk",
+              str(sdk), "--target", target, "--mode", mode, "--configure-only"
+          ]
           # Python 3.11 is simulated only for Android command generation.
-          with (
-              mock.patch.object(build_engine, "__file__", str(script)),
-              mock.patch.object(sys, "argv", argv),
-              mock.patch.object(sys, "version_info", (3, 11, 0, "final", 0)),
-              mock.patch.object(build_engine, "apply_all") as apply_all,
-              mock.patch.object(build_engine.subprocess, "run") as run,
-              mock.patch.object(build_engine.subprocess, "check_output", return_value="3.11\n"),
-          ):
+          with mock.patch.object(build_engine, "__file__", str(script)), \
+              mock.patch.object(sys, "argv", argv), \
+              mock.patch.object(sys, "version_info", (3, 11, 0, "final", 0)), \
+              mock.patch.object(build_engine, "apply_all") as apply_all, \
+              mock.patch.object(build_engine.subprocess, "run") as run, \
+              mock.patch.object(build_engine.subprocess, "check_output", return_value="3.11\n"):
             build_engine.main()
 
           apply_all.assert_called_once_with(source / "flutter/third_party/dart", flax)
           self.assertEqual(run.call_count, 3)  # SDK check, GN, Ninja regeneration only.
           sdk_call, gn_call, ninja_call = run.call_args_list
-          self.assertEqual(sdk_call.args[0],
-                           [sys.executable, str(flax / "tools/sdk_info.py"), str(sdk), target])
+          self.assertEqual(
+              sdk_call.args[0],
+              [sys.executable, str(flax / "tools/sdk_info.py"),
+               str(sdk), target]
+          )
           command = gn_call.args[0]
           self.assertEqual(command[:2], [sys.executable, "flutter/tools/gn"])
           self.assertEqual(gn_call.kwargs["cwd"], source)

@@ -13,4 +13,4 @@ uint32_t flax_webgpu_renderer_supported(void);
 #ifdef __cplusplus
 }
 #endif
-#endif
+#endif  // FLUTTER_FLAX_NATIVE_INCLUDE_FLAX_ENGINE_WEBGPU_H_

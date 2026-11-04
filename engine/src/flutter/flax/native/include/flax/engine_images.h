@@ -24,4 +24,4 @@ Dart_Handle flax_image_dispatch(uint32_t operation,
 #ifdef __cplusplus
 }
 #endif
-#endif
+#endif  // FLUTTER_FLAX_NATIVE_INCLUDE_FLAX_ENGINE_IMAGES_H_

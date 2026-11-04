@@ -1,5 +1,6 @@
 // Internal macOS texture/fence protocol shared with the Dawn native package.
-#pragma once
+#ifndef FLUTTER_FLAX_NATIVE_INCLUDE_FLAX_DAWN_INTEROP_H_
+#define FLUTTER_FLAX_NATIVE_INCLUDE_FLAX_DAWN_INTEROP_H_
 #import <Metal/Metal.h>
 #import <objc/runtime.h>
 
@@ -15,3 +16,4 @@
 static inline id<FlaxDawnFrame> FlaxDawnFrameForTexture(id<MTLTexture> texture) {
   return objc_getAssociatedObject(texture, @selector(copyFlaxDawnMetalTexture));
 }
+#endif  // FLUTTER_FLAX_NATIVE_INCLUDE_FLAX_DAWN_INTEROP_H_
