@@ -4,9 +4,11 @@
 
 #import "flutter/shell/platform/darwin/macos/framework/Source/FlutterSurfaceManager.h"
 
+#import <CoreVideo/CoreVideo.h>
 #import <Metal/Metal.h>
 
 #include <algorithm>
+#include <atomic>
 
 #include "flutter/fml/logging.h"
 #import "flutter/shell/platform/darwin/macos/framework/Source/FlutterSurface.h"
@@ -19,7 +21,7 @@
   id<MTLCommandQueue> _commandQueue;
   CALayer* _containingLayer;
   __weak id<FlutterSurfaceManagerDelegate> _delegate;
-  BOOL _wideGamut;
+  std::atomic<MTLPixelFormat> _pixelFormat;
 
   // Available (cached) back buffer surfaces. These will be cleared during
   // present and replaced by current frong surfaces.
@@ -59,6 +61,21 @@ static NSColor* GetBorderColorForLayer(int layer) {
   return colors[layer % colors.count];
 }
 
+static void SetSurfaceContents(CALayer* layer, IOSurfaceRef surface) {
+#if defined(FLAX_ENABLE_METAL_INTEROP)
+  if (@available(macOS 26.0, *)) {
+    // Core Animation applies the dynamic range to the layer owning the contents.
+    CADynamicRange range = IOSurfaceGetPixelFormat(surface) == kCVPixelFormatType_64RGBAHalf
+                               ? CADynamicRangeHigh
+                               : CADynamicRangeStandard;
+    if (![layer.preferredDynamicRange isEqualToString:range]) {
+      layer.preferredDynamicRange = range;
+    }
+  }
+#endif
+  layer.contents = (__bridge id)surface;
+}
+
 /// Creates sublayers for given layer, each one displaying a portion of the
 /// of the surface determined by a rectangle in the provided paint region.
 static void UpdateContentSubLayers(CALayer* layer,
@@ -96,7 +113,7 @@ static void UpdateContentSubLayers(CALayer* layer,
       subLayer.borderWidth = 1.0;
     }
 
-    subLayer.contents = (__bridge id)surface;
+    SetSurfaceContents(subLayer, surface);
   }
 }
 
@@ -112,7 +129,7 @@ static void UpdateContentSubLayers(CALayer* layer,
     _commandQueue = commandQueue;
     _containingLayer = containingLayer;
     _delegate = delegate;
-    _wideGamut = wideGamut;
+    _pixelFormat = wideGamut ? MTLPixelFormatBGRA10_XR : MTLPixelFormatBGRA8Unorm;
     _backBufferCache = [[FlutterBackBufferCache alloc] init];
     _frontSurfaces = [NSMutableArray array];
     _layers = [NSMutableArray array];
@@ -121,11 +138,14 @@ static void UpdateContentSubLayers(CALayer* layer,
 }
 
 - (void)setEnableWideGamut:(BOOL)enableWideGamut {
+  [self setPixelFormat:enableWideGamut ? MTLPixelFormatBGRA10_XR : MTLPixelFormatBGRA8Unorm];
+}
+
+- (void)setPixelFormat:(MTLPixelFormat)pixelFormat {
   FML_DCHECK([NSThread isMainThread]);
-  if (_wideGamut == enableWideGamut) {
+  if (_pixelFormat.exchange(pixelFormat, std::memory_order_relaxed) == pixelFormat) {
     return;
   }
-  _wideGamut = enableWideGamut;
 
   // Flush cached surfaces since they have the wrong pixel format.
   [_backBufferCache flush];
@@ -147,11 +167,16 @@ static void UpdateContentSubLayers(CALayer* layer,
 }
 
 - (FlutterSurface*)surfaceForSize:(CGSize)size {
-  FlutterSurface* surface = [_backBufferCache removeSurfaceForSize:size];
-  if (surface == nil) {
-    surface = [[FlutterSurface alloc] initWithSize:size device:_device enableWideGamut:_wideGamut];
+  for (;;) {
+    MTLPixelFormat format = _pixelFormat.load(std::memory_order_relaxed);
+    FlutterSurface* surface = [_backBufferCache removeSurfaceForSize:size];
+    if (surface == nil || surface.pixelFormat != format) {
+      surface = [[FlutterSurface alloc] initWithSize:size device:_device pixelFormat:format];
+    }
+    if (_pixelFormat.load(std::memory_order_relaxed) == format) {
+      return surface;
+    }
   }
-  return surface;
 }
 
 - (BOOL)enableSurfaceDebugInfo {
@@ -168,10 +193,9 @@ static void UpdateContentSubLayers(CALayer* layer,
 - (void)commit:(NSArray<FlutterSurfacePresentInfo*>*)surfaces {
   FML_DCHECK([NSThread isMainThread]);
 
-  // Check if incoming surfaces match current wide gamut mode.
-  // If not, discard them by returning early - they will be released.
+  MTLPixelFormat format = _pixelFormat.load(std::memory_order_relaxed);
   for (FlutterSurfacePresentInfo* info in surfaces) {
-    if (info.surface.isWideGamut != _wideGamut) {
+    if (info.surface.pixelFormat != format) {
       return;
     }
   }
@@ -206,7 +230,7 @@ static void UpdateContentSubLayers(CALayer* layer,
     if (i == 0) {
       layer.frame = CGRectMake(info.offset.x / scale, info.offset.y / scale,
                                info.surface.size.width / scale, info.surface.size.height / scale);
-      layer.contents = (__bridge id)info.surface.ioSurface;
+      SetSurfaceContents(layer, info.surface.ioSurface);
     } else {
       layer.frame = CGRectZero;
       NSColor* borderColor = enableSurfaceDebugInfo ? GetBorderColorForLayer(i - 1) : nil;

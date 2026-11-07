@@ -6,6 +6,7 @@
 #define FLUTTER_SHELL_PLATFORM_DARWIN_MACOS_FRAMEWORK_SOURCE_FLUTTERSURFACE_H_
 
 #import <Cocoa/Cocoa.h>
+#import <Metal/Metal.h>
 
 #import "flutter/shell/platform/embedder/embedder.h"
 
@@ -29,15 +30,14 @@
 
 - (nonnull instancetype)initWithSize:(CGSize)size
                               device:(nonnull id<MTLDevice>)device
-                     enableWideGamut:(BOOL)enableWideGamut;
+                         pixelFormat:(MTLPixelFormat)pixelFormat;
 
 @property(readonly, nonatomic, nonnull) IOSurfaceRef ioSurface;
 @property(readonly, nonatomic) CGSize size;
 @property(readonly, nonatomic) int64_t textureId;
 // Whether the surface is currently in use by the compositor.
 @property(readonly, nonatomic) BOOL isInUse;
-// Whether the surface was created with wide gamut enabled.
-@property(readonly, nonatomic) BOOL isWideGamut;
+@property(readonly, nonatomic) MTLPixelFormat pixelFormat;
 
 @end
 

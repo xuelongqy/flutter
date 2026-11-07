@@ -230,6 +230,19 @@ struct MouseState {
   [_flutterView setBackgroundColor:color];
 }
 
+#if defined(FLAX_ENABLE_METAL_INTEROP)
+- (void)viewDidMoveToWindow {
+  [super viewDidMoveToWindow];
+  if (self.window != nil) {
+    FlutterViewController* controller = _controller;
+    [controller updateWideGamutForScreen];
+    if (controller.engine.running) {
+      [controller viewDidReshape:_flutterView];
+    }
+  }
+}
+#endif
+
 - (BOOL)performKeyEquivalent:(NSEvent*)event {
   // Do not intercept the event if flutterView is not first responder, otherwise this would
   // interfere with TextInputPlugin, which also handles key equivalents.
@@ -395,8 +408,8 @@ static void CommonInit(FlutterViewController* controller, FlutterEngine* engine)
   }
   FlutterViewWrapper* wrapperView = [[FlutterViewWrapper alloc] initWithFlutterView:flutterView
                                                                          controller:self];
-  self.view = wrapperView;
   _flutterView = flutterView;
+  self.view = wrapperView;
 }
 
 - (void)viewDidLoad {
@@ -817,7 +830,7 @@ static void CommonInit(FlutterViewController* controller, FlutterEngine* engine)
 }
 
 - (void)updateWideGamutForScreen {
-  if (!self.enableWideGamut) {
+  if (!self.viewLoaded || !self.enableWideGamut) {
     return;
   }
   NSScreen* screen = self.view.window.screen;
@@ -825,6 +838,17 @@ static void CommonInit(FlutterViewController* controller, FlutterEngine* engine)
     return;
   }
   BOOL screenSupportsP3 = [screen canRepresentDisplayGamut:NSDisplayGamutP3];
+#if defined(FLAX_ENABLE_METAL_INTEROP)
+  if (@available(macOS 26.0, *)) {
+    CFTypeRef optIn = (__bridge CFTypeRef)
+        [NSBundle.mainBundle objectForInfoDictionaryKey:@"FLTEnableExtendedDynamicRange"];
+    if (screenSupportsP3 && optIn == kCFBooleanTrue &&
+        screen.maximumPotentialExtendedDynamicRangeColorComponentValue > 1.0) {
+      [self.flutterView.surfaceManager setPixelFormat:MTLPixelFormatRGBA16Float];
+      return;
+    }
+  }
+#endif
   [self.flutterView setEnableWideGamut:screenSupportsP3];
 }
 
