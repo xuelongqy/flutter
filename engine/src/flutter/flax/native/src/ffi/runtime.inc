@@ -105,7 +105,7 @@ struct State : std::enable_shared_from_this<State> {
   uint64_t nextFinalizer = 1;
   void wake();
   void metadataChanged() { metadataDirty = true; wake(); }
-  void sweep(size_t limit = 128, bool finishAll = false);
+  void sweep(size_t limit = 128, bool finishAll = false, bool detachPeers = true);
   void checkpoint();
   void drain(fbjsi::Runtime &js);
   void close();
@@ -526,6 +526,27 @@ std::shared_ptr<Binding> boundFunction(fbjsi::Runtime &js, State &state,
   checkOpen(js, state, *peer->binding->library);
   return peer->binding;
 }
+fbjsi::Value ownedArrayBuffer(fbjsi::Runtime& js, State& state,
+                              const fbjsi::Value* args, size_t count) {
+  if (count != 4)
+    fail(js, "Expected address, byte length, native cleanup and cleanup token");
+  auto address = pointer(js, args[0], true);
+  auto length = checkedSize(js, args[1]);
+  if (!address || !length)
+    fail(js, "Owned ArrayBuffer requires nonempty native storage");
+  range(js, address, length);
+  auto cleanup = boundFunction(js, state, args[2]);
+  if (cleanup->result->kind != Type::Void || cleanup->arguments.size() != 1 ||
+      cleanup->arguments[0]->kind != Type::Pointer)
+    fail(js, "Owned ArrayBuffer cleanup requires a bound void(pointer) function");
+  auto token = pointer(js, args[3]);
+  auto image = cleanup->library->image;
+  auto storage = std::make_shared<OwnedByteView>(
+      address, length, token, image ? image->shared : nullptr);
+  fbjsi::ArrayBuffer result(js, storage);
+  storage->cleanup = reinterpret_cast<void (*)(void*)>(cleanup->address);
+  return result;
+}
 void *symbol(fbjsi::Runtime &js, const std::shared_ptr<Library> &library,
              const std::string &name, bool required = true) {
   ::dlerror();
@@ -724,7 +745,7 @@ void State::wake() {
 #endif
   }
 }
-void State::sweep(size_t limit, bool finishAll) {
+void State::sweep(size_t limit, bool finishAll, bool detachPeers) {
   if (sweeping) return;
   sweeping = true;
 #if defined(FLAX_FFI_TESTING)
@@ -746,7 +767,7 @@ void State::sweep(size_t limit, bool finishAll) {
       if (found == finalizers.end()) continue; // A successful detach consumed it.
       auto record = found->second;
       try {
-        record->releasePeer(*js);
+        record->releasePeer(*js, detachPeers);
       } catch (...) {
         std::lock_guard<std::mutex> lock(queueMutex);
         readyFinalizers.push_front(id);
@@ -782,6 +803,10 @@ void State::sweep(size_t limit, bool finishAll) {
 void State::checkpoint() {
   // Clear before draining so a concurrent producer can schedule the next turn.
   wakePending = false;
+  if (runtime && runtime->detached && retiring) {
+    retire(false);
+    return;
+  }
   try {
     if (!retiring) drain(*js);
     sweep();
@@ -826,14 +851,30 @@ bool State::retire(bool reportCallbackErrors) {
   cancelDeliveries();
   if (sweeping || ownerCalls || (executingCallback && executingCallback->state.lock().get() == this))
     return false;
+  const bool detached = runtime && runtime->detached;
+  if (detached) retiring = true;
   // Stop producers before waiting: an active call may itself wait for stop/join.
   for (auto &[address, callback] : callbacks) callback->stopProducer();
   if (!asyncCalls.empty()) {
-    const auto pending = asyncCalls.size();
-    completeCalls(*js);
-    // Promise settlements must run before finalizers and VM destruction.
-    if (asyncCalls.size() != pending) wake();
-    return false;
+    if (detached) {
+      for (auto& call : asyncCalls) call->cancelled = true;
+      for (auto it = asyncCalls.begin(); it != asyncCalls.end();) {
+        auto& call = *it;
+        if (!call->done) { ++it; continue; }
+        call->worker.join();
+        call->discardResult();
+        --call->binding->library->active;
+        if (call->discard) --call->discard->library->active;
+        it = asyncCalls.erase(it);
+      }
+      if (!asyncCalls.empty()) return false;
+    } else {
+      const auto pending = asyncCalls.size();
+      completeCalls(*js);
+      // Promise settlements must run before finalizers and VM destruction.
+      if (asyncCalls.size() != pending) wake();
+      return false;
+    }
   }
   retiring = true;
   for (auto &entry : libraries)
@@ -843,7 +884,7 @@ bool State::retire(bool reportCallbackErrors) {
   for (auto &[address, callback] : callbacks)
     if (callback->active)
       return false;
-  if (reportCallbackErrors) {
+  if (reportCallbackErrors && !detached) {
     try {
       drain(*js);
     } catch (...) {
@@ -852,7 +893,8 @@ bool State::retire(bool reportCallbackErrors) {
       throw;
     }
   }
-  sweep(reportCallbackErrors ? 128 : std::numeric_limits<size_t>::max(), true);
+  sweep(reportCallbackErrors ? 128 : std::numeric_limits<size_t>::max(), true,
+        !detached);
   if (!finalizers.empty()) { wake(); return false; }
   closed = true;
   port = ILLEGAL_PORT;

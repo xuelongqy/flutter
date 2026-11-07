@@ -206,7 +206,8 @@ bool serializeWorker(v8::Isolate* isolate,
                      v8::Local<v8::Value> value,
                      v8::Local<v8::Array> list,
                      WorkerPacket& packet,
-                     v8::Local<v8::Function> host) {
+                     v8::Local<v8::Function> host,
+                     v8::Local<v8::Function> precommit) {
   auto context = isolate->GetCurrentContext();
   auto mapping = v8::Private::ForApi(
       isolate, v8::String::NewFromUtf8Literal(isolate, "flax.webgpu.mapping"));
@@ -247,16 +248,24 @@ bool serializeWorker(v8::Isolate* isolate,
   serializer.WriteHeader();
   if (!serializer.WriteValue(context, value).FromMaybe(false))
     return false;
-  // Getters can reenter postMessage and detach a transfer while serializing.
-  for (auto buffer : buffers) {
-    if (!transferable(buffer)) {
-      workerCloneError(
-          isolate,
-          v8::String::NewFromUtf8Literal(
-              isolate, "Transfer buffer changed during serialization"));
-      return false;
+  auto validateBuffers = [&] {
+    for (auto buffer : buffers) {
+      if (!transferable(buffer)) {
+        workerCloneError(
+            isolate,
+            v8::String::NewFromUtf8Literal(
+                isolate, "Transfer buffer changed during serialization"));
+        return false;
+      }
     }
-  }
+    return true;
+  };
+  // Getters can reenter postMessage or acquire a canvas context while cloning.
+  if (!validateBuffers()) return false;
+  if (!precommit.IsEmpty() &&
+      precommit->Call(context, v8::Undefined(isolate), 0, nullptr).IsEmpty())
+    return false;
+  if (!validateBuffers()) return false;
   auto released = serializer.Release();
   packet.bytes.reset(released.first);
   packet.length = released.second;
@@ -293,8 +302,11 @@ void workerClone(const v8::FunctionCallbackInfo<v8::Value>& args) {
     return;
   WorkerPacket packet;
   auto* isolate = args.GetIsolate();
+  auto precommit = args.Length() > 4 && args[4]->IsFunction()
+                       ? args[4].As<v8::Function>()
+                       : v8::Local<v8::Function>();
   if (!serializeWorker(isolate, args[0], args[1].As<v8::Array>(), packet,
-                       args[2].As<v8::Function>()))
+                       args[2].As<v8::Function>(), precommit))
     return;
   v8::Local<v8::Value> result;
   if (deserializeWorker(isolate, packet, args[3].As<v8::Function>())
@@ -405,7 +417,11 @@ void workerPost(const v8::FunctionCallbackInfo<v8::Value>& args) {
   auto host = args.Length() > 4 && args[4]->IsFunction()
                   ? args[4].As<v8::Function>()
                   : v8::Local<v8::Function>();
-  if (!serializeWorker(isolate, args[2], args[3].As<v8::Array>(), packet, host))
+  auto precommit = args.Length() > 5 && args[5]->IsFunction()
+                       ? args[5].As<v8::Function>()
+                       : v8::Local<v8::Function>();
+  if (!serializeWorker(isolate, args[2], args[3].As<v8::Array>(), packet, host,
+                       precommit))
     return;
   std::lock_guard lock(workersMutex);
   auto found = workerChannels.find(id);
@@ -488,6 +504,12 @@ void installWorkerBridge(facebook::jsi::Runtime& runtime, int64_t port) {
   V8Scope scope(state);
   auto context = state->getContextLocal();
   auto bridge = v8::Object::New(state->isolate);
+  bridge
+      ->Set(context,
+            v8::String::NewFromUtf8Literal(state->isolate,
+                                          "canvasTransferVersion"),
+            v8::Integer::New(state->isolate, 1))
+      .Check();
   for (auto entry :
        {std::pair{"post", workerPost}, std::pair{"take", workerTake},
         std::pair{"clone", workerClone},
