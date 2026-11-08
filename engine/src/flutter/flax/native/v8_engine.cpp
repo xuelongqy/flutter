@@ -69,6 +69,18 @@ JointCell* bindDartPeer(facebook::jsi::Runtime& runtime,
 void releaseDartPeer(facebook::jsi::Runtime& runtime, JointCell* cell) {
   v8rt_internal::releaseDartPeer(jsi::abi::getAbiRuntime(runtime), cell);
 }
+bool bindOwnedDartPeer(facebook::jsi::Runtime& runtime,
+                       const facebook::jsi::Object& object,
+                       Dart_Handle target) {
+  return v8rt_internal::bindOwnedDartPeer(
+      jsi::abi::getAbiRuntime(runtime), jsi::abi::getAbiObject(runtime, object),
+      target);
+}
+bool unlinkOwnedDartPeer(facebook::jsi::Runtime& runtime,
+                         const facebook::jsi::Object& object) {
+  return v8rt_internal::unlinkOwnedDartPeer(
+      jsi::abi::getAbiRuntime(runtime), jsi::abi::getAbiObject(runtime, object));
+}
 uint64_t jointCellCount(facebook::jsi::Runtime& runtime) {
   return v8rt_internal::jointCellCount(jsi::abi::getAbiRuntime(runtime));
 }

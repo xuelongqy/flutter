@@ -37,6 +37,11 @@ JointCell* bindDartPeer(facebook::jsi::Runtime&,
                         void (*cleanup)(void*) = nullptr,
                         void* data = nullptr);
 void releaseDartPeer(facebook::jsi::Runtime&, JointCell*);
+bool bindOwnedDartPeer(facebook::jsi::Runtime&,
+                       const facebook::jsi::Object&,
+                       Dart_Handle target);
+bool unlinkOwnedDartPeer(facebook::jsi::Runtime&,
+                         const facebook::jsi::Object&);
 uint64_t jointCellCount(facebook::jsi::Runtime&);
 void closeEngineRuntime(facebook::jsi::Runtime&);
 void notifyEngineWork(facebook::jsi::Runtime&);

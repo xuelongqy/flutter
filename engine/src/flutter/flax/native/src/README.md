@@ -39,8 +39,8 @@ at host checkpoints. Dart-owned shared-buffer leases and object peers are reject
 Native channel interruption precedes runtime disposal and never calls Dart from a
 foreign thread. Ordinary runtime creation retains its Flutter UI isolate check.
 
-Ordinary V8 external-memory collection requests coalesce their Dart follow-ups for
-8 ms on the owner runner. This avoids a full Dart pass for every transferred buffer.
+In the staged comparison mode, ordinary V8 external-memory collection requests
+coalesce their Dart follow-ups for 8 ms on the owner runner. This avoids a full Dart pass for every transferred buffer.
 V8 accounting/collection, ordinary JS allocation pressure, forced/last-resort
 collections and direct Dart requests keep their existing paths. An actual Dart trace
 cancels pending external work, and the delayed task holds only a weak heap reference.
@@ -51,3 +51,29 @@ Detached Worker Promise rejection callbacks queue native Promise/reason referenc
 release them when the owning host checkpoint drains the records. JS event handlers run
 after the microtask checkpoint. Error locations use captured exception frames rather
 than a new Message at the reporting helper.
+
+## One-way joint GC
+
+The collector uses one-way confirmation by default. The initial Pixel 4
+Android arm64 Release/AOT trial is recorded in
+`flax-joint-gc-one-way-20261108-1/TRIAL.md`.
+`../../tools/apply_dart_patch.py` reconstructs the tested Dart VM from the SDK
+revision in `../../patches/dart_revision`. The consolidated `dart.patch` applies
+to that upstream revision. `dart-joint-gc.patch` upgrades the same revision
+with the maintained Flax patches already applied.
+
+Owner-local Dart collections keep JS-to-Dart targets and trace their Dart
+references normally. They post a coalesced owner request. JS activity and
+Flutter idle notifications share its one-second confirmation window. A recent
+frame postpones idle-only work for one second. An eligible V8 major can run
+fresh staged Dart marking before the deadline. The gate admits the UI isolate
+with at most one eligible Dart Worker in the same group. Failed admission
+preserves the peers and retries. After a further one-second grace period, the
+owner can run staged joint collection from a safe task outside Dart and JS
+jobs. The fallback forces a JS pass for wrappers whose Dart targets still
+have roots. Aborted passes and requests received during collection queue a
+fresh batch.
+
+The private `flax_experiment_incremental_joint(1)` call acknowledges the
+default policy for existing comparison fixtures. Mode `0` selects the staged
+control before binding bridge peers.

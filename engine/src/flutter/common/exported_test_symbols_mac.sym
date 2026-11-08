@@ -10,6 +10,8 @@ _LookupEntryPoint
 _ForceShutdownIsolate
 _flax_engine_get_api
 _flax_engine_get_gc_api
+_flax_engine_bind_owned_peer
+_flax_engine_unlink_owned_peer
 _flax_engine_get_binding_api
 _flax_get_engine_execution_api
 _flax_engine_get_ffi_api
