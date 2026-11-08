@@ -9,15 +9,11 @@
     JNI_OnLoad;
     flax_engine_get_api;
     flax_engine_get_gc_api;
-    flax_experiment_incremental_joint;
     flax_engine_get_binding_api;
     flax_get_engine_execution_api;
     flax_engine_get_modules_api;
-    flax_engine_get_workers_api;
     flax_canvas_version;
     flax_canvas_dispatch;
-    flax_image_version;
-    flax_image_dispatch;
     _binary_icudtl_dat_start;
     _binary_icudtl_dat_size;
     InternalFlutterGpu*;

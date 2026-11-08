@@ -1128,25 +1128,6 @@ v8::Local<v8::Function> JsiRuntimeState::getHostObjectConstructor() {
 //==============================================================================
 
 struct V8Scope {
-  struct ForegroundGCReservation {
-    explicit ForegroundGCReservation(const JsiRuntimeState* state)
-        : heap(state ? state->heap.get() : nullptr) {
-      if (heap) {
-        // A signaled task can start and finish marking within this pump.
-        heap->TryReserveForegroundGC(
-            state->wakeup &&
-            state->wakeup->pending.load(std::memory_order_acquire));
-      }
-    }
-    ~ForegroundGCReservation() { Release(); }
-    void Release() {
-      if (heap) std::exchange(heap, nullptr)->ReleaseForegroundGC();
-    }
-    flax::JointHeap* heap;
-  };
-
-  // Reserve with neither the V8 Locker nor a Dart GC safepoint held.
-  ForegroundGCReservation foreground_gc;
   // Order matters: Locker must be acquired before any other scope when the
   // isolate is shared across threads.
   std::optional<v8::Locker> locker;
@@ -1156,8 +1137,7 @@ struct V8Scope {
   flax::JointHeap* heap;
 
   V8Scope(JsiRuntimeState* state)
-      : foreground_gc(depth == 0 ? state : nullptr),
-        locker(makeLocker(state)),
+      : locker(makeLocker(state)),
         isolate_scope(state->isolate),
         handle_scope(state->isolate),
         context_scope(state->getContextLocal()),
@@ -1166,12 +1146,7 @@ struct V8Scope {
     if (depth++ == 0) {
       if (state->wakeup)
         state->wakeup->pending = false;
-      struct ResetForegroundPump {
-        ~ResetForegroundPump() { foreground_pump_isolate = nullptr; }
-      } reset_foreground_pump;
-      foreground_pump_isolate = state->isolate;
       v8rt::V8PlatformHolder::pumpForegroundTasks(state->isolate);
-      foreground_gc.Release();
     }
   }
 
@@ -1181,7 +1156,6 @@ struct V8Scope {
   }
 
   static thread_local unsigned depth;
-  static thread_local v8::Isolate* foreground_pump_isolate;
 
  private:
   static std::optional<v8::Locker> makeLocker(JsiRuntimeState* state) {
@@ -1192,7 +1166,6 @@ struct V8Scope {
 };
 
 thread_local unsigned V8Scope::depth = 0;
-thread_local v8::Isolate* V8Scope::foreground_pump_isolate = nullptr;
 
 //==============================================================================
 // Host Function Wrapper
@@ -3648,11 +3621,6 @@ v8_jsi_config_set_task_runner(jsi_config config,
 #endif
 
 namespace flax {
-
-bool JointHeap::InOutermostForegroundPump(v8::Isolate* isolate) {
-  return V8Scope::depth == 1 && V8Scope::foreground_pump_isolate == isolate;
-}
-
 void numericHostFunction(
     facebook::jsi::Runtime& runtime,
     const facebook::jsi::Function& function,

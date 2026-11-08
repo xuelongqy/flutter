@@ -51,24 +51,3 @@ Detached Worker Promise rejection callbacks queue native Promise/reason referenc
 release them when the owning host checkpoint drains the records. JS event handlers run
 after the microtask checkpoint. Error locations use captured exception frames rather
 than a new Message at the reporting helper.
-
-## One-way joint GC experiment
-
-This isolated branch packages the Pixel 4 Android arm64 Release/AOT prototype.
-The local trial record is `flax-joint-gc-one-way-20261108-1/TRIAL.md`.
-`../../tools/apply_dart_patch.py` reconstructs the tested Dart VM from the SDK
-revision in `../../patches/dart_revision`. The consolidated `dart.patch` applies
-to that upstream revision. `dart-joint-gc.patch` upgrades the same revision
-with the maintained Flax patches already applied.
-
-The one-way policy is opt-in. On the owning UI isolate, call
-`flax_experiment_incremental_joint(1)` once after creating the Flax runtime
-and before starting the workload. A return value of `1` confirms selection.
-Mode `0` selects the staged control in the same engine.
-
-Ordinary Dart collections guard bridge peers and post a coalesced owner request.
-An eligible V8 major runs fresh staged Dart marking. After one second the owner
-attempts a deadline major. The r3 gate admits the UI isolate with at most one
-eligible Dart Worker in the same group. Failed admission preserves the peers
-and retries. Reclamation can be postponed while multiple same-group Workers
-remain active.

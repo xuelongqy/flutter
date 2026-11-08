@@ -144,7 +144,7 @@ index ecff06a6..467fad02 100644
  
    if (is_fuchsia) {
 diff --git a/runtime/vm/dart_api_impl.cc b/runtime/vm/dart_api_impl.cc
-index ac526ee0..38806aa6 100644
+index ac526ee0..77509519 100644
 --- a/runtime/vm/dart_api_impl.cc
 +++ b/runtime/vm/dart_api_impl.cc
 @@ -3,6 +3,7 @@
@@ -155,16 +155,7 @@ index ac526ee0..38806aa6 100644
  #include "include/dart_native_api.h"
  
  #include <cstring>
-@@ -31,6 +32,8 @@
- #include "vm/exceptions.h"
- #include "vm/flags.h"
- #include "vm/growable_array.h"
-+#include "vm/heap/marker.h"
-+#include "vm/heap/safepoint.h"
- #include "vm/heap/verifier.h"
- #include "vm/image_snapshot.h"
- #include "vm/isolate_reload.h"
-@@ -69,6 +72,7 @@
+@@ -69,6 +70,7 @@
  #endif  // !defined(DART_PRECOMPILED_RUNTIME)
  
  namespace dart {
@@ -172,7 +163,7 @@ index ac526ee0..38806aa6 100644
  
  // Facilitate quick access to the current zone once we have the current thread.
  #define Z (T->zone())
-@@ -1071,6 +1075,69 @@ Dart_NewFinalizableHandle(Dart_Handle object,
+@@ -1071,6 +1073,41 @@ Dart_NewFinalizableHandle(Dart_Handle object,
                                     callback);
  }
  
@@ -190,9 +181,7 @@ index ac526ee0..38806aa6 100644
 +  CHECK_ISOLATE_GROUP(T->isolate_group());
 +  TransitionToVM transition(T);
 +  auto* state = T->isolate_group()->api_state();
-+  if (state->flax_owner() != T || state->flax_epoch() != 0 ||
-+      state->flax_callback_active())
-+    return false;
++  if (state->flax_owner() != T) return false;
 +  return state->RegisterFlaxHandle(handle, is_origin);
 +}
 +
@@ -213,36 +202,10 @@ index ac526ee0..38806aa6 100644
 +  }
 +}
 +
-+DART_EXPORT bool Dart_FlaxGCCheckpoint(
-+    Dart_FlaxGCEpoch epoch,
-+    const Dart_WeakPersistentHandle* targets,
-+    intptr_t target_count,
-+    void (*origin_sink)(void*, Dart_WeakPersistentHandle),
-+    void* peer,
-+    bool* all_targets_marked) {
-+  Thread* T = Thread::Current();
-+  CHECK_ISOLATE_GROUP(T->isolate_group());
-+  RELEASE_ASSERT(T->execution_state() == Thread::kThreadInVM);
-+  RELEASE_ASSERT(!T->OwnsGCSafepoint());
-+  RELEASE_ASSERT(target_count >= 0 &&
-+                 (target_count == 0 || targets != nullptr));
-+  NoActiveIsolateScope no_active_isolate_scope(T);
-+  GcSafepointOperationScope safepoint_operation(T);
-+  auto* api = T->isolate_group()->api_state();
-+  // Acquisition can first park us for a foreign/minor GC. Revalidate here,
-+  // before ever loading a visitor or dereferencing an epoch's raw origin index.
-+  if (epoch == 0 || api->flax_epoch() != epoch || api->flax_owner() != T ||
-+      !api->flax_callback_active())
-+    return false;
-+  TIMELINE_FUNCTION_GC_DURATION(T, "FlaxMarkCheckpoint");
-+  return T->heap()->old_space()->marker()->FlaxCheckpoint(
-+      targets, target_count, origin_sink, peer, all_targets_marked);
-+}
-+
  DART_EXPORT void Dart_DeletePersistentHandle(Dart_PersistentHandle object) {
    Thread* T = Thread::Current();
    IsolateGroup* isolate_group = T->isolate_group();
-@@ -1404,6 +1471,7 @@ DART_EXPORT void Dart_ShutdownIsolate() {
+@@ -1404,6 +1441,7 @@ DART_EXPORT void Dart_ShutdownIsolate() {
      StackZone zone(T);
      Dart::RunShutdownCallback();
    }
@@ -250,7 +213,7 @@ index ac526ee0..38806aa6 100644
    Dart::ShutdownIsolate(T);
  }
  
-@@ -5790,6 +5858,277 @@ static Dart_Handle GetTypeCommon(Dart_Handle library,
+@@ -5790,6 +5828,277 @@ static Dart_Handle GetTypeCommon(Dart_Handle library,
    return Api::NewHandle(T, type.ptr());
  }
  
@@ -528,7 +491,7 @@ index ac526ee0..38806aa6 100644
  DART_EXPORT Dart_Handle Dart_GetType(Dart_Handle library,
                                       Dart_Handle class_name,
                                       intptr_t number_of_type_arguments,
-@@ -7258,3 +7597,154 @@ void ThrowCantRunWithoutIsolateError() {
+@@ -7258,3 +7567,154 @@ void ThrowCantRunWithoutIsolateError() {
  }
  
  }  // namespace dart
@@ -684,7 +647,7 @@ index ac526ee0..38806aa6 100644
 +
 +}  // namespace dart
 diff --git a/runtime/vm/dart_api_state.h b/runtime/vm/dart_api_state.h
-index 394ac210..f481149b 100644
+index 394ac210..85524a4b 100644
 --- a/runtime/vm/dart_api_state.h
 +++ b/runtime/vm/dart_api_state.h
 @@ -5,7 +5,10 @@
@@ -698,7 +661,7 @@ index 394ac210..f481149b 100644
  #include "platform/utils.h"
  #include "vm/bitfield.h"
  #include "vm/dart_api_impl.h"
-@@ -726,9 +729,67 @@ class ApiState {
+@@ -726,9 +729,57 @@ class ApiState {
    }
    void FreeWeakPersistentHandle(FinalizablePersistentHandle* weak_ref) {
      MutexLocker ml(&mutex_);
@@ -734,7 +697,6 @@ index 394ac210..f481149b 100644
 +  bool SetFlaxCollector(Dart_FlaxCollector collector,
 +                        void* peer,
 +                        Thread* owner) {
-+    if (flax_epoch_ != 0 || flax_callback_active_) return false;
 +    if (flax_collector_ != nullptr && collector != nullptr) return false;
 +    if (flax_collector_ != nullptr && flax_owner_ != owner) return false;
 +    flax_collector_ = collector;
@@ -746,15 +708,6 @@ index 394ac210..f481149b 100644
 +  Dart_FlaxCollector flax_collector() const { return flax_collector_; }
 +  void* flax_peer() const { return flax_peer_; }
 +  Thread* flax_owner() const { return flax_owner_; }
-+  Dart_FlaxGCEpoch flax_epoch() const { return flax_epoch_; }
-+  void BeginFlaxEpoch() {
-+    RELEASE_ASSERT(flax_epoch_ == 0);
-+    RELEASE_ASSERT(++flax_epoch_counter_ != 0);
-+    flax_epoch_ = flax_epoch_counter_;
-+  }
-+  void EndFlaxEpoch() { flax_epoch_ = 0; }
-+  bool flax_callback_active() const { return flax_callback_active_; }
-+  void set_flax_callback_active(bool active) { flax_callback_active_ = active; }
 +  const auto& flax_handles() const { return flax_handles_; }
 +  void SetFlaxCollectionRequest(void (*request)(void*)) {
 +    flax_request_ = request;
@@ -766,7 +719,7 @@ index 394ac210..f481149b 100644
    bool IsValidPersistentHandle(Dart_PersistentHandle object) {
      MutexLocker ml(&mutex_);
      return persistent_handles_.IsValidHandle(object);
-@@ -781,6 +842,14 @@ class ApiState {
+@@ -781,6 +832,11 @@ class ApiState {
    PersistentHandles persistent_handles_;
    FinalizablePersistentHandles weak_persistent_handles_;
    WeakTable acquired_table_;
@@ -775,31 +728,28 @@ index 394ac210..f481149b 100644
 +  void* flax_peer_ = nullptr;
 +  Thread* flax_owner_ = nullptr;
 +  void (*flax_request_)(void*) = nullptr;
-+  Dart_FlaxGCEpoch flax_epoch_counter_ = 0;
-+  Dart_FlaxGCEpoch flax_epoch_ = 0;
-+  bool flax_callback_active_ = false;
  
    DISALLOW_COPY_AND_ASSIGN(ApiState);
  };
 diff --git a/runtime/vm/heap/marker.cc b/runtime/vm/heap/marker.cc
-index f58905a0..c54f7aaa 100644
 --- a/runtime/vm/heap/marker.cc
 +++ b/runtime/vm/heap/marker.cc
-@@ -4,6 +4,10 @@
- 
+@@ -3,6 +3,9 @@
+ // BSD-style license that can be found in the LICENSE file.
+
  #include "vm/heap/marker.h"
- 
-+#include <unordered_map>
-+#include <unordered_set>
-+#include <vector>
 +
++#include <unordered_map>
++#include <vector>
+
  #include "platform/assert.h"
  #include "platform/atomic.h"
- #include "platform/thread_sanitizer.h"
-@@ -59,6 +63,56 @@ class MarkingVisitor : public ObjectPointerVisitor {
+@@ -57,6 +60,55 @@
+   static bool IsMarked(ObjectPtr raw) {
+     ASSERT(raw->IsHeapObject());
      return raw->untag()->IsMarked();
-   }
- 
++  }
++
 +  void DrainFlaxMarking() {
 +    do {
 +      ProcessDeferredMarking();
@@ -818,7 +768,7 @@ index f58905a0..c54f7aaa 100644
 +      if (!object->IsHeapObject()) continue;
 +      auto api = handle->ApiWeakPersistentHandle();
 +      flax_origins_[static_cast<uword>(object)].push_back(api);
-+      if (object->untag()->IsMarked()) QueueFlaxOrigin(api);
++      if (object->untag()->IsMarked()) flax_marked_.push_back(api);
 +    }
 +  }
 +
@@ -832,65 +782,49 @@ index f58905a0..c54f7aaa 100644
 +    return object->IsHeapObject() && object->untag()->IsMarked();
 +  }
 +
-+  void MarkFlaxTargets(const Dart_WeakPersistentHandle* targets,
-+                       intptr_t count) {
-+    for (intptr_t i = 0; i < count; i++) {
-+      auto* handle = reinterpret_cast<FinalizablePersistentHandle*>(targets[i]);
-+      RELEASE_ASSERT(flax_state_->flax_handles().contains(handle));
-+      // A finalized origin must never be resurrected by a live JS target.
-+      if (!handle->IsFinalizedNotFreed()) MarkObject(handle->ptr());
-+    }
-+    FinishedRoots();
-+    DrainFlaxMarking();
++  static void FlaxMark(void* context, Dart_WeakPersistentHandle api) {
++    auto* visitor = static_cast<MarkingVisitor*>(context);
++    auto* handle = reinterpret_cast<FinalizablePersistentHandle*>(api);
++    RELEASE_ASSERT(visitor->flax_state_->flax_handles().contains(handle));
++    // An origin can expire while its JS peer still owns a different Dart target.
++    if (handle->IsFinalizedNotFreed()) return;
++    visitor->MarkObject(handle->ptr());
++    visitor->FinishedRoots();
++    visitor->DrainFlaxMarking();
 +  }
 +
 +  static Dart_WeakPersistentHandle FlaxNextOrigin(void* context) {
 +    auto* visitor = static_cast<MarkingVisitor*>(context);
 +    if (visitor->flax_next_ == visitor->flax_marked_.size()) return nullptr;
 +    return visitor->flax_marked_[visitor->flax_next_++];
-+  }
-+
+   }
+
    void FinishedRoots() {
-     // Nothing to remember for roots. Don't carry over to objects.
-     has_evacuation_candidate_ = false;
-@@ -245,6 +299,8 @@ class MarkingVisitor : public ObjectPointerVisitor {
-       ObjectPtr obj;
-       while (MarkerWorkList::Pop(&old_work_list_, &new_work_list_, &obj)) {
-         ASSERT(!has_evacuation_candidate_);
-+        // Barrier-pushed objects may already have their mark bit set.
+@@ -491,6 +543,7 @@
+       // Add the size only if we win the marking race to prevent
+       // double-counting.
+       if (obj->untag()->TryAcquireMarkBit()) {
 +        FlaxObjectMarked(obj);
- 
-         const intptr_t class_id = obj->GetClassIdOfHeapObject();
-         ASSERT(class_id != kIllegalCid);
-@@ -495,6 +551,7 @@ class MarkingVisitor : public ObjectPointerVisitor {
+         if (!obj->IsNewObject()) {
            marked_bytes_ += size;
          }
-       }
-+      FlaxObjectMarked(obj);
-       if (has_evacuation_candidate_) {
-         has_evacuation_candidate_ = false;
-         if (!obj->untag()->IsCardRemembered() &&
-@@ -632,6 +689,19 @@ class MarkingVisitor : public ObjectPointerVisitor {
+@@ -632,6 +685,15 @@
    GCLinkedLists* delayed() { return &delayed_; }
- 
+
   private:
-+  void QueueFlaxOrigin(Dart_WeakPersistentHandle handle) {
-+    if (flax_reported_.insert(handle).second) flax_marked_.push_back(handle);
-+  }
-+
 +  void FlaxObjectMarked(ObjectPtr object) {
 +    if (flax_state_ == nullptr) return;
 +    auto found = flax_origins_.find(static_cast<uword>(object));
 +    if (found != flax_origins_.end()) {
 +      for (auto api : found->second)
-+        QueueFlaxOrigin(api);
++        flax_marked_.push_back(api);
 +    }
 +  }
 +
    DART_FORCE_INLINE
    bool MarkObject(ObjectPtr obj) {
      if (obj->IsImmediateObject()) {
-@@ -642,6 +712,7 @@ class MarkingVisitor : public ObjectPointerVisitor {
+@@ -642,6 +704,7 @@
  #if defined(HOST_HAS_FAST_WRITE_WRITE_FENCE)
        // Ignore race: TSAN doesn't support fences.
        if (obj->untag()->TryAcquireMarkBitIgnoreRace()) {
@@ -898,7 +832,7 @@ index f58905a0..c54f7aaa 100644
          new_work_list_.Push(obj);
        }
  #else
-@@ -650,6 +721,7 @@ class MarkingVisitor : public ObjectPointerVisitor {
+@@ -650,6 +713,7 @@
          // initializing store.
          deferred_work_list_.Push(obj);
        } else if (obj->untag()->TryAcquireMarkBit()) {
@@ -906,30 +840,29 @@ index f58905a0..c54f7aaa 100644
          new_work_list_.Push(obj);
        }
  #endif
-@@ -683,12 +755,19 @@ class MarkingVisitor : public ObjectPointerVisitor {
+@@ -683,12 +747,18 @@
      }
- 
+
      if (obj->untag()->TryAcquireMarkBit()) {
 +      FlaxObjectMarked(obj);
        old_work_list_.Push(obj);
      }
- 
+
      return UntaggedObject::IsEvacuationCandidate(tags);
    }
- 
+
 +  ApiState* flax_state_ = nullptr;
 +  std::unordered_map<uword, std::vector<Dart_WeakPersistentHandle>>
 +      flax_origins_;
 +  std::vector<Dart_WeakPersistentHandle> flax_marked_;
-+  std::unordered_set<Dart_WeakPersistentHandle> flax_reported_;
 +  size_t flax_next_ = 0;
    PageSpace* page_space_;
    MarkerWorkList old_work_list_;
    MarkerWorkList new_work_list_;
-@@ -970,6 +1049,14 @@ class ParallelMarkTask : public SafepointTask {
+@@ -970,6 +1040,14 @@
        visitor_->ProcessDeferredMarking();
        barrier_->Sync();
- 
+
 +      // The ordinary mark stays parallel. A registered foreign collector joins
 +      // on the safepoint owner before any weak references are cleared.
 +      if (thread->isolate_group()->api_state()->flax_collector() != nullptr) {
@@ -941,38 +874,25 @@ index f58905a0..c54f7aaa 100644
        // Phase 3: Weak processing and statistics.
        visitor_->MournWeakProperties();
        visitor_->MournWeakReferences();
-@@ -1110,6 +1197,7 @@ GCMarker::~GCMarker() {
-       delete visitors_[i];
-     }
-   }
-+  isolate_group_->api_state()->EndFlaxEpoch();
-   delete[] visitors_;
- }
- 
-@@ -1286,7 +1374,13 @@ class VerifyAfterMarkingVisitor : public ObjectVisitor,
+@@ -1286,7 +1364,7 @@
    bool failed_ = false;
  };
- 
+
 -void GCMarker::MarkObjects(PageSpace* page_space) {
-+void GCMarker::MarkObjects(PageSpace* page_space,
-+                           bool defer_flax_tracing,
-+                           bool stage_flax) {
-+  ApiState* api = isolate_group_->api_state();
-+  const bool completing_flax = api->flax_epoch() != 0;
-+  // Retire the token before any abort, weak processing, or moving collection.
-+  if (completing_flax) api->EndFlaxEpoch();
++void GCMarker::MarkObjects(PageSpace* page_space, bool defer_flax_tracing) {
    if (isolate_group_->old_marking_stack() != nullptr) {
      isolate_group_->DisableIncrementalBarrier();
    }
-@@ -1295,6 +1389,7 @@ void GCMarker::MarkObjects(PageSpace* page_space) {
- 
+@@ -1295,6 +1373,8 @@
+
    const int num_tasks = FLAG_marker_tasks;
    RELEASE_ASSERT(num_tasks > 0);
++  ApiState* api = isolate_group_->api_state();
 +  auto collector = api->flax_collector();
    ThreadBarrier* barrier = new ThreadBarrier(num_tasks, /*initial=*/1);
- 
+
    ResetSlices();
-@@ -1324,6 +1419,47 @@ void GCMarker::MarkObjects(PageSpace* page_space) {
+@@ -1324,6 +1404,42 @@
    }
    visitors_[0]->Adopt(&global_list_);
    isolate_group_->safepoint_handler()->RunTasks(&tasks);
@@ -989,24 +909,19 @@ index f58905a0..c54f7aaa 100644
 +    visitor->set_concurrent(false);
 +    visitor->ProcessDeferredMarking();
 +    visitor->DrainFlaxMarking();
-+    if (stage_flax) {
-+      RELEASE_ASSERT(thread == api->flax_owner());
-+      RELEASE_ASSERT(!completing_flax && !defer_flax_tracing);
++    if (thread == api->flax_owner() && !defer_flax_tracing) {
 +      visitor->BeginFlaxTracing(api);
-+      api->BeginFlaxEpoch();
-+      isolate_group_->EnableIncrementalBarrier(
-+          &old_marking_stack_, &new_marking_stack_, &deferred_marking_stack_);
-+      isolate_group_->DeferredMarkLiveTemporaries();
-+      thread->ReleaseStoreBuffer();
-+      visitor->AddMicros(OS::GetCurrentMonotonicMicros() - start);
-+      return;  // The VM owns all visitors and weak lists until commit/abort.
-+    } else if (!completing_flax || defer_flax_tracing) {
++      Dart_FlaxGC gc = {visitor, MarkingVisitor::FlaxIsMarked,
++                        MarkingVisitor::FlaxMark,
++                        MarkingVisitor::FlaxNextOrigin};
++      collector(api->flax_peer(), &gc);
++    } else {
 +      // Retain conditional targets until the immediate fresh pass, or until an
 +      // owner-thread major when this thread cannot enter the JS isolate.
 +      api->VisitFlaxHandles(visitor);
 +      visitor->FinishedRoots();
 +      visitor->DrainFlaxMarking();
-+      if (!defer_flax_tracing || completing_flax) {
++      if (thread != api->flax_owner()) {
 +        api->RequestFlaxCollection();
 +      }
 +    }
@@ -1017,56 +932,9 @@ index f58905a0..c54f7aaa 100644
 +    IterateWeakRoots(thread);
 +    visitor->AddMicros(OS::GetCurrentMonotonicMicros() - start);
 +  }
- 
+
    for (intptr_t i = 0; i < num_tasks; i++) {
      MarkingVisitor* visitor = visitors_[i];
-@@ -1349,6 +1485,46 @@ void GCMarker::MarkObjects(PageSpace* page_space) {
-   Epilogue();
- }
- 
-+bool GCMarker::FlaxCheckpoint(const Dart_WeakPersistentHandle* targets,
-+                              intptr_t target_count,
-+                              void (*origin_sink)(void*,
-+                                                  Dart_WeakPersistentHandle),
-+                              void* peer,
-+                              bool* all_targets_marked) {
-+  RELEASE_ASSERT(Thread::Current()->OwnsGCSafepoint());
-+  auto* api = isolate_group_->api_state();
-+  RELEASE_ASSERT(api->flax_epoch() != 0);
-+  auto* visitor = visitors_[0];
-+  for (intptr_t i = 0; i < target_count; i++) {
-+    RELEASE_ASSERT(api->flax_handles().contains(
-+        reinterpret_cast<FinalizablePersistentHandle*>(targets[i])));
-+  }
-+  isolate_group_->FlushMarkingStacks();
-+  heap_->old_space()->WriteProtectCode(false);
-+  Prologue();
-+  visitor->MarkFlaxTargets(targets, target_count);
-+  while (auto origin = MarkingVisitor::FlaxNextOrigin(visitor)) {
-+    if (origin_sink != nullptr) origin_sink(peer, origin);
-+  }
-+  if (all_targets_marked != nullptr) {
-+    *all_targets_marked = true;
-+    for (auto& entry : api->flax_handles()) {
-+      if (!entry.second && !entry.first->IsFinalizedNotFreed() &&
-+          !MarkingVisitor::FlaxIsMarked(
-+              visitor, entry.first->ApiWeakPersistentHandle())) {
-+        *all_targets_marked = false;
-+        break;
-+      }
-+    }
-+  }
-+  Thread::Current()->ReleaseStoreBuffer();
-+  heap_->old_space()->WriteProtectCode(true);
-+  // Other mutators may resume in a barrier-eliminated initialization sequence.
-+  // Keep its live temporaries deferred until the next checkpoint or commit.
-+  isolate_group_->DeferredMarkLiveTemporaries();
-+  return true;
-+}
-+
- void GCMarker::PruneWeak(Scavenger* scavenger) {
-   scavenger->PruneWeak(&global_list_);
-   for (intptr_t i = 0, n = FLAG_marker_tasks; i < n; i++) {
 diff --git a/runtime/vm/heap/scavenger.cc b/runtime/vm/heap/scavenger.cc
 index 9fba03d6..269af227 100644
 --- a/runtime/vm/heap/scavenger.cc
@@ -1696,10 +1564,10 @@ index 9bb5a9a9..80eca234 100644
        // events.
 diff --git a/runtime/include/dart_flax_api.h b/runtime/include/dart_flax_api.h
 new file mode 100644
-index 00000000..6d78c048
+index 00000000..f8a90c6f
 --- /dev/null
 +++ b/runtime/include/dart_flax_api.h
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,51 @@
 +// Experimental Flax cross-heap tracing. Not part of the public Dart API.
 +#ifndef RUNTIME_INCLUDE_DART_FLAX_API_H_
 +#define RUNTIME_INCLUDE_DART_FLAX_API_H_
@@ -1707,38 +1575,15 @@ index 00000000..6d78c048
 +#ifdef __cplusplus
 +extern "C" {
 +#endif
-+// The VM owns the epoch. The collector runs synchronously on its owner in VM
-+// execution state, outside the GC safepoint. No application execution, ordinary
-+// Dart API calls, microtasks, or heap allocation are allowed in the callback.
-+typedef uint64_t Dart_FlaxGCEpoch;
-+typedef void (*Dart_FlaxCollector)(void*, Dart_FlaxGCEpoch);
-+// Try to stage Dart roots for an embedder major already in its atomic pause.
-+// Zero leaves the caller in native state. A nonzero epoch requires a matching
-+// Finish on this thread before leaving the pause. Only GCCheckpoint and Finish
-+// may enter Dart during that interval, and no application code may execute.
-+DART_EXPORT Dart_FlaxGCEpoch Dart_FlaxTryBeginEmbedderGC(void* collector_peer);
-+// Reserve before taking the V8 Locker. A positive result is the number of
-+// isolates in the stable group. The owner remains in native state until Begin.
-+DART_EXPORT int32_t Dart_FlaxTryReserveEmbedderGC(void* collector_peer);
-+// Release the matching reservation and return its full closed time in us.
-+// Finish must already have returned if a marker was staged.
-+DART_EXPORT int64_t Dart_FlaxReleaseEmbedderGCReservation(void);
-+// Commit only after tracing has reached closure. A matching Finish restores
-+// native state even if an intervening Dart GC retired the epoch. False means
-+// there was no precise commit. Passing commit=false retains the Dart peers.
-+DART_EXPORT bool Dart_FlaxFinishEmbedderGC(Dart_FlaxGCEpoch epoch, bool commit);
-+// A checkpoint acquires a short GC safepoint, validates the epoch, and drains
-+// ordinary strong/ephemeron marking before reporting newly reached origins.
-+// The origin sink may only copy handle identities; it must not enter V8 or Dart.
-+// No VM visitor escapes. False means the epoch was aborted by an intervening GC;
-+// the collector must preserve all peers and request a fresh owner pass.
-+DART_EXPORT bool Dart_FlaxGCCheckpoint(
-+    Dart_FlaxGCEpoch epoch,
-+    const Dart_WeakPersistentHandle* targets,
-+    intptr_t target_count,
-+    void (*origin_sink)(void*, Dart_WeakPersistentHandle),
-+    void* peer,
-+    bool* all_targets_marked);
++// Valid only during the collector callback, on its owning thread. No Dart
++// execution, heap allocation, ordinary Dart API calls, or retained context.
++typedef struct {
++  void* context;
++  bool (*is_marked)(void*, Dart_WeakPersistentHandle);
++  void (*mark)(void*, Dart_WeakPersistentHandle);
++  Dart_WeakPersistentHandle (*next_marked_origin)(void*);
++} Dart_FlaxGC;
++typedef void (*Dart_FlaxCollector)(void*, const Dart_FlaxGC*);
 +DART_EXPORT bool Dart_FlaxSetCollector(Dart_FlaxCollector collector,
 +                                       void* peer);
 +DART_EXPORT bool Dart_FlaxRegisterHandle(Dart_WeakPersistentHandle handle,
@@ -2804,7 +2649,6 @@ index 6a6576ad..ab9d3dcf 100644
 
    final _ConstVisitor _visitor;
 diff --git a/runtime/vm/dart_api_impl_test.cc b/runtime/vm/dart_api_impl_test.cc
-index 2924029d..3f53cc1c 100644
 --- a/runtime/vm/dart_api_impl_test.cc
 +++ b/runtime/vm/dart_api_impl_test.cc
 @@ -10,6 +10,7 @@
@@ -2815,18 +2659,12 @@ index 2924029d..3f53cc1c 100644
  #include "include/dart_native_api.h"
  #include "include/dart_tools_api.h"
  #include "platform/assert.h"
-@@ -31,6 +32,7 @@ namespace dart {
- 
- DECLARE_FLAG(bool, verify_acquired_data);
- DECLARE_FLAG(bool, complete_timeline);
-+DECLARE_FLAG(bool, force_evacuation);
- 
- #ifndef PRODUCT
- 
-@@ -3850,6 +3852,383 @@ static Dart_Handle AsHandle(Dart_WeakPersistentHandle weak) {
+@@ -3848,6 +3849,88 @@
+
+ static Dart_Handle AsHandle(Dart_WeakPersistentHandle weak) {
    return Dart_HandleFromWeakPersistent(weak);
- }
- 
++}
++
 +struct FlaxIncrementalCollectionState {
 +  Dart_WeakPersistentHandle live = nullptr;
 +  Dart_WeakPersistentHandle dead = nullptr;
@@ -2841,20 +2679,14 @@ index 2924029d..3f53cc1c 100644
 +  *static_cast<bool*>(peer) = true;
 +}
 +
-+static void FlaxIncrementalCollector(void* peer, Dart_FlaxGCEpoch epoch) {
++static void FlaxIncrementalCollector(void* peer, const Dart_FlaxGC* gc) {
 +  auto* state = static_cast<FlaxIncrementalCollectionState*>(peer);
 +  ++state->collections;
-+  EXPECT(!Thread::Current()->OwnsGCSafepoint());
-+  EXPECT_EQ(Thread::kThreadInVM, Thread::Current()->execution_state());
 +  EXPECT(!state->live_finalized);
 +  EXPECT(!state->dead_finalized);
-+  bool all_targets_marked = true;
-+  EXPECT(Dart_FlaxGCCheckpoint(epoch, nullptr, 0, nullptr, nullptr,
-+                               &all_targets_marked));
-+  EXPECT(!all_targets_marked);
-+  EXPECT(Dart_FlaxGCCheckpoint(epoch, &state->live, 1, nullptr, nullptr,
-+                               &all_targets_marked));
-+  EXPECT(!all_targets_marked);  // The rootless target is still unmarked.
++  EXPECT(!gc->is_marked(gc->context, state->dead));
++  gc->mark(gc->context, state->live);
++  EXPECT(gc->is_marked(gc->context, state->live));
 +}
 +
 +static void FlaxIncrementalCollectionRequest(void* peer) {
@@ -2913,636 +2745,32 @@ index 2924029d..3f53cc1c 100644
 +  Dart_DeleteWeakPersistentHandle(state.live);
 +  Dart_DeleteWeakPersistentHandle(state.dead);
 +  EXPECT(Dart_FlaxSetCollector(nullptr, nullptr));
-+}
-+
-+struct FlaxEpochTestState {
-+  Dart_WeakPersistentHandle target = nullptr;
-+  Dart_WeakPersistentHandle origin = nullptr;
-+  Dart_WeakPersistentHandle dead = nullptr;
-+  Dart_FlaxGCEpoch previous_epoch = 0;
-+  bool target_finalized = false;
-+  bool origin_finalized = false;
-+  bool dead_finalized = false;
-+  bool mark_target = true;
-+  bool abort = false;
-+  bool foreign = false;
-+  GCType abort_type = GCType::kScavenge;
-+  intptr_t origins = 0;
-+  intptr_t requests = 0;
-+};
-+
-+static void FlaxEpochOrigin(void* peer, Dart_WeakPersistentHandle origin) {
-+  auto* state = static_cast<FlaxEpochTestState*>(peer);
-+  EXPECT(Thread::Current()->OwnsGCSafepoint());
-+  EXPECT_EQ(state->origin, origin);
-+  ++state->origins;
-+}
-+
-+static void FlaxEpochCollector(void* peer, Dart_FlaxGCEpoch epoch) {
-+  auto* state = static_cast<FlaxEpochTestState*>(peer);
-+  auto* thread = Thread::Current();
-+  EXPECT(!thread->OwnsGCSafepoint());
-+  EXPECT_EQ(Thread::kThreadInVM, thread->execution_state());
-+  EXPECT(!Dart_FlaxSetCollector(nullptr, nullptr));
-+  EXPECT(!Dart_FlaxGCCheckpoint(state->previous_epoch, nullptr, 0,
-+                                FlaxEpochOrigin, state, nullptr));
-+  state->previous_epoch = epoch;
-+  bool all_targets_marked = true;
-+  EXPECT(Dart_FlaxGCCheckpoint(epoch, nullptr, 0, FlaxEpochOrigin, state,
-+                               &all_targets_marked));
-+  EXPECT_EQ(0, state->origins);
-+  EXPECT(!all_targets_marked);
-+  if (state->abort) {
-+    state->abort = false;
-+    if (state->foreign) {
-+      auto* group = thread->isolate_group();
-+      std::thread collector([group] {
-+        Thread::EnterIsolateGroupAsHelper(group, Thread::kUnknownTask,
-+                                          /*bypass_safepoint=*/false);
-+        auto* helper = Thread::Current();
-+        helper->heap()->CollectGarbage(helper, GCType::kMarkSweep,
-+                                       GCReason::kDebugging);
-+        Thread::ExitIsolateGroupAsHelper(/*bypass_safepoint=*/false);
-+      });
-+      // The foreign collector must wait for our VM-state owner. Entering the
-+      // checkpoint first services its request, which retires this generation.
-+      while (!thread->IsSafepointRequested()) OS::SleepMicros(50);
-+      EXPECT(!Dart_FlaxGCCheckpoint(epoch, nullptr, 0, FlaxEpochOrigin, state,
-+                                    nullptr));
-+      collector.join();
-+    } else {
-+      thread->heap()->CollectGarbage(thread, state->abort_type,
-+                                     GCReason::kDebugging);
-+    }
-+    EXPECT(!Dart_FlaxGCCheckpoint(epoch, nullptr, 0, FlaxEpochOrigin, state,
-+                                  nullptr));
-+    EXPECT(!state->target_finalized);
-+    EXPECT(!state->origin_finalized);
-+    EXPECT(!state->dead_finalized);
-+    return;
-+  }
-+  if (state->mark_target) {
-+    EXPECT(Dart_FlaxGCCheckpoint(epoch, &state->target, 1, FlaxEpochOrigin,
-+                                 state, &all_targets_marked));
-+    EXPECT_EQ(1, state->origins);
-+    EXPECT(!all_targets_marked);
-+    // Reporting is per epoch, even when the same target is visited again.
-+    EXPECT(Dart_FlaxGCCheckpoint(epoch, &state->target, 1, FlaxEpochOrigin,
-+                                 state, nullptr));
-+    EXPECT_EQ(1, state->origins);
-+  }
-+}
-+
-+static void FlaxEpochRequest(void* peer) {
-+  ++static_cast<FlaxEpochTestState*>(peer)->requests;
-+}
-+
-+static void CreateFlaxEpochTestGraph(FlaxEpochTestState* state) {
-+  auto* thread = Thread::Current();
-+  Dart_EnterScope();
-+  ForceGrowthScope force_growth(thread);
-+  Dart_Handle target, middle, origin, dead;
-+  {
-+    TransitionNativeToVM transition(thread);
-+    target = Api::NewHandle(thread, Array::New(1));
-+    middle = Api::NewHandle(thread, Array::New(1));
-+    origin = Api::NewHandle(thread, Array::New(1));
-+    dead = Api::NewHandle(thread, Array::New(1));
-+  }
-+  EXPECT_VALID(Dart_ListSetAt(target, 0, middle));
-+  EXPECT_VALID(Dart_ListSetAt(middle, 0, origin));
-+  EXPECT_VALID(Dart_ListSetAt(origin, 0, target));
-+  EXPECT_VALID(Dart_ListSetAt(dead, 0, dead));
-+  state->target = Dart_NewWeakPersistentHandle(
-+      target, &state->target_finalized, 0, FlaxIncrementalCollectionFinalizer);
-+  state->origin = Dart_NewWeakPersistentHandle(
-+      origin, &state->origin_finalized, 0, FlaxIncrementalCollectionFinalizer);
-+  state->dead = Dart_NewWeakPersistentHandle(
-+      dead, &state->dead_finalized, 0, FlaxIncrementalCollectionFinalizer);
-+  EXPECT(Dart_FlaxRegisterHandle(state->target, false));
-+  EXPECT(Dart_FlaxRegisterHandle(state->origin, true));
-+  EXPECT(Dart_FlaxRegisterHandle(state->dead, false));
-+  Dart_ExitScope();
-+}
-+
-+static void RunFlaxEpochTest(bool abort,
-+                             GCType abort_type,
-+                             bool foreign = false) {
-+  auto* thread = Thread::Current();
-+  {
-+    TransitionNativeToVM transition(thread);
-+    GCTestHelper::CollectAllGarbage();
-+  }
-+  FlaxEpochTestState state;
-+  state.abort = abort;
-+  state.abort_type = abort_type;
-+  state.foreign = foreign;
-+  EXPECT(Dart_FlaxSetCollector(FlaxEpochCollector, &state));
-+  Dart_FlaxSetCollectionRequest(FlaxEpochRequest);
-+  CreateFlaxEpochTestGraph(&state);
-+  Dart_FlaxCollect(false, false);
-+  EXPECT(!state.target_finalized);
-+  EXPECT(!state.origin_finalized);
-+  EXPECT_EQ(!abort, state.dead_finalized);
-+  EXPECT_EQ(abort ? 0 : 1, state.origins);
-+  EXPECT_EQ(abort, state.requests > 0);
-+  state.mark_target = false;
-+  state.origins = 0;
-+  Dart_FlaxCollect(false, false);
-+  EXPECT(state.target_finalized);
-+  EXPECT(state.origin_finalized);
-+  EXPECT(state.dead_finalized);
-+  Dart_DeleteWeakPersistentHandle(state.target);
-+  Dart_DeleteWeakPersistentHandle(state.origin);
-+  Dart_DeleteWeakPersistentHandle(state.dead);
-+  EXPECT(Dart_FlaxSetCollector(nullptr, nullptr));
-+}
-+
-+TEST_CASE(DartAPI_FlaxEpochClosureAndRootlessCycle) {
-+  RunFlaxEpochTest(false, GCType::kScavenge);
-+}
-+
-+TEST_CASE(DartAPI_FlaxEpochMinorAbortAndFreshPass) {
-+  RunFlaxEpochTest(true, GCType::kScavenge);
-+}
-+
-+TEST_CASE(DartAPI_FlaxEpochCompactAbortAndFreshPass) {
-+  RunFlaxEpochTest(true, GCType::kMarkCompact);
-+}
-+
-+TEST_CASE(DartAPI_FlaxEpochForeignAbortAndFreshPass) {
-+  RunFlaxEpochTest(true, GCType::kMarkSweep, true);
-+}
-+
-+static void FlaxMovingCollector(void* peer, Dart_FlaxGCEpoch epoch) {
-+  auto* state = static_cast<FlaxEpochTestState*>(peer);
-+  auto* thread = Thread::Current();
-+  EXPECT(!thread->OwnsGCSafepoint());
-+  EXPECT_EQ(Thread::kThreadInVM, thread->execution_state());
-+  EXPECT(!Dart_FlaxGCCheckpoint(state->previous_epoch, nullptr, 0,
-+                                FlaxEpochOrigin, state, nullptr));
-+  state->previous_epoch = epoch;
-+  state->origins = 0;
-+  EXPECT(Dart_FlaxGCCheckpoint(epoch, nullptr, 0, FlaxEpochOrigin, state,
-+                               nullptr));
-+  EXPECT_EQ(state->abort ? 1 : 0, state->origins);
-+  if (!state->abort) return;
-+  state->abort = false;
-+  auto* slot = reinterpret_cast<FinalizablePersistentHandle*>(state->target);
-+  EXPECT(slot->ptr()->IsOldObject());
-+  EXPECT(!Page::Of(slot->ptr())->is_large());
-+  EXPECT(!Page::Of(slot->ptr())->is_never_evacuate());
-+  EXPECT(!Page::Of(slot->ptr())->is_evacuation_candidate());
-+  const uword before = UntaggedObject::ToAddr(slot->ptr());
-+  {
-+    // Compact alone can leave an object in place; force an observable move.
-+    SetFlagScope<bool> force_evacuation(&FLAG_force_evacuation, true);
-+    thread->heap()->CollectGarbage(thread, GCType::kMarkCompact,
-+                                   GCReason::kDebugging);
-+  }
-+  EXPECT(!slot->IsFinalizedNotFreed());
-+  EXPECT(slot->ptr()->IsOldObject());
-+  EXPECT_NE(before, UntaggedObject::ToAddr(slot->ptr()));
-+  EXPECT(!Dart_FlaxGCCheckpoint(epoch, nullptr, 0, FlaxEpochOrigin, state,
-+                                nullptr));
-+  EXPECT(!state->target_finalized);
-+  EXPECT(!state->origin_finalized);
-+  EXPECT(!state->dead_finalized);
-+}
-+
-+TEST_CASE(DartAPI_FlaxEpochOldTargetMovesAndFreshCleanup) {
-+  {
-+    TransitionNativeToVM transition(thread);
-+    GCTestHelper::CollectAllGarbage();
-+    GCTestHelper::WaitForGCTasks();
-+  }
-+  // Avoid preparatory evacuation that could recycle the source page.
-+  SetFlagScope<bool> only_sliding(&FLAG_use_incremental_compactor, false);
-+  FlaxEpochTestState state;
-+  state.abort = true;
-+  EXPECT(Dart_FlaxSetCollector(FlaxMovingCollector, &state));
-+  Dart_FlaxSetCollectionRequest(FlaxEpochRequest);
-+  constexpr int64_t kSentinel = 12345;
-+  Dart_PersistentHandle business_root;
-+  {
-+    Dart_EnterScope();
-+    ForceGrowthScope force_growth(thread);
-+    Dart_Handle target, middle, origin, dead;
-+    {
-+      TransitionNativeToVM transition(thread);
-+      // Old-space freelists can reuse holes in pages fixed after loading.
-+      constexpr intptr_t kTargetLength = 1024;
-+      constexpr intptr_t kMaxTargetAllocations = 2048;
-+      ArrayPtr target_array = nullptr;
-+      for (intptr_t attempt = 0; attempt < kMaxTargetAllocations; ++attempt) {
-+        const ArrayPtr candidate = Array::New(kTargetLength, Heap::kOld);
-+        if (!Page::Of(candidate)->is_never_evacuate()) {
-+          target_array = candidate;
-+          break;
-+        }
-+      }
-+      RELEASE_ASSERT(target_array != nullptr);
-+      target = Api::NewHandle(thread, target_array);
-+      middle = Api::NewHandle(thread, Array::New(1, Heap::kOld));
-+      origin = Api::NewHandle(thread, Array::New(1, Heap::kOld));
-+      dead = Api::NewHandle(thread, Array::New(1, Heap::kOld));
-+    }
-+    EXPECT_VALID(Dart_ListSetAt(target, 0, Dart_NewInteger(kSentinel)));
-+    EXPECT_VALID(Dart_ListSetAt(target, 1, target));
-+    EXPECT_VALID(Dart_ListSetAt(target, 2, middle));
-+    EXPECT_VALID(Dart_ListSetAt(middle, 0, origin));
-+    EXPECT_VALID(Dart_ListSetAt(origin, 0, target));
-+    EXPECT_VALID(Dart_ListSetAt(dead, 0, dead));
-+    business_root = Dart_NewPersistentHandle(target);
-+    state.target = Dart_NewWeakPersistentHandle(
-+        target, &state.target_finalized, 0, FlaxIncrementalCollectionFinalizer);
-+    state.origin = Dart_NewWeakPersistentHandle(
-+        origin, &state.origin_finalized, 0, FlaxIncrementalCollectionFinalizer);
-+    state.dead = Dart_NewWeakPersistentHandle(
-+        dead, &state.dead_finalized, 0, FlaxIncrementalCollectionFinalizer);
-+    EXPECT(Dart_FlaxRegisterHandle(state.target, false));
-+    EXPECT(Dart_FlaxRegisterHandle(state.origin, true));
-+    EXPECT(Dart_FlaxRegisterHandle(state.dead, false));
-+    Dart_ExitScope();
-+  }
-+  Dart_FlaxCollect(false, false);
-+  EXPECT(state.requests > 0);
-+  EXPECT_EQ(1, state.origins);
-+  {
-+    Dart_EnterScope();
-+    Dart_Handle target = AsHandle(state.target);
-+    EXPECT_VALID(target);
-+    EXPECT(
-+        Dart_IdentityEquals(Dart_HandleFromPersistent(business_root), target));
-+    int64_t value = 0;
-+    EXPECT_VALID(Dart_IntegerToInt64(Dart_ListGetAt(target, 0), &value));
-+    EXPECT_EQ(kSentinel, value);
-+    EXPECT(Dart_IdentityEquals(Dart_ListGetAt(target, 1), target));
-+    Dart_Handle origin = Dart_ListGetAt(Dart_ListGetAt(target, 2), 0);
-+    EXPECT_VALID(origin);
-+    EXPECT(Dart_IdentityEquals(origin, AsHandle(state.origin)));
-+    EXPECT(Dart_IdentityEquals(Dart_ListGetAt(origin, 0), target));
-+    // These local handles must not become roots for the fresh cleanup pass.
-+    Dart_ExitScope();
-+  }
-+  Dart_DeletePersistentHandle(business_root);
-+  Dart_FlaxCollect(false, false);
-+  EXPECT_EQ(0, state.origins);
-+  EXPECT(state.target_finalized);
-+  EXPECT(state.origin_finalized);
-+  EXPECT(state.dead_finalized);
-+  {
-+    Dart_EnterScope();
-+    EXPECT(Dart_IsNull(AsHandle(state.target)));
-+    EXPECT(Dart_IsNull(AsHandle(state.origin)));
-+    EXPECT(Dart_IsNull(AsHandle(state.dead)));
-+    Dart_ExitScope();
-+  }
-+  Dart_DeleteWeakPersistentHandle(state.target);
-+  Dart_DeleteWeakPersistentHandle(state.origin);
-+  Dart_DeleteWeakPersistentHandle(state.dead);
-+  EXPECT(Dart_FlaxSetCollector(nullptr, nullptr));
-+}
-+
+ }
+
  TEST_CASE(DartAPI_WeakPersistentHandle) {
-   Dart_WeakPersistentHandle weak_new_ref = nullptr;
-   Dart_WeakPersistentHandle weak_old_ref = nullptr;
 diff --git a/runtime/vm/heap/heap.cc b/runtime/vm/heap/heap.cc
-index a356646c..56283b0e 100644
 --- a/runtime/vm/heap/heap.cc
 +++ b/runtime/vm/heap/heap.cc
-@@ -3,6 +3,7 @@
- // BSD-style license that can be found in the LICENSE file.
- 
- #include <memory>
-+#include <optional>
- #include <utility>
- 
- #include "vm/heap/heap.h"
-@@ -11,6 +12,7 @@
- #include "platform/utils.h"
- #include "vm/compiler/jit/compiler.h"
- #include "vm/dart.h"
-+#include "vm/dart_api_state.h"
- #include "vm/flags.h"
- #include "vm/heap/incremental_compactor.h"
- #include "vm/heap/pages.h"
-@@ -311,10 +313,14 @@ HeapIterationScope::HeapIterationScope(Thread* thread, bool writable)
-     while ((old_space_->tasks() > 0) ||
-            (old_space_->phase() != PageSpace::kDone)) {
-       old_space_->AssistTasks(&ml);
--      if (old_space_->phase() == PageSpace::kAwaitingFinalization) {
-+      if (old_space_->phase() == PageSpace::kAwaitingFinalization ||
-+          old_space_->phase() == PageSpace::kAwaitingFlax) {
-+        const bool abort_flax = old_space_->phase() == PageSpace::kAwaitingFlax;
-         ml.Exit();
--        heap_->CollectOldSpaceGarbage(thread, GCType::kMarkSweep,
--                                      GCReason::kFinalize);
-+        heap_->CollectOldSpaceGarbage(
-+            thread, GCType::kMarkSweep,
-+            abort_flax ? GCReason::kDebugging : GCReason::kFinalize,
-+            /*defer_flax_tracing=*/abort_flax);
-         ml.Enter();
-       }
-       while (old_space_->tasks() > 0) {
-@@ -473,6 +479,12 @@ void Heap::CollectNewSpaceGarbage(Thread* thread,
-   ASSERT(reason != GCReason::kFinalize);
-   {
-     GcSafepointOperationScope safepoint_operation(thread);
-+    if (isolate_group_->api_state()->flax_epoch() != 0) {
-+      // A guard-only young survivor is blackened on promotion. Abort before
-+      // scavenging rather than letting that mark certify a business root.
-+      CollectOldSpaceGarbage(thread, GCType::kMarkSweep, GCReason::kCatchUp,
-+                             /*defer_flax_tracing=*/true);
-+    }
-     RecordBeforeGC(type, reason);
-     {
-       NOT_IN_PRODUCT(VMTagScope tagScope(thread, VMTag::kGCNewSpaceTagId));
-@@ -507,8 +519,12 @@ void Heap::CollectNewSpaceGarbage(Thread* thread,
- 
+@@ -507,7 +507,8 @@
+
  void Heap::CollectOldSpaceGarbage(Thread* thread,
                                    GCType type,
 -                                  GCReason reason) {
 +                                  GCReason reason,
 +                                  bool defer_flax_tracing) {
    NoActiveIsolateScope no_active_isolate_scope(thread);
-+  const bool enclosing_gc_safepoint = thread->OwnsGCSafepoint();
-+  ApiState* api = isolate_group_->api_state();
-+  Dart_FlaxGCEpoch epoch = 0;
- 
+
    ASSERT(type != GCType::kScavenge);
-   ASSERT(reason != GCReason::kNewSpace);
-@@ -530,23 +546,257 @@ void Heap::CollectOldSpaceGarbage(Thread* thread,
-         return;  // Lost race.
-       }
-     }
-+    const bool abort = api->flax_epoch() != 0;
-+    const bool stage = api->flax_collector() != nullptr &&
-+                       thread == api->flax_owner() && !thread->is_marking() &&
-+                       !api->flax_callback_active() && !defer_flax_tracing &&
-+                       !enclosing_gc_safepoint;
-+    CollectOldSpaceGarbageAtSafepoint(thread, type, reason,
-+                                     defer_flax_tracing || abort, stage);
-+    if (stage) epoch = api->flax_epoch();
-+  }
-+  if (epoch != 0) {
-+    RELEASE_ASSERT(!thread->OwnsGCSafepoint());
-+    RELEASE_ASSERT(thread->execution_state() == Thread::kThreadInVM);
-+    // Keep VM execution state: a foreign GC may proceed only when a checkpoint
-+    // parks this thread, where it invalidates the epoch before reclaiming it.
-+    api->set_flax_callback_active(true);
-+    thread->IncrementNoCallbackScopeDepth();
-+    api->flax_collector()(api->flax_peer(), epoch);
-+    thread->DecrementNoCallbackScopeDepth();
-+    api->set_flax_callback_active(false);
-+    GcSafepointOperationScope safepoint_operation(thread);
-+    if (api->flax_epoch() == epoch) {
-+      CollectOldSpaceGarbageAtSafepoint(thread, type, reason,
-+                                       /*defer_flax_tracing=*/false,
-+                                       /*stage_flax=*/false);
-+    } else {
-+      api->RequestFlaxCollection();
-+    }
-+  }
-+}
- 
--    RecordBeforeGC(type, reason);
--    NOT_IN_PRODUCT(VMTagScope tagScope(thread, VMTag::kGCOldSpaceTagId));
--    TIMELINE_FUNCTION_GC_DURATION(thread, "CollectOldGeneration");
--    old_space_.CollectGarbage(thread, /*compact=*/type == GCType::kMarkCompact,
+@@ -535,7 +536,7 @@
+     NOT_IN_PRODUCT(VMTagScope tagScope(thread, VMTag::kGCOldSpaceTagId));
+     TIMELINE_FUNCTION_GC_DURATION(thread, "CollectOldGeneration");
+     old_space_.CollectGarbage(thread, /*compact=*/type == GCType::kMarkCompact,
 -                              /*finalize=*/true);
--    RecordAfterGC(type);
--    PrintStats();
-+void Heap::CollectOldSpaceGarbageAtSafepoint(Thread* thread,
-+                                             GCType type,
-+                                             GCReason reason,
-+                                             bool defer_flax_tracing,
-+                                             bool stage_flax) {
-+  ASSERT(thread->OwnsGCSafepoint());
-+  RecordBeforeGC(type, reason);
-+  NOT_IN_PRODUCT(VMTagScope tagScope(thread, VMTag::kGCOldSpaceTagId));
-+  TIMELINE_FUNCTION_GC_DURATION(thread, "CollectOldGeneration");
-+  old_space_.CollectGarbage(thread, /*compact=*/type == GCType::kMarkCompact,
-+                            /*finalize=*/true, defer_flax_tracing, stage_flax);
-+  RecordAfterGC(type);
-+  PrintStats();
++                              /*finalize=*/true, defer_flax_tracing);
+     RecordAfterGC(type);
+     PrintStats();
  #if defined(SUPPORT_TIMELINE)
--    PrintStatsToTimeline(&tbes, reason);
-+  PrintStatsToTimeline(&tbes, reason);
- #endif
- 
--    // Some Code objects may have been collected so invalidate handler cache.
--    thread->isolate_group()->handler_info_cache()->Clear();
--    thread->isolate_group()->ClearCatchEntryMovesCacheLocked();
--    assume_scavenge_will_fail_ = false;
-+  // Some Code objects may have been collected so invalidate handler cache.
-+  thread->isolate_group()->handler_info_cache()->Clear();
-+  thread->isolate_group()->ClearCatchEntryMovesCacheLocked();
-+  assume_scavenge_will_fail_ = false;
-+}
-+
-+namespace {
-+
-+struct FlaxEmbedderGC {
-+  FlaxEmbedderGC(Thread* owner, SafepointRwLock* lock)
-+      // The reservation spans embedder calls, outside the VM unwind chain.
-+      : owner(owner), isolates_lock(/*thread_state=*/nullptr, lock) {}
-+
-+  Thread* const owner;
-+  SafepointReadRwLocker isolates_lock;
-+  Dart_FlaxGCEpoch epoch = 0;
-+  int64_t closed_at = -1;
-+};
-+
-+thread_local std::optional<FlaxEmbedderGC> flax_embedder_gc;
-+thread_local int64_t flax_cancelled_gate_micros = -1;
-+
-+bool FlaxCanEnterEmbedderGC(Thread* thread) {
-+  return thread != nullptr && thread->isolate() != nullptr &&
-+         thread->IsDartMutatorThread() && !thread->BypassSafepoints() &&
-+         thread->execution_state() == Thread::kThreadInNative &&
-+         thread->no_callback_scope_depth() == 0 &&
-+         thread->no_safepoint_scope_depth() == 0 && !thread->OwnsSafepoint() &&
-+         thread->IsAtSafepoint() && !thread->force_growth() &&
-+         !FLAG_use_compactor && FLAG_marker_tasks > 0;
-+}
-+
-+}  // namespace
-+
-+DART_EXPORT int32_t Dart_FlaxTryReserveEmbedderGC(void* collector_peer) {
-+  Thread* thread = Thread::Current();
-+  if (!FlaxCanEnterEmbedderGC(thread) || flax_embedder_gc ||
-+      flax_cancelled_gate_micros != -1 ||
-+      !thread->TryExitSafepointFromNative()) {
-+    return 0;
-+  }
-+
-+  // The fast exit proves this owner slot has not been stolen. The reservation
-+  // prevents stealing until its release, including the time in native code.
-+  thread->set_execution_state(Thread::kThreadInVM);
-+  const int32_t isolates =
-+      thread->heap()->TryReserveFlaxEmbedderGC(thread, collector_peer);
-+  thread->set_execution_state(Thread::kThreadInNative);
-+  thread->EnterSafepointToNative();
-+  return isolates;
-+}
-+
-+int32_t Heap::TryReserveFlaxEmbedderGC(Thread* thread, void* collector_peer) {
-+  if (!thread->CanAcquireSafepointLocks()) return 0;
-+
-+  auto* group = isolate_group_;
-+  auto& gc = flax_embedder_gc.emplace(thread, group->isolates_lock_.get());
-+  intptr_t count = 0;
-+  for (auto it = group->isolates_.begin(); it != group->isolates_.end(); ++it) {
-+    ++count;
-+  }
-+  if (count < 1 || count > 2 || count != group->isolate_count_ ||
-+      group->isolates_.First() != thread->isolate() ||
-+      group->group_mutator_count_ != 0 ||
-+      !group->TryCloseFlaxWorkerGate(thread, &gc.closed_at)) {
-+    flax_embedder_gc.reset();
-+    return 0;
-+  }
-+
-+  // A concurrent job can have been queued without entering the registry.
-+  // Check after closing admission, without nesting the scheduler monitors.
-+  bool idle;
-+  {
-+    MonitorLocker ml(old_space_.tasks_lock());
-+    idle = old_space_.phase() == PageSpace::kDone && old_space_.tasks() == 0;
-+  }
-+  auto* api = group->api_state();
-+  if (!idle || thread->is_marking() || api->flax_epoch() != 0 ||
-+      api->flax_callback_active() || api->flax_owner() != thread ||
-+      api->flax_collector() == nullptr || api->flax_peer() != collector_peer) {
-+    ReleaseFlaxWorkerGate(thread);
-+    return 0;
-+  }
-+  return count;
-+}
-+
-+int64_t Heap::ReleaseFlaxWorkerGate(Thread* thread) {
-+  RELEASE_ASSERT(flax_embedder_gc && flax_embedder_gc->owner == thread);
-+  RELEASE_ASSERT(flax_embedder_gc->epoch == 0 && !thread->OwnsSafepoint());
-+  const int64_t closed_at = flax_embedder_gc->closed_at;
-+  RELEASE_ASSERT(closed_at >= 0);
-+  flax_embedder_gc.reset();
-+  return isolate_group_->OpenFlaxWorkerGate(thread, closed_at);
-+}
-+
-+void Heap::CancelFlaxWorkerGateOnIsolateExit(Thread* thread) {
-+  if (flax_embedder_gc && flax_embedder_gc->owner == thread) {
-+    // For example, a group-bound FFI callback may deschedule the owner before
-+    // the foreground pump reaches a major. Release before it tries to reenter.
-+    flax_cancelled_gate_micros = thread->heap()->ReleaseFlaxWorkerGate(thread);
-+  }
-+}
-+
-+DART_EXPORT int64_t Dart_FlaxReleaseEmbedderGCReservation() {
-+  if (flax_cancelled_gate_micros != -1) {
-+    return std::exchange(flax_cancelled_gate_micros, -1);
-+  }
-+  Thread* thread = Thread::Current();
-+  RELEASE_ASSERT(thread != nullptr);
-+  return thread->heap()->ReleaseFlaxWorkerGate(thread);
-+}
-+
-+DART_EXPORT Dart_FlaxGCEpoch Dart_FlaxTryBeginEmbedderGC(void* collector_peer) {
-+  Thread* thread = Thread::Current();
-+  if (!FlaxCanEnterEmbedderGC(thread) || !flax_embedder_gc ||
-+      flax_embedder_gc->owner != thread || flax_embedder_gc->epoch != 0) {
-+    return 0;
-+  }
-+
-+  thread->ExitSafepointFromNative();
-+  thread->set_execution_state(Thread::kThreadInVM);
-+  const Dart_FlaxGCEpoch epoch =
-+      thread->heap()->TryBeginFlaxEmbedderGC(thread, collector_peer);
-+  RELEASE_ASSERT(!thread->OwnsSafepoint() && !thread->IsAtSafepoint());
-+  if (epoch == 0) {
-+    thread->set_execution_state(Thread::kThreadInNative);
-+    thread->EnterSafepointToNative();
-+  }
-+  return epoch;
-+}
-+
-+Dart_FlaxGCEpoch Heap::TryBeginFlaxEmbedderGC(Thread* thread,
-+                                            void* collector_peer) {
-+  auto* api = isolate_group_->api_state();
-+  NoActiveIsolateScope no_active_isolate_scope(thread);
-+  GcSafepointOperationScope safepoint_operation(thread);
-+  {
-+    MonitorLocker ml(old_space_.tasks_lock());
-+    if (old_space_.phase() != PageSpace::kDone || old_space_.tasks() != 0) {
-+      TIMELINE_FUNCTION_GC_DURATION(thread, "FlaxJoinRejectDartHeapBusy");
-+      return 0;
-+    }
-+  }
-+  if (thread->is_marking() || api->flax_epoch() != 0 ||
-+      api->flax_callback_active() || api->flax_owner() != thread ||
-+      api->flax_collector() == nullptr || api->flax_peer() != collector_peer) {
-+    TIMELINE_FUNCTION_GC_DURATION(thread, "FlaxJoinRejectDartOwnership");
-+    return 0;
-+  }
-+  CollectOldSpaceGarbageAtSafepoint(thread, GCType::kMarkSweep,
-+                                    GCReason::kDebugging,
-+                                    /*defer_flax_tracing=*/false,
-+                                    /*stage_flax=*/true);
-+  const auto epoch = api->flax_epoch();
-+  RELEASE_ASSERT(epoch != 0);
-+  flax_embedder_gc->epoch = epoch;
-+  api->set_flax_callback_active(true);
-+  thread->IncrementNoCallbackScopeDepth();
-+  return epoch;
-+}
-+
-+DART_EXPORT bool Dart_FlaxFinishEmbedderGC(Dart_FlaxGCEpoch epoch,
-+                                           bool commit) {
-+  Thread* thread = Thread::Current();
-+  if (!flax_embedder_gc || flax_embedder_gc->owner != thread || epoch == 0 ||
-+      flax_embedder_gc->epoch != epoch) {
-+    return false;
-+  }
-+  RELEASE_ASSERT(thread->execution_state() == Thread::kThreadInVM);
-+  RELEASE_ASSERT(!thread->OwnsSafepoint() && !thread->IsAtSafepoint());
-+  RELEASE_ASSERT(thread->no_callback_scope_depth() == 1);
-+  RELEASE_ASSERT(thread->no_safepoint_scope_depth() == 0);
-+  const bool committed =
-+      thread->heap()->FinishFlaxEmbedderGC(thread, epoch, commit);
-+  RELEASE_ASSERT(!thread->OwnsSafepoint() && !thread->IsAtSafepoint());
-+  flax_embedder_gc->epoch = 0;
-+  thread->DecrementNoCallbackScopeDepth();
-+  thread->set_execution_state(Thread::kThreadInNative);
-+  thread->EnterSafepointToNative();
-+  return committed;
-+}
-+
-+bool Heap::FinishFlaxEmbedderGC(Thread* thread,
-+                                Dart_FlaxGCEpoch epoch,
-+                                bool commit) {
-+  NoActiveIsolateScope no_active_isolate_scope(thread);
-+  GcSafepointOperationScope safepoint_operation(thread);
-+  auto* api = isolate_group_->api_state();
-+  RELEASE_ASSERT(api->flax_owner() == thread && api->flax_callback_active());
-+  // Acquiring the safepoint can park the owner for a foreign GC. In that
-+  // case the old visitor is gone and the foreign GC has kept the Dart peers.
-+  if (api->flax_epoch() == epoch) {
-+    RELEASE_ASSERT(old_space_.phase() == PageSpace::kAwaitingFlax);
-+    CollectOldSpaceGarbageAtSafepoint(thread, GCType::kMarkSweep,
-+                                      GCReason::kDebugging,
-+                                      /*defer_flax_tracing=*/!commit,
-+                                      /*stage_flax=*/false);
-+  } else {
-+    RELEASE_ASSERT(api->flax_epoch() == 0);
-+    api->RequestFlaxCollection();
-+    commit = false;
-   }
-+  api->set_flax_callback_active(false);
-+  return commit;
- }
- 
- void Heap::CollectGarbage(Thread* thread, GCType type, GCReason reason) {
-@@ -570,7 +820,9 @@ void Heap::CollectAllGarbage(GCReason reason, bool compact) {
+@@ -570,7 +571,9 @@
      // If incremental marking is happening, we need to finish the GC cycle
      // and perform a follow-up GC to purge any "floating garbage" that may be
      // retained by the incremental barrier.
@@ -3553,44 +2781,11 @@ index a356646c..56283b0e 100644
    }
    CollectOldSpaceGarbage(
        thread, compact ? GCType::kMarkCompact : GCType::kMarkSweep, reason);
-@@ -603,6 +855,8 @@ void Heap::CheckConcurrentMarking(Thread* thread,
-         old_space_.IncrementalMarkWithSizeBudget(size + (size >> 2));
-       }
-       return;
-+    case PageSpace::kAwaitingFlax:
-+      return;  // The synchronous owner callback holds reclamation.
-     case PageSpace::kSweepingLarge:
-     case PageSpace::kSweepingRegular:
-       if (mode_ != Dart_PerformanceMode_Latency) {
 diff --git a/runtime/vm/heap/heap.h b/runtime/vm/heap/heap.h
-index 5f0c8a1e..f393d029 100644
 --- a/runtime/vm/heap/heap.h
 +++ b/runtime/vm/heap/heap.h
-@@ -11,6 +11,7 @@
- 
- #include <memory>
- 
-+#include "include/dart_flax_api.h"
- #include "include/dart_tools_api.h"
- 
- #include "platform/assert.h"
-@@ -122,6 +123,14 @@ class Heap {
-   void CollectAllGarbage(GCReason reason = GCReason::kFull,
-                          bool compact = false);
- 
-+  int32_t TryReserveFlaxEmbedderGC(Thread* thread, void* collector_peer);
-+  int64_t ReleaseFlaxWorkerGate(Thread* thread);
-+  static void CancelFlaxWorkerGateOnIsolateExit(Thread* thread);
-+  Dart_FlaxGCEpoch TryBeginFlaxEmbedderGC(Thread* thread, void* collector_peer);
-+  bool FinishFlaxEmbedderGC(Thread* thread,
-+                            Dart_FlaxGCEpoch epoch,
-+                            bool commit);
-+
-   void CheckCatchUp(Thread* thread);
-   void CheckConcurrentMarking(Thread* thread, GCReason reason, intptr_t size);
-   void CheckFinalizeMarking(Thread* thread);
-@@ -352,7 +361,15 @@ class Heap {
- 
+@@ -352,7 +352,10 @@
+
    // Helper functions for garbage collection.
    void CollectNewSpaceGarbage(Thread* thread, GCType type, GCReason reason);
 -  void CollectOldSpaceGarbage(Thread* thread, GCType type, GCReason reason);
@@ -3598,343 +2793,88 @@ index 5f0c8a1e..f393d029 100644
 +                              GCType type,
 +                              GCReason reason,
 +                              bool defer_flax_tracing = false);
-+  void CollectOldSpaceGarbageAtSafepoint(Thread* thread,
-+                                         GCType type,
-+                                         GCReason reason,
-+                                         bool defer_flax_tracing,
-+                                         bool stage_flax);
- 
+
    // GC stats collection.
    void RecordBeforeGC(GCType type, GCReason reason);
 diff --git a/runtime/vm/heap/pages.cc b/runtime/vm/heap/pages.cc
-index 8c3242ef..e68a096d 100644
 --- a/runtime/vm/heap/pages.cc
 +++ b/runtime/vm/heap/pages.cc
-@@ -3,6 +3,7 @@
- // BSD-style license that can be found in the LICENSE file.
- 
- #include "vm/heap/pages.h"
-+#include "vm/dart_api_state.h"
- 
- #include "platform/assert.h"
- #include "platform/leak_sanitizer.h"
-@@ -625,6 +626,7 @@ void PageSpace::ReleaseBumpAllocation() {
- }
- 
- void PageSpace::AbandonMarkingForShutdown() {
-+  heap_->isolate_group()->api_state()->EndFlaxEpoch();
-   delete marker_;
-   marker_ = nullptr;
- }
-@@ -935,12 +937,14 @@ bool PageSpace::ShouldPerformIdleMarkCompact(int64_t deadline) {
- }
- 
- void PageSpace::IncrementalMarkWithSizeBudget(intptr_t size) {
-+  if (phase() == kAwaitingFlax) return;
-   if (marker_ != nullptr) {
-     marker_->IncrementalMarkWithSizeBudget(this, size);
+@@ -1010,7 +1010,10 @@
    }
  }
- 
- void PageSpace::IncrementalMarkWithTimeBudget(int64_t deadline) {
-+  if (phase() == kAwaitingFlax) return;
-   if (marker_ != nullptr) {
-     marker_->IncrementalMarkWithTimeBudget(this, deadline);
-   }
-@@ -1010,7 +1014,11 @@ void PageSpace::VisitRoots(ObjectPointerVisitor* visitor) {
-   }
- }
- 
+
 -void PageSpace::CollectGarbage(Thread* thread, bool compact, bool finalize) {
 +void PageSpace::CollectGarbage(Thread* thread,
 +                               bool compact,
 +                               bool finalize,
-+                               bool defer_flax_tracing,
-+                               bool stage_flax) {
++                               bool defer_flax_tracing) {
    ASSERT(!thread->force_growth());
    ASSERT(thread->OwnsGCSafepoint());
- 
-@@ -1022,8 +1030,8 @@ void PageSpace::CollectGarbage(Thread* thread, bool compact, bool finalize) {
-   // Wait for pending tasks to complete and then account for the driver task.
-   {
-     MonitorLocker locker(tasks_lock());
--    if (!finalize &&
--        (phase() == kMarking || phase() == kAwaitingFinalization)) {
-+    if (!finalize && (phase() == kMarking || phase() == kAwaitingFinalization ||
-+                      phase() == kAwaitingFlax)) {
-       // Concurrent mark is already running.
-       return;
-     }
-@@ -1032,7 +1040,8 @@ void PageSpace::CollectGarbage(Thread* thread, bool compact, bool finalize) {
-     while (tasks() > 0) {
-       locker.Wait();
-     }
--    ASSERT(phase() == kAwaitingFinalization || phase() == kDone);
-+    ASSERT(phase() == kAwaitingFinalization || phase() == kAwaitingFlax ||
-+           phase() == kDone);
-     set_tasks(1);
-   }
- 
-@@ -1040,7 +1049,8 @@ void PageSpace::CollectGarbage(Thread* thread, bool compact, bool finalize) {
+
+@@ -1040,7 +1043,7 @@
    // stopped or in native code). We have guards around Newgen GC and oldgen GC
    // to ensure that if two threads are racing to collect at the same time the
    // loser skips collection and goes straight to allocation.
 -  CollectGarbageHelper(thread, compact, finalize);
-+  CollectGarbageHelper(thread, compact, finalize, defer_flax_tracing,
-+                       stage_flax);
- 
++  CollectGarbageHelper(thread, compact, finalize, defer_flax_tracing);
+
    // Done, reset the task count.
    {
-@@ -1074,7 +1084,9 @@ class ParallelSweepTask : public SafepointTask {
- 
+@@ -1074,7 +1077,8 @@
+
  void PageSpace::CollectGarbageHelper(Thread* thread,
                                       bool compact,
 -                                     bool finalize) {
 +                                     bool finalize,
-+                                     bool defer_flax_tracing,
-+                                     bool stage_flax) {
++                                     bool defer_flax_tracing) {
    ASSERT(thread->OwnsGCSafepoint());
    auto isolate_group = heap_->isolate_group();
    ASSERT(isolate_group == IsolateGroup::Current());
-@@ -1108,7 +1120,7 @@ void PageSpace::CollectGarbageHelper(Thread* thread,
-     }
- #endif
-   } else {
--    ASSERT(phase() == kAwaitingFinalization);
-+    ASSERT(phase() == kAwaitingFinalization || phase() == kAwaitingFlax);
-   }
- 
-   if (!finalize) {
-@@ -1120,7 +1132,13 @@ void PageSpace::CollectGarbageHelper(Thread* thread,
+@@ -1120,7 +1124,7 @@
    // Abandon the remainder of the bump allocation block.
    ReleaseBumpAllocation();
- 
+
 -  marker_->MarkObjects(this);
-+  marker_->MarkObjects(this, defer_flax_tracing, stage_flax);
-+  if (stage_flax) {
-+    RELEASE_ASSERT(isolate_group->api_state()->flax_epoch() != 0);
-+    set_phase(kAwaitingFlax);
-+    WriteProtectCode(true);
-+    return;
-+  }
++  marker_->MarkObjects(this, defer_flax_tracing);
    usage_.used_in_words = marker_->marked_words() + allocated_black_in_words_;
    allocated_black_in_words_ = 0;
    mark_words_per_micro_ = marker_->MarkedWordsPerMicro();
 diff --git a/runtime/vm/heap/pages.h b/runtime/vm/heap/pages.h
-index d9977a48..b03bf5d2 100644
 --- a/runtime/vm/heap/pages.h
 +++ b/runtime/vm/heap/pages.h
-@@ -131,6 +131,7 @@ class PageSpace {
-     kDone,
-     kMarking,
-     kAwaitingFinalization,
-+    kAwaitingFlax,
-     kSweepingLarge,
-     kSweepingRegular
-   };
-@@ -246,7 +247,11 @@ class PageSpace {
+@@ -246,7 +246,10 @@
    void ResetProgressBars() const;
- 
+
    // Collect the garbage in the page space using mark-sweep or mark-compact.
 -  void CollectGarbage(Thread* thread, bool compact, bool finalize);
 +  void CollectGarbage(Thread* thread,
 +                      bool compact,
 +                      bool finalize,
-+                      bool defer_flax_tracing = false,
-+                      bool stage_flax = false);
- 
++                      bool defer_flax_tracing = false);
+
    void AddRegionsToObjectSet(ObjectSet* set) const;
- 
-@@ -424,7 +429,11 @@ class PageSpace {
+
+@@ -424,7 +427,10 @@
    void FreeLargePage(Page* page, Page* previous_page);
    void FreePages(Page* pages);
- 
+
 -  void CollectGarbageHelper(Thread* thread, bool compact, bool finalize);
 +  void CollectGarbageHelper(Thread* thread,
 +                            bool compact,
 +                            bool finalize,
-+                            bool defer_flax_tracing,
-+                            bool stage_flax);
++                            bool defer_flax_tracing);
    void VerifyStoreBuffers(const char* msg);
    void SweepExecutable();
    void SweepNew();
 diff --git a/runtime/vm/heap/marker.h b/runtime/vm/heap/marker.h
-index a9090851..aa8677a3 100644
 --- a/runtime/vm/heap/marker.h
 +++ b/runtime/vm/heap/marker.h
-@@ -5,6 +5,7 @@
- #ifndef RUNTIME_VM_HEAP_MARKER_H_
- #define RUNTIME_VM_HEAP_MARKER_H_
- 
-+#include "include/dart_flax_api.h"
- #include "vm/allocation.h"
- #include "vm/heap/gc_shared.h"
- #include "vm/heap/pointer_block.h"
-@@ -45,7 +46,15 @@ class GCMarker {
- 
+@@ -45,7 +45,7 @@
+
    // (Re)mark roots, drain the marking queue and finalize weak references.
    // Does not required StartConcurrentMark to have been previously called.
 -  void MarkObjects(PageSpace* page_space);
-+  void MarkObjects(PageSpace* page_space,
-+                   bool defer_flax_tracing = false,
-+                   bool stage_flax = false);
-+
-+  bool FlaxCheckpoint(const Dart_WeakPersistentHandle* targets,
-+                      intptr_t target_count,
-+                      void (*origin_sink)(void*, Dart_WeakPersistentHandle),
-+                      void* peer,
-+                      bool* all_targets_marked);
- 
++  void MarkObjects(PageSpace* page_space, bool defer_flax_tracing = false);
+
    intptr_t marked_words() const { return marked_bytes_ >> kWordSizeLog2; }
    intptr_t MarkedWordsPerMicro() const;
-diff --git a/runtime/vm/isolate.cc b/runtime/vm/isolate.cc
-index 7f084f77..78c08026 100644
---- a/runtime/vm/isolate.cc
-+++ b/runtime/vm/isolate.cc
-@@ -578,6 +578,44 @@ void IsolateGroup::set_heap(std::unique_ptr<Heap> heap) {
-   heap_ = std::move(heap);
- }
- 
-+bool IsolateGroup::TryCloseFlaxWorkerGate(Thread* owner, int64_t* closed_at) {
-+  MonitorLocker mutators(active_mutators_monitor_.get());
-+  if (flax_worker_gate_owner_ != nullptr || active_mutators_ != 1) {
-+    return false;
-+  }
-+  MonitorLocker threads(thread_registry()->threads_lock());
-+  if (safepoint_handler()->AnySafepointInProgressLocked()) {
-+    return false;
-+  }
-+  for (Thread* peer = thread_registry()->active_list(); peer != nullptr;
-+       peer = peer->next()) {
-+    if (peer == owner) continue;
-+    // Check stack state only after confirming detachment. A group-bound FFI
-+    // handoff can suspend a peer with live Dart frames and drop its slot.
-+    if (!peer->IsDartMutatorThread() || peer->BypassSafepoints() ||
-+        peer->scheduled_dart_mutator_isolate() == nullptr ||
-+        !peer->IsAtSafepoint() || peer->os_thread() != nullptr ||
-+        peer->HasActiveState()) {
-+      return false;
-+    }
-+  }
-+  *closed_at = OS::GetCurrentMonotonicMicros();
-+  flax_worker_gate_owner_ = owner;
-+  return true;
-+}
-+
-+int64_t IsolateGroup::OpenFlaxWorkerGate(Thread* owner, int64_t closed_at) {
-+  MonitorLocker mutators(active_mutators_monitor_.get());
-+  MonitorLocker threads(thread_registry()->threads_lock());
-+  RELEASE_ASSERT(flax_worker_gate_owner_ == owner);
-+  RELEASE_ASSERT(!safepoint_handler()->AnySafepointInProgressLocked());
-+  const int64_t elapsed = OS::GetCurrentMonotonicMicros() - closed_at;
-+  flax_worker_gate_owner_ = nullptr;
-+  threads.NotifyAll();
-+  mutators.NotifyAll();
-+  return elapsed;
-+}
-+
- static constexpr intptr_t kActiveMutatorPreemptionTimeout = 120;
- 
- void IsolateGroup::IncreaseMutatorCount(Thread* thread,
-@@ -597,10 +635,11 @@ void IsolateGroup::IncreaseMutatorCount(Thread* thread,
-     // max_active_mutators) and only use monitors in the uncommon case.
-     MonitorLocker ml(active_mutators_monitor_.get());
-     ASSERT(active_mutators_ <= max_active_mutators_);
--    while (active_mutators_ == max_active_mutators_) {
-+    while (active_mutators_ == max_active_mutators_ ||
-+           flax_worker_gate_owner_ != nullptr) {
-       waiting_mutators_++;
-       bool timed_out = false;
--      if (has_timeout_waiter_) {
-+      if (has_timeout_waiter_ || flax_worker_gate_owner_ != nullptr) {
-         if (was_stolen) {
-           ml.WaitWithSafepointCheck(thread);
-         } else {
-@@ -620,7 +659,7 @@ void IsolateGroup::IncreaseMutatorCount(Thread* thread,
-       }
-       waiting_mutators_--;
- 
--      if (timed_out) {
-+      if (timed_out && flax_worker_gate_owner_ == nullptr) {
-         active_mutators_ -=
-             thread_registry()->StealActiveMutators(thread_pool());
-         ASSERT(active_mutators_ >= 0);
-@@ -2585,6 +2624,7 @@ void IsolateGroup::MaybeIncreaseReloadEveryNStackOverflowChecks() {
- void Isolate::Shutdown() {
-   Thread* thread = Thread::Current();
-   ASSERT(this == thread->isolate());
-+  Heap::CancelFlaxWorkerGateOnIsolateExit(thread);
- 
-   // Don't allow anymore dart code to execution on this isolate.
-   thread->ClearStackLimit();
-diff --git a/runtime/vm/isolate.h b/runtime/vm/isolate.h
-index e5e6f00e..1be0b266 100644
---- a/runtime/vm/isolate.h
-+++ b/runtime/vm/isolate.h
-@@ -609,6 +609,11 @@ class IsolateGroup : public IntrusiveDListEntry<IsolateGroup> {
-   NO_SANITIZE_THREAD
-   intptr_t MutatorCount() const { return active_mutators_; }
- 
-+  // Called with thread_registry()->threads_lock() held.
-+  bool HasFlaxWorkerGateLocked() const {
-+    return flax_worker_gate_owner_ != nullptr;
-+  }
-+
-   bool HasTagHandler() const { return library_tag_handler() != nullptr; }
-   ObjectPtr CallTagHandler(Dart_LibraryTag tag,
-                            const Object& arg1,
-@@ -863,6 +868,9 @@ class IsolateGroup : public IntrusiveDListEntry<IsolateGroup> {
-  private:
-   friend class Dart;  // For `object_store_ = ` in Dart::Init
-   friend class Heap;
-+  bool TryCloseFlaxWorkerGate(Thread* owner, int64_t* closed_at);
-+  int64_t OpenFlaxWorkerGate(Thread* owner, int64_t closed_at);
-+
-   friend class StackFrame;  // For `[isolates_].First()`.
-   // For `object_store_shared_untag()`, `class_table_shared_untag()`
-   friend class Isolate;
-@@ -1028,6 +1036,10 @@ class IsolateGroup : public IntrusiveDListEntry<IsolateGroup> {
-   std::unique_ptr<Roots> roots_;
- 
-   FfiCallbackMetadata::MetadataEntry* ffi_callback_list_head_ = nullptr;
-+
-+  // Written under active_mutators_monitor_ and threads_lock(), in that order.
-+  // Either monitor suffices for readers. Keep existing AOT offsets intact.
-+  Thread* flax_worker_gate_owner_ = nullptr;
- };
- 
- // When an isolate sends-and-exits this class represent things that it passed
-diff --git a/runtime/vm/thread.cc b/runtime/vm/thread.cc
-index 887450d2..5f5e2a78 100644
---- a/runtime/vm/thread.cc
-+++ b/runtime/vm/thread.cc
-@@ -494,6 +494,7 @@ void Thread::ExitIsolate(bool isolate_shutdown) {
- 
-   auto isolate = thread->isolate();
-   auto group = thread->isolate_group();
-+  Heap::CancelFlaxWorkerGateOnIsolateExit(thread);
- 
-   thread->set_vm_tag(isolate->is_runnable() ? VMTag::kIdleTagId
-                                             : VMTag::kLoadWaitTagId);
-@@ -736,7 +737,8 @@ Thread* Thread::AddActiveThread(IsolateGroup* group,
-   MonitorLocker ml(thread_registry->threads_lock());
- 
-   if (!bypass_safepoint) {
--    while (safepoint_handler->AnySafepointInProgressLocked()) {
-+    while (safepoint_handler->AnySafepointInProgressLocked() ||
-+           group->HasFlaxWorkerGateLocked()) {
-       ml.Wait();
-     }
-   }
-diff --git a/runtime/vm/thread_registry.h b/runtime/vm/thread_registry.h
-index ebf477e4..c48f4ac6 100644
---- a/runtime/vm/thread_registry.h
-+++ b/runtime/vm/thread_registry.h
-@@ -66,6 +66,7 @@ class ThreadRegistry {
-   Thread* free_list_;    // Free list of Thread objects that can be reused.
-   RelaxedAtomic<intptr_t> active_isolates_count_;
- 
-+  friend class IsolateGroup;
-   friend class Thread;
-   friend class SafepointHandler;
-   DISALLOW_COPY_AND_ASSIGN(ThreadRegistry);
