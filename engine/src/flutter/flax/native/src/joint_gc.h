@@ -117,6 +117,7 @@ class JointHeap : public std::enable_shared_from_this<JointHeap> {
   int64_t worker_gate_admitted_ = 0, worker_gate_joined_ = 0;
   int64_t worker_gate_released_ = 0, gate_rejected_ = 0;
   int64_t worker_gate_total_us_ = 0, worker_gate_max_us_ = 0;
+  std::atomic<int64_t> confirmation_signals_{0}, confirmation_posts_{0};
   std::atomic<int64_t> incremental_starts_{0}, major_epilogues_{0};
   std::atomic<int64_t> joined_majors_{0}, major_followups_{0};
   std::atomic<int64_t> rejected_joins_{0}, certified_collections_{0};

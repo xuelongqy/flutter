@@ -182,6 +182,10 @@ int64_t JointHeap::IncrementalJointExperiment(int32_t op) {
         return 0;
       Dart_FlaxCollect(false, false);
       return 1;
+    case 15:
+      return heap->confirmation_signals_.load(std::memory_order_relaxed);
+    case 16:
+      return heap->confirmation_posts_.load(std::memory_order_relaxed);
     default:
       return 0;
   }
@@ -388,8 +392,10 @@ void JointHeap::Remove(JointCell* cell) {
   if (cell->cleanup)
     cell->cleanup(cell->cleanup_data);
   cells_.erase(cell);
-  if (cells_.empty() && confirmation_due_)
+  if (cells_.empty() && incremental_joint_mode_ == 1) {
     confirmation_due_.reset();
+    collect_requested_ = false;
+  }
 }
 
 void JointHeap::CloseSession(const void* session) {
@@ -812,6 +818,7 @@ void JointHeap::JsCollected(v8::Isolate* isolate,
         heap.GuardAllPeers();
         if (committed) {
           heap.confirmation_due_.reset();
+          heap.collect_requested_ = false;
           if (natural) {
             TRACE_EVENT0("flutter", "FlaxIncrementalJointCommit");
             heap.joined_majors_.fetch_add(1, std::memory_order_relaxed);
@@ -879,10 +886,15 @@ void JointHeap::RequestFromDart(void* peer) {
 void JointHeap::Request(bool collect) {
   if (closed_)
     return;
-  if (collect)
-    collect_requested_ = true;
+  if (collect) {
+    confirmation_signals_.fetch_add(1, std::memory_order_relaxed);
+    if (collect_requested_.exchange(true))
+      return;
+  }
   if (queued_.exchange(true))
     return;
+  if (collect)
+    confirmation_posts_.fetch_add(1, std::memory_order_relaxed);
   // Always post: a GC callback must never reenter Dart or execute application
   // code.
   runner_->PostTask([weak = weak_from_this()] {
@@ -895,21 +907,21 @@ void JointHeap::Request(bool collect) {
     heap->queued_ = false;
     tonic::DartIsolateScope entered(state->isolate());
     Dart_EnterScope();
-    if (heap->collect_requested_.exchange(false)) {
-      if (heap->incremental_joint_mode_ == 1) {
-        if (!heap->confirmation_due_ && !heap->cells_.empty()) {
-          heap->confirmation_due_ =
-              fml::TimePoint::Now() + fml::TimeDelta::FromSeconds(1);
-          heap->ScheduleConfirmation();
-        }
-      } else {
-        TRACE_EVENT0("flutter", "FlaxCollect");
-        // JS changes need an idle collection even when all Dart targets survive.
-        // Unmarked Dart targets always trigger joint tracing independently.
-        heap->force_js_collection_ = heap->dirty_;
-        Dart_FlaxCollect(false, false);
-        heap->force_js_collection_ = false;
+    if (heap->incremental_joint_mode_ == 1) {
+      if (heap->cells_.empty()) {
+        heap->collect_requested_ = false;
+      } else if (heap->collect_requested_ && !heap->confirmation_due_) {
+        heap->confirmation_due_ =
+            fml::TimePoint::Now() + fml::TimeDelta::FromSeconds(1);
+        heap->ScheduleConfirmation();
       }
+    } else if (heap->collect_requested_.exchange(false)) {
+      TRACE_EVENT0("flutter", "FlaxCollect");
+      // JS changes need an idle collection even when all Dart targets survive.
+      // Unmarked Dart targets always trigger joint tracing independently.
+      heap->force_js_collection_ = heap->dirty_;
+      Dart_FlaxCollect(false, false);
+      heap->force_js_collection_ = false;
     }
     heap->Prune();
     Dart_ExitScope();
