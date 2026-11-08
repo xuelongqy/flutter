@@ -1,0 +1,161 @@
+diff --git a/engine/src/flutter/flax/native/src/joint_gc.cc b/engine/src/flutter/flax/native/src/joint_gc.cc
+--- a/engine/src/flutter/flax/native/src/joint_gc.cc
++++ b/engine/src/flutter/flax/native/src/joint_gc.cc
+@@ -186,6 +186,8 @@
+       return heap->confirmation_signals_.load(std::memory_order_relaxed);
+     case 16:
+       return heap->confirmation_posts_.load(std::memory_order_relaxed);
++    case 17:
++      return heap->InstallFixturePeerControl();
+     default:
+       return 0;
+   }
+@@ -231,6 +233,8 @@
+   isolate_->RemoveGCEpilogueCallback(JsCollected, this);
+   while (!cells_.empty())
+     Remove(cells_.begin()->first);
++  fixture_context_.Reset();
++  fixture_session_ = nullptr;
+   peers_key_.Reset();
+   peer_template_.Reset();
+ }
+@@ -280,6 +284,16 @@
+   auto key = peers_key_.Get(isolate_);
+   if (!value->GetPrivate(ctx, key).ToLocal(&previous))
+     std::abort();
++  // Only the fixture's native factory can mark a fresh ordinary object.
++  const bool fixture_target = previous->IsTrue();
++  if (fixture_target &&
++      (fixture_context_.IsEmpty() || fixture_context_.Get(isolate_) != ctx ||
++       fixture_session_ != session ||
++       !target || Dart_IsNull(target) || (origin && !Dart_IsNull(origin)) ||
++       cleanup || cleanup_data)) {
++    throw std::runtime_error("Invalid fixture peer registration");
++  }
++  cell->fixture_target = fixture_target;
+   JointPeer* peer;
+   if (previous->IsObject()) {
+     peer =
+@@ -398,7 +412,92 @@
+   }
+ }
+
++bool JointHeap::InstallFixturePeerControl() {
++  if (incremental_joint_mode_ != 1 || collecting_ || joint_epoch_ ||
++      !fixture_context_.IsEmpty() || v8::Isolate::TryGetCurrent() != isolate_)
++    return false;
++  v8::HandleScope handles(isolate_);
++  auto ctx = isolate_->GetCurrentContext();
++  if (ctx.IsEmpty() || ctx != isolate_->GetEnteredOrMicrotaskContext() ||
++      ctx->GetNumberOfEmbedderDataFields() <= v8rt::ContextEmbedderIndex::kContextTag ||
++      ctx->GetAlignedPointerFromEmbedderData(v8rt::ContextEmbedderIndex::kContextTag,
++          v8::kEmbedderDataTypeTagDefault) != v8rt::RuntimeContextTagPtr)
++    return false;
++  const auto* session = ctx->GetAlignedPointerFromEmbedderData(
++      v8rt::ContextEmbedderIndex::kRuntime, v8::kEmbedderDataTypeTagDefault);
++  if (!session)
++    return false;
++  auto name = v8::String::NewFromUtf8Literal(isolate_, "__fixturePeerControl");
++  if (ctx->Global()->HasOwnProperty(ctx, name).FromMaybe(true))
++    return false;
++  auto data = v8::External::New(isolate_, this, v8::kExternalPointerTypeTagDefault);
++  v8::Local<v8::Function> control;
++  if (!v8::Function::New(ctx, FixturePeerControl, data, 2,
++                         v8::ConstructorBehavior::kThrow).ToLocal(&control) ||
++      !ctx->Global()->CreateDataProperty(ctx, name, control).FromMaybe(false))
++    return false;
++  fixture_context_.Reset(isolate_, ctx);
++  fixture_session_ = session;
++  return true;
++}
++
++void JointHeap::FixturePeerControl(
++    const v8::FunctionCallbackInfo<v8::Value>& args) {
++  auto* isolate = args.GetIsolate();
++  auto* heap = static_cast<JointHeap*>(args.Data().As<v8::External>()->Value(
++      v8::kExternalPointerTypeTagDefault));
++  args.GetReturnValue().Set(false);
++  if (std::this_thread::get_id() != heap->owner_ || heap->closed_ ||
++      Dart_CurrentIsolate() != heap->dart_isolate_ || heap->collecting_ ||
++      heap->joint_epoch_ || heap->fixture_context_.IsEmpty() ||
++      !args[0]->IsInt32())
++    return;
++  auto ctx = heap->fixture_context_.Get(isolate);
++  if (ctx != isolate->GetCurrentContext() ||
++      ctx != isolate->GetEnteredOrMicrotaskContext())
++    return;
++  const int op = args[0].As<v8::Int32>()->Value();
++  if (op == 3) {
++    args.GetReturnValue().Set(static_cast<double>(
++        heap->major_epilogues_.load(std::memory_order_relaxed)));
++    return;
++  }
++  auto key = heap->peers_key_.Get(isolate);
++  if (op == 0) {
++    auto wrapper = v8::Object::New(isolate, v8::Null(isolate), nullptr, nullptr, 0);
++    if (wrapper->SetPrivate(ctx, key, v8::True(isolate)).FromMaybe(false))
++      args.GetReturnValue().Set(wrapper);
++    return;
++  }
++  if ((op != 1 && op != 2) || !heap->fixture_session_ ||
++      !args[1]->IsObject() || args[1]->IsProxy())
++    return;
++  auto wrapper = args[1].As<v8::Object>();
++  v8::Local<v8::Context> creation;
++  v8::Local<v8::Value> carrier;
++  if (!wrapper->GetCreationContext(isolate).ToLocal(&creation) ||
++      creation != ctx || !wrapper->GetPrivate(ctx, key).ToLocal(&carrier) ||
++      !carrier->IsObject())
++    return;
++  auto* peer = v8::Object::Unwrap<tag, JointPeer>(isolate, carrier.As<v8::Object>());
++  if (!peer || peer->value.Get(isolate) != wrapper)
++    return;
++  for (auto* cell : peer->cells) {
++    if (!cell->fixture_target || cell->session != heap->fixture_session_ ||
++        !cell->target || cell->origin || cell->cleanup || cell->cleanup_data)
++      continue;
++    if (op == 2)
++      heap->Remove(cell);
++    args.GetReturnValue().Set(true);
++    return;
++  }
++}
++
+ void JointHeap::CloseSession(const void* session) {
++  if (fixture_session_ == session) {
++    fixture_context_.Reset();
++    fixture_session_ = nullptr;
++  }
+   incremental_start_latched_ = false;
+   for (auto it = cells_.begin(); it != cells_.end();) {
+     auto* cell = (it++)->first;
+diff --git a/engine/src/flutter/flax/native/src/joint_gc.h b/engine/src/flutter/flax/native/src/joint_gc.h
+--- a/engine/src/flutter/flax/native/src/joint_gc.h
++++ b/engine/src/flutter/flax/native/src/joint_gc.h
+@@ -40,6 +40,7 @@
+   cppgc::WeakPersistent<JointPeer> peer;
+   std::atomic<bool> cpp_dead{false};
+   bool dart_live = false;
++  bool fixture_target = false;
+   void* cleanup_data = nullptr;
+   void (*cleanup)(void*) = nullptr;
+ };
+@@ -82,6 +83,9 @@
+                                   v8::GCCallbackFlags,
+                                   void*);
+   static void JsCollected(v8::Isolate*, v8::GCType, v8::GCCallbackFlags, void*);
++  bool InstallFixturePeerControl();
++  static void FixturePeerControl(
++      const v8::FunctionCallbackInfo<v8::Value>& args);
+   void Prune();
+   void Remove(JointCell* cell);
+   void Shutdown();
+@@ -101,6 +105,8 @@
+   v8::Global<v8::FunctionTemplate> peer_template_;
+   std::unordered_map<JointCell*, std::unique_ptr<JointCell>> cells_;
+   std::unordered_map<Dart_WeakPersistentHandle, JointCell*> origins_;
++  v8::Global<v8::Context> fixture_context_;
++  const void* fixture_session_ = nullptr;
+   Dart_FlaxGCEpoch joint_epoch_ = 0;
+   bool collecting_ = false, aborted_ = false;
+   bool force_js_collection_ = false;
