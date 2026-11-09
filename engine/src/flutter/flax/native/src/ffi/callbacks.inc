@@ -607,7 +607,7 @@ struct Finalization {
   void* token = nullptr;
   uint64_t id = 0;
   std::unique_ptr<fbjsi::WeakObject> externalWitness;
-  void releasePeer(fbjsi::Runtime& js);
+  void releasePeer(fbjsi::Runtime& js, bool detach = true);
   void finish() {
     if (done.exchange(true))
       return;
@@ -647,15 +647,16 @@ struct FinalizerFactory {
     if (auto owner = state.lock()) owner->metadataChanged();
   }
 };
-void Finalization::releasePeer(fbjsi::Runtime& js) {
+void Finalization::releasePeer(fbjsi::Runtime& js, bool detach) {
   if (!externalWitness)
     return;
   auto reference = std::move(externalWitness);
   auto witness = reference->lock(js);
   if (witness.isObject()) {
     auto owner = witness.getObject(js);
-    if (auto scope = state.lock())
-      scope->detachFinalizer->call(js, owner);
+    if (detach)
+      if (auto scope = state.lock())
+        scope->detachFinalizer->call(js, owner);
     owner.setExternalMemoryPressure(js, 0);
     std::static_pointer_cast<FinalizerPeer>(owner.getNativeState(js))->record.reset();
   }

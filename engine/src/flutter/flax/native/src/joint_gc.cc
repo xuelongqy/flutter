@@ -331,9 +331,8 @@ JointCell* JointHeap::Bind(const void* session,
   return raw;
 }
 
-v8::Local<v8::Context> JointHeap::OwnedViewContext(
-    const void* session,
-    v8::Local<v8::Object> view) {
+v8::Local<v8::Context> JointHeap::OwnedViewContext(const void* session,
+                                                   v8::Local<v8::Object> view) {
   if (!session || std::this_thread::get_id() != owner_ || closed_ ||
       Dart_CurrentIsolate() != dart_isolate_ || collecting_ || joint_epoch_ ||
       v8::Isolate::TryGetCurrent() != isolate_ || view.IsEmpty() ||
@@ -359,8 +358,8 @@ v8::Local<v8::Context> JointHeap::OwnedViewContext(
 }
 
 bool JointHeap::BindOwned(const void* session,
-                         v8::Local<v8::Object> view,
-                         Dart_Handle target) {
+                          v8::Local<v8::Object> view,
+                          Dart_Handle target) {
   auto ctx = OwnedViewContext(session, view);
   v8::Local<v8::Value> previous;
   if (ctx.IsEmpty() ||
@@ -541,8 +540,8 @@ void JointHeap::Collect(void* peer, Dart_FlaxGCEpoch epoch) {
     }
     // JS can still reach these Dart targets. Ordinary Dart tracing from the
     // targets also preserves any origins they reach.
-    Dart_FlaxGCCheckpoint(epoch, guards.data(), guards.size(), nullptr,
-                          nullptr, nullptr);
+    Dart_FlaxGCCheckpoint(epoch, guards.data(), guards.size(), nullptr, nullptr,
+                          nullptr);
     heap.Request(true);
     return;
   }
@@ -643,7 +642,8 @@ void JointHeap::Collect(void* peer, Dart_FlaxGCEpoch epoch) {
   if (heap.aborted_)
     heap.Request(true);
   else if (heap.confirming_from_dart_)
-    heap.GuardAllPeers();  // Resume one-way collection with surviving peers guarded.
+    heap.GuardAllPeers();  // Resume one-way collection with surviving peers
+                           // guarded.
   heap.force_js_collection_ = false;
   heap.joint_epoch_ = 0;
   heap.collecting_ = false;
@@ -677,11 +677,13 @@ void JointHeap::Trace(const JointPeer* peer, cppgc::Visitor* visitor) {
 
 void JointHeap::TryReserveForegroundGC(bool wakeup_pending) {
   if (std::this_thread::get_id() != owner_ || !one_way_gc_ ||
-      !confirmation_due_ ||
-      (!incremental_start_latched_ && !wakeup_pending) || reserved_isolates_ ||
-      preparing_ || closed_ || collecting_ || joint_epoch_ || cells_.empty() ||
-      Dart_CurrentIsolate() != dart_isolate_ || v8::Locker::IsLocked(isolate_) ||
-      (!collect_requested_ && HasRecentFrame(*flutter::UIDartState::Current()))) {
+      !confirmation_due_ || (!incremental_start_latched_ && !wakeup_pending) ||
+      reserved_isolates_ || preparing_ || closed_ || collecting_ ||
+      joint_epoch_ || cells_.empty() ||
+      Dart_CurrentIsolate() != dart_isolate_ ||
+      v8::Locker::IsLocked(isolate_) ||
+      (!collect_requested_ &&
+       HasRecentFrame(*flutter::UIDartState::Current()))) {
     return;
   }
   reserved_isolates_ = Dart_FlaxTryReserveEmbedderGC(this);
@@ -694,7 +696,8 @@ void JointHeap::TryReserveForegroundGC(bool wakeup_pending) {
 
 void JointHeap::ReleaseForegroundGC() {
   const int32_t isolates = std::exchange(reserved_isolates_, 0);
-  if (isolates == 0) return;
+  if (isolates == 0)
+    return;
   const int64_t elapsed = Dart_FlaxReleaseEmbedderGCReservation();
   if (isolates == 2) {
     ++worker_gate_released_;
@@ -773,7 +776,8 @@ void JointHeap::ConfirmAtDeadline() {
     v8::Locker locker(isolate_);
     v8::Isolate::Scope scope(isolate_);
     auto& cpp_heap = isolate_->GetCppHeap()->GetHeapHandle();
-    v8_ready = !isolate_->InContext() && !HeapState::IsInAtomicPause(cpp_heap) &&
+    v8_ready = !isolate_->InContext() &&
+               !HeapState::IsInAtomicPause(cpp_heap) &&
                !HeapState::IsSweepingOnOwningThread(cpp_heap);
     if (v8_ready && reserved_isolates_) {
       if (HeapState::IsMarking(cpp_heap)) {
@@ -786,7 +790,8 @@ void JointHeap::ConfirmAtDeadline() {
             cpp_heap, cppgc::EmbedderStackState::kNoHeapPointers);
         isolate_->ClearKeptObjects();
         deadline_major_armed_ = true;
-        isolate_->MemoryPressureNotification(v8::MemoryPressureLevel::kCritical);
+        isolate_->MemoryPressureNotification(
+            v8::MemoryPressureLevel::kCritical);
         deadline_major_armed_ = false;
         if (joint_epoch_)
           std::abort();
@@ -828,9 +833,8 @@ void JointHeap::JsCollectionStarted(v8::Isolate* isolate,
     TRACE_EVENT0("flutter", "FlaxIncrementalV8Start");
     if (on_owner) {
       heap.incremental_start_latched_ =
-          heap.one_way_gc_ && !heap.preparing_ &&
-          heap.confirmation_due_ && !heap.closed_ &&
-          Dart_CurrentIsolate() == heap.dart_isolate_;
+          heap.one_way_gc_ && !heap.preparing_ && heap.confirmation_due_ &&
+          !heap.closed_ && Dart_CurrentIsolate() == heap.dart_isolate_;
     }
     return;
   }
@@ -839,10 +843,12 @@ void JointHeap::JsCollectionStarted(v8::Isolate* isolate,
   if (!on_owner)
     return;
   const bool deadline = std::exchange(heap.deadline_major_armed_, false);
-  const bool early_start = std::exchange(heap.incremental_start_latched_, false);
+  const bool early_start =
+      std::exchange(heap.incremental_start_latched_, false);
   if ((!deadline && !early_start) || !heap.confirmation_due_ ||
-      heap.preparing_ || heap.closed_ || heap.collecting_ || heap.joint_epoch_ ||
-      heap.cells_.empty() || Dart_CurrentIsolate() != heap.dart_isolate_) {
+      heap.preparing_ || heap.closed_ || heap.collecting_ ||
+      heap.joint_epoch_ || heap.cells_.empty() ||
+      Dart_CurrentIsolate() != heap.dart_isolate_) {
     if (deadline)
       heap.ReleaseForegroundGC();
     return;
@@ -906,7 +912,8 @@ void JointHeap::JsCollected(v8::Isolate* isolate,
         const bool natural = InOutermostForegroundPump(isolate);
         const auto epoch = std::exchange(heap.joint_epoch_, 0);
         const bool committed = Dart_FlaxFinishEmbedderGC(epoch, !heap.aborted_);
-        // The Worker gate must keep the epoch valid through both weak decisions.
+        // The Worker gate must keep the epoch valid through both weak
+        // decisions.
         if (!committed && !heap.aborted_)
           std::abort();
         heap.GuardAllPeers();

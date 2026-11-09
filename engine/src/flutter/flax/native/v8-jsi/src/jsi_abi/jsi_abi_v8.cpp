@@ -1140,7 +1140,8 @@ struct V8Scope {
     }
     ~ForegroundGCReservation() { Release(); }
     void Release() {
-      if (heap) std::exchange(heap, nullptr)->ReleaseForegroundGC();
+      if (heap)
+        std::exchange(heap, nullptr)->ReleaseForegroundGC();
     }
     flax::JointHeap* heap;
   };
@@ -3208,8 +3209,8 @@ bool unlinkOwnedDartPeer(jsi_runtime* runtime, jsi_object object) {
   if (!state->heap)
     return false;
   V8Scope scope(state);
-  return state->heap->UnlinkOwned(
-      state, toObjectHandle(object)->get(state->isolate));
+  return state->heap->UnlinkOwned(state,
+                                  toObjectHandle(object)->get(state->isolate));
 }
 
 size_t jointCellCount(jsi_runtime* runtime) {

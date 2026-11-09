@@ -8,6 +8,24 @@ struct ByteView final : fbjsi::MutableBuffer {
   void *address;
   size_t length;
 };
+struct OwnedByteView final : fbjsi::MutableBuffer {
+  OwnedByteView(void* address, size_t length, void* token,
+                std::shared_ptr<SharedImage> image)
+      : address(address), length(length), token(token),
+        image(std::move(image)) { ++liveViews; }
+  ~OwnedByteView() override {
+    if (cleanup) cleanup(token);
+    --liveViews;
+  }
+  size_t size() const override { return length; }
+  uint8_t* data() override { return static_cast<uint8_t*>(address); }
+  void* address;
+  size_t length;
+  void (*cleanup)(void*) = nullptr;
+  void* token;
+  // A transferred BackingStore can outlive the originating FFI installation.
+  std::shared_ptr<SharedImage> image;
+};
 struct CopyBytes final : fbjsi::MutableBuffer {
   explicit CopyBytes(size_t size) : bytes(size) { ++liveMemories; }
   ~CopyBytes() override { --liveMemories; }
@@ -228,6 +246,7 @@ fbjsi::Value memoryBind(FlaxRuntime *, fbjsi::Runtime &,
                         size_t);
 fbjsi::Value makeFinalizer(fbjsi::Runtime &, const std::shared_ptr<State> &,
                            const fbjsi::Value &);
+fbjsi::Value ownedArrayBuffer(fbjsi::Runtime&, State&, const fbjsi::Value*, size_t);
 fbjsi::Value memoryCall(FlaxRuntime *runtime, fbjsi::Runtime &js, State &state,
                         const std::string &name, const fbjsi::Value *args,
                         size_t count) {
@@ -244,6 +263,8 @@ fbjsi::Value memoryCall(FlaxRuntime *runtime, fbjsi::Runtime &js, State &state,
     arity(1, 1);
     return makeFinalizer(js, state.shared_from_this(), args[0]);
   }
+  if (name == "ownedArrayBuffer")
+    return ownedArrayBuffer(js, state, args, count);
   if (name == "layout") {
     arity(1, 1);
     return layoutValue(js, parseType(js, args[0], false));
@@ -489,7 +510,7 @@ void installMemory(FlaxRuntime *runtime, fbjsi::Runtime &js,
         "toUint8Array", "exportString", "exportArrayBuffer",
         "exportArrayBufferView", "layout", "read", "write", "allocate", "free",
         "bindFunction", "finalizer", "protectMappedArrayBuffer",
-        "detachMappedArrayBuffer"}) {
+        "detachMappedArrayBuffer", "ownedArrayBuffer"}) {
     module.setProperty(
         js, name,
         fbjsi::Function::createFromHostFunction(

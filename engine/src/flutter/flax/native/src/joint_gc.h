@@ -88,7 +88,7 @@ class JointHeap : public std::enable_shared_from_this<JointHeap> {
                                   void*);
   static void JsCollected(v8::Isolate*, v8::GCType, v8::GCCallbackFlags, void*);
   v8::Local<v8::Context> OwnedViewContext(const void* session,
-                                         v8::Local<v8::Object> view);
+                                          v8::Local<v8::Object> view);
   void Prune();
   void Remove(JointCell* cell);
   void Shutdown();
