@@ -15,8 +15,7 @@
   id<MTLTexture> _texture;
   // Used for testing.
   BOOL _isInUseOverride;
-  // Whether this surface was created with wide gamut enabled.
-  BOOL _isWideGamut;
+  MTLPixelFormat _pixelFormat;
 }
 @end
 
@@ -38,8 +37,8 @@
   return _isInUseOverride || IOSurfaceIsInUse(_ioSurface);
 }
 
-- (BOOL)isWideGamut {
-  return _isWideGamut;
+- (MTLPixelFormat)pixelFormat {
+  return _pixelFormat;
 }
 
 - (BOOL)isInUseOverride {
@@ -52,14 +51,11 @@
 
 - (instancetype)initWithSize:(CGSize)size
                       device:(id<MTLDevice>)device
-             enableWideGamut:(BOOL)enableWideGamut {
+                 pixelFormat:(MTLPixelFormat)pixelFormat {
   if (self = [super init]) {
     self->_size = size;
-    self->_isWideGamut = enableWideGamut;
-    self->_ioSurface.Reset([FlutterSurface createIOSurfaceWithSize:size
-                                                   enableWideGamut:enableWideGamut]);
-    MTLPixelFormat pixelFormat =
-        enableWideGamut ? MTLPixelFormatBGRA10_XR : MTLPixelFormatBGRA8Unorm;
+    self->_pixelFormat = pixelFormat;
+    self->_ioSurface.Reset([FlutterSurface createIOSurfaceWithSize:size pixelFormat:pixelFormat]);
     self->_texture = [FlutterSurface createTextureForIOSurface:_ioSurface
                                                           size:size
                                                         device:device
@@ -89,17 +85,20 @@
   return (__bridge FlutterSurface*)texture->user_data;
 }
 
-+ (IOSurfaceRef)createIOSurfaceWithSize:(CGSize)size enableWideGamut:(BOOL)enableWideGamut {
-  unsigned pixelFormat;
-  unsigned bytesPerElement;
-  if (enableWideGamut) {
-    // 10-bit wide gamut format (same as iOS)
++ (IOSurfaceRef)createIOSurfaceWithSize:(CGSize)size pixelFormat:(MTLPixelFormat)metalFormat {
+  unsigned pixelFormat = kCVPixelFormatType_32BGRA;
+  unsigned bytesPerElement = 4;
+  if (metalFormat == MTLPixelFormatBGRA10_XR) {
+    // 10-bit wide gamut format (same as iOS).
     pixelFormat = kCVPixelFormatType_40ARGBLEWideGamut;
     bytesPerElement = 8;
-  } else {
-    pixelFormat = kCVPixelFormatType_32BGRA;
-    bytesPerElement = 4;
   }
+#if defined(FLAX_ENABLE_METAL_INTEROP)
+  if (metalFormat == MTLPixelFormatRGBA16Float) {
+    pixelFormat = kCVPixelFormatType_64RGBAHalf;
+    bytesPerElement = 8;
+  }
+#endif
 
   size_t bytesPerRow = IOSurfaceAlignProperty(kIOSurfaceBytesPerRow, size.width * bytesPerElement);
   size_t totalBytes = IOSurfaceAlignProperty(kIOSurfaceAllocSize, size.height * bytesPerRow);
@@ -113,7 +112,18 @@
   };
 
   IOSurfaceRef res = IOSurfaceCreate((CFDictionaryRef)options);
-  if (enableWideGamut) {
+#if defined(FLAX_ENABLE_METAL_INTEROP)
+  if (@available(macOS 26.0, *)) {
+    if (metalFormat == MTLPixelFormatRGBA16Float) {
+      fml::CFRef<CGColorSpaceRef> colorSpace(CGColorSpaceCreateWithName(kCGColorSpaceExtendedSRGB));
+      fml::CFRef<CFPropertyListRef> colorProperty(CGColorSpaceCopyPropertyList(colorSpace));
+      IOSurfaceSetValue(res, kIOSurfaceColorSpace, colorProperty);
+      IOSurfaceSetValue(res, kIOSurfaceContentHeadroom, (__bridge CFNumberRef) @3.0);
+      return res;
+    }
+  }
+#endif
+  if (metalFormat == MTLPixelFormatBGRA10_XR) {
     IOSurfaceSetValue(res, kIOSurfaceColorSpace, kCGColorSpaceExtendedSRGB);
   } else {
     IOSurfaceSetValue(res, kIOSurfaceColorSpace, kCGColorSpaceSRGB);
@@ -132,7 +142,7 @@
                                                      mipmapped:NO];
   textureDescriptor.usage =
       MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite;
-  // plane = 0 for BGRA.
+  // Packed RGB surfaces use plane 0.
   return [device newTextureWithDescriptor:textureDescriptor iosurface:surface plane:0];
 }
 

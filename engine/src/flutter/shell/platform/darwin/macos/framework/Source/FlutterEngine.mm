@@ -1115,6 +1115,9 @@ static void SetThreadPriority(FlutterThreadPriority priority) {
 
 - (void)updateDisplayConfig:(NSNotification*)notification {
   [self updateDisplayConfig];
+#if defined(FLAX_ENABLE_METAL_INTEROP)
+  [self windowDidChangeScreen:notification];
+#endif
 }
 
 - (NSArray<NSScreen*>*)screens {
@@ -1490,6 +1493,11 @@ static void SetThreadPriority(FlutterThreadPriority priority) {
       case kCVPixelFormatType_32BGRA:
         formatString = @"MTLPixelFormatBGRA8Unorm";
         break;
+#if defined(FLAX_ENABLE_METAL_INTEROP)
+      case kCVPixelFormatType_64RGBAHalf:
+        formatString = @"MTLPixelFormatRGBA16Float";
+        break;
+#endif
       default:
         formatString = [NSString stringWithFormat:@"Unknown(%u)", pixelFormat];
         break;
@@ -1535,8 +1543,8 @@ static void SetThreadPriority(FlutterThreadPriority priority) {
   NSEnumerator* viewControllerEnumerator = [_viewControllers objectEnumerator];
   FlutterViewController* nextViewController;
   while ((nextViewController = [viewControllerEnumerator nextObject])) {
-    [self updateWindowMetricsForViewController:nextViewController];
     [nextViewController updateWideGamutForScreen];
+    [self updateWindowMetricsForViewController:nextViewController];
   }
 }
 

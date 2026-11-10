@@ -353,7 +353,9 @@ FLUTTER_ASSERT_ARC
                                aiksContext:(nonnull impeller::AiksContext*)aiks_context {
   impeller::TextureDescriptor desc;
   desc.storage_mode = impeller::StorageMode::kDevicePrivate;
-  desc.format = impeller::PixelFormat::kB8G8R8A8UNormInt;
+  desc.format = rgbaTex.pixelFormat == MTLPixelFormatRGBA16Float
+                    ? impeller::PixelFormat::kR16G16B16A16Float
+                    : impeller::PixelFormat::kB8G8R8A8UNormInt;
   desc.size = impeller::ISize(rgbaTex.width, rgbaTex.height);
   desc.mip_count = 1;
   auto texture = impeller::TextureMTL::Wrapper(desc, rgbaTex);

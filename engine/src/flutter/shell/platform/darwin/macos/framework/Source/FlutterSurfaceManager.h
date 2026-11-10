@@ -63,6 +63,9 @@
  */
 - (void)setEnableWideGamut:(BOOL)enableWideGamut;
 
+/** Changes the backing surface format on the platform thread. */
+- (void)setPixelFormat:(MTLPixelFormat)pixelFormat;
+
 /**
  * Returns a back buffer surface of the given size to which Flutter can render content.
  * A cached surface will be returned if available; otherwise a new one will be created.

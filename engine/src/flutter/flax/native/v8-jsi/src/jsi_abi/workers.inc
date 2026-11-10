@@ -343,12 +343,9 @@ bool serializeWorker(v8::Isolate* isolate,
                      v8::Local<v8::Function> precommit,
                      uint64_t sourcePort = 0) {
   auto context = isolate->GetCurrentContext();
-  auto mapping = v8::Private::ForApi(
-      isolate, v8::String::NewFromUtf8Literal(isolate, "flax.webgpu.mapping"));
   auto transferable = [&](v8::Local<v8::ArrayBuffer> buffer) {
     return !buffer->WasDetached() && buffer->IsDetachable() &&
-           !buffer->GetBackingStore()->IsImmutable() &&
-           !buffer->HasPrivate(context, mapping).FromMaybe(true);
+           !buffer->GetBackingStore()->IsImmutable();
   };
   std::vector<v8::Local<v8::ArrayBuffer>> buffers;
   std::unordered_map<uint64_t, uint32_t> portOrdinals;
@@ -429,6 +426,20 @@ bool serializeWorker(v8::Isolate* isolate,
     return false;
   if (!validateBuffers())
     return false;
+  // Cloning and precommit exceptions precede detach-key failures.
+  auto mapping = v8::Private::ForApi(
+      isolate, v8::String::NewFromUtf8Literal(isolate, "flax.webgpu.mapping"));
+  for (auto buffer : buffers) {
+    bool mapped;
+    if (!buffer->HasPrivate(context, mapping).To(&mapped))
+      return false;
+    if (mapped) {
+      isolate->ThrowException(v8::Exception::TypeError(
+          v8::String::NewFromUtf8Literal(isolate,
+                                       "Cannot transfer a mapped GPU buffer")));
+      return false;
+    }
+  }
   auto released = serializer.Release();
   packet.bytes.reset(released.first);
   packet.length = released.second;
