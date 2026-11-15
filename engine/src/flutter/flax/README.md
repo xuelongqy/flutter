@@ -1,7 +1,7 @@
 # Flax Engine Integration
 
-Experimental macOS, Android and iOS arm64 integration based on Flutter 3.47.9
-and Dart 3.13.7. macOS targets 15 or later; Android targets API 24 or later. The iOS
+Experimental macOS, Android and iOS arm64 integration based on Flutter 3.50.0
+and Dart 3.14.0. macOS targets 15 or later; Android targets API 24 or later. The iOS
 producer targets 16.3 or later and supports simulator debug and device release/AOT.
 The exact Flutter, Dart, bridge, V8 SDK revisions are in `source.lock.json`.
 The maintained branch is `flax/main`; version branches use `flax/<version>`.
@@ -70,12 +70,22 @@ Use the official local-engine flow from an application checkout:
 ```
 
 For profile or release, build the matching mode and select `flax_mac_profile_arm64`
-or `flax_mac_release_arm64` for both engine flags. The macOS build also produces the
-matching const-finder snapshot. Its managed `flax:runtime-icon-data` factory exception
-keeps business-owned icon fonts separate from host constant-font subsetting; ordinary
-unmarked dynamic IconData is still rejected. Rebuild this helper and refresh the Flutter
-tools snapshot after changing their sources. The macOS SDK uses system libc++;
-`flax_system_cxx` makes the engine use matching headers and ABI. The build
+or `flax_mac_release_arm64` for both engine flags. Flutter 3.50's matching compiler
+and SDK emit recorded uses during AOT compilation; no const-finder helper or snapshot
+is built. An exact core `@pragma('flax:runtime-icon-data')` on the leaf creator omits
+only its direct runtime Flutter `IconData` creation records. Constants, other recorded
+classes/calls and constructor tear-offs remain recorded. Ordinary unmarked runtime
+arguments remain rejected; upstream still accepts constant arguments without `const`
+syntax. A caller's marker is never copied to a shared fixed-default entry.
+
+This omission is not a font keep-list: business-owned fonts must retain their separate
+asset/domain delivery policy and must not share the host subset asset. Rebuild the
+matching compiler/SDK after changing this policy; native precompiled application
+compilation generates `recorded_uses.json`, and the ordinary Flutter tools perform
+font subsetting. Debug/hot reload does not run this collector.
+
+The macOS SDK uses system libc++; `flax_system_cxx` makes the engine use matching
+headers and ABI. The build
 GN selects Xcode's linker for its SDK's TAPI format. Tool pins remain intact.
 Framework dependencies are copied into `FlutterMacOS.framework/Versions/A/Libraries`;
 the test executable uses an adjacent `Libraries` directory.
@@ -198,9 +208,9 @@ not change the native ABI, UI protocol or joint-GC ownership.
 
 Incremental compilation also invalidates serialized dependency groups when fixed
 helpers are added to a previously cached library. Their owning libraries are emitted
-in the reload delta. The revision-checked patch includes this repair for cold mixed
-SDK/application caches; `dart-startup.patch` upgrades earlier patched checkouts
-without resetting unrelated Dart edits.
+in the reload delta. The revision-checked consolidated patch includes this repair
+for cold mixed SDK/application caches. Only the exact Dart revision in the source
+lock is accepted; obsolete partial patches fail without resetting unrelated edits.
 
 ## JavaScript startup and execution
 

@@ -69,6 +69,29 @@ class BuildEngineTest(unittest.TestCase):
           flags = [flag for flag in command if flag in ("--unoptimized", "--dart-debug")]
           self.assertEqual(flags, ["--unoptimized", "--dart-debug"] if debug_flags else [])
 
+  def test_macos_build_uses_target_recorded_use_compiler_not_deleted_helper(self):
+    with tempfile.TemporaryDirectory(prefix="flax-build-engine-",
+                                     dir=os.environ["TMPDIR"]) as directory:
+      root = Path(directory).resolve()
+      source = root / "engine/src"
+      flax = source / "flutter/flax"
+      script = flax / "tools/build_engine.py"
+      output = source / "out/flax_mac_debug_arm64"
+      argv = [str(script), "--sdk", str(root / "sdk"), "--jobs", "2"]
+      with mock.patch.object(build_engine, "__file__", str(script)), \
+          mock.patch.object(sys, "argv", argv), \
+          mock.patch.object(build_engine, "apply_all"), \
+          mock.patch.object(build_engine.subprocess, "run") as run, \
+          mock.patch.object(build_engine.shutil, "copytree") as copy:
+        build_engine.main()
+      self.assertEqual(
+          run.call_args_list[-1].args[0],
+          ["ninja", "-C", str(output), "-j", "2", "flutter", "flutter_tester"]
+      )
+      copy.assert_called_once_with(
+          output / "gen/dart-pkg/sky_engine", root / "bin/cache/pkg/sky_engine", dirs_exist_ok=True
+      )
+
 
 if __name__ == "__main__":
   unittest.main()

@@ -58,9 +58,9 @@ The collector uses one-way confirmation by default. The initial Pixel 4
 Android arm64 Release/AOT trial is recorded in
 `flax-joint-gc-one-way-20261108-1/TRIAL.md`.
 `../../tools/apply_dart_patch.py` reconstructs the tested Dart VM from the SDK
-revision in `../../patches/dart_revision`. The consolidated `dart.patch` applies
-to that upstream revision. `dart-joint-gc.patch` upgrades the same revision
-with the maintained Flax patches already applied.
+revision in `../../patches/dart_revision`. The consolidated `dart.patch` and
+`dart-ffi.patch` apply only to that exact upstream revision. Obsolete partial
+patches are rejected rather than upgraded or reset in place.
 
 Owner-local Dart collections keep JS-to-Dart targets and trace their Dart
 references normally. They post a coalesced owner request. JS activity and

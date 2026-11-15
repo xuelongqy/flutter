@@ -87,7 +87,7 @@ def main() -> None:
           )
       )
   if not args.configure_only:
-    targets = ["flutter", "flutter_tester", "const_finder"] if platform == "mac" else ["flutter"]
+    targets = ["flutter", "flutter_tester"] if platform == "mac" else ["flutter"]
     if platform == "android":
       # Flutter applications consume the packaged JAR, not the raw library.
       targets.append("flutter_jar_zip")

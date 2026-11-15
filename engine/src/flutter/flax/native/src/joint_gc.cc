@@ -532,20 +532,6 @@ void JointHeap::Collect(void* peer, Dart_FlaxGCEpoch epoch) {
   if (std::this_thread::get_id() != heap.owner_ || heap.collecting_ ||
       heap.joint_epoch_)
     std::abort();
-  if (heap.one_way_gc_ && !heap.confirming_from_dart_) {
-    std::vector<Dart_WeakPersistentHandle> guards;
-    guards.reserve(heap.cells_.size());
-    for (const auto& [cell, owned] : heap.cells_) {
-      if (cell->target)
-        guards.push_back(cell->target);
-    }
-    // JS can still reach these Dart targets. Ordinary Dart tracing from the
-    // targets also preserves any origins they reach.
-    Dart_FlaxGCCheckpoint(epoch, guards.data(), guards.size(), nullptr,
-                          nullptr, nullptr);
-    heap.Request(true);
-    return;
-  }
   heap.external_gc_pending_ = false;
   heap.collecting_ = true;
   heap.aborted_ = false;
@@ -913,7 +899,10 @@ void JointHeap::JsCollected(v8::Isolate* isolate,
         const bool dart_requested =
             std::exchange(heap.joined_dart_request_, false);
         if (committed) {
-          heap.ResetConfirmation();
+          // A natural major can retain conservative roots. Keep a pending Dart
+          // reclamation request until an owner confirmation has completed.
+          if (!natural || !dart_requested)
+            heap.ResetConfirmation();
           if (natural) {
             TRACE_EVENT0("flutter", "FlaxIncrementalJointCommit");
             heap.joined_majors_.fetch_add(1, std::memory_order_relaxed);
@@ -928,7 +917,7 @@ void JointHeap::JsCollected(v8::Isolate* isolate,
         }
         heap.ReleaseForegroundGC();
         if (committed) {
-          heap.Request(false);  // Prune without consuming queued Dart work.
+          heap.Request(natural && dart_requested);
         } else if (dart_requested) {
           heap.Request(true);
         }

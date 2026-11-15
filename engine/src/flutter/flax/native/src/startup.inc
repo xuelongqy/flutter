@@ -82,7 +82,7 @@ int32_t prepareStartup(FlaxRuntime* runtime,
           throw BridgeError(FLAX_ARGUMENT_ERROR,
                             "Invalid initialization sources");
         *started = 0;
-#if !defined(FML_OS_MACOSX)
+#if !defined(FML_OS_MACOSX) && !defined(FML_OS_ANDROID)
         return;  // Other targets retain UI-thread startup until their own
                  // acceptance.
 #endif

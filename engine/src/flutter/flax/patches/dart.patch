@@ -1,8 +1,8 @@
 diff --git a/pkg/front_end/lib/src/base/incremental_compiler.dart b/pkg/front_end/lib/src/base/incremental_compiler.dart
-index 4c0c1d1f..bc5ae18f 100644
+index 847e4639e999137794bc8745d23b4bdafb99e076..aadf9851aa76372cd5550324224fbe2c7888c7bb 100644
 --- a/pkg/front_end/lib/src/base/incremental_compiler.dart
 +++ b/pkg/front_end/lib/src/base/incremental_compiler.dart
-@@ -565,6 +565,15 @@ class IncrementalCompiler implements IncrementalKernelGenerator {
+@@ -598,6 +598,15 @@ class IncrementalCompiler implements IncrementalKernelGenerator {
              c,
              cleanedUpBuilders: cleanedUpBuilders,
            );
@@ -18,18 +18,18 @@ index 4c0c1d1f..bc5ae18f 100644
        if (experimentalInvalidation != null &&
            experimentalInvalidation.invalidatedMixinApplicationLibraries !=
                null) {
-@@ -2884,6 +2893,7 @@ class IncrementalKernelTarget extends KernelTarget
+@@ -3158,6 +3167,7 @@ class IncrementalKernelTarget extends KernelTarget
      implements ChangedStructureNotifier {
    Set<Class>? classHierarchyChanges;
    Set<Class>? classMemberChanges;
 +  final Set<Library> libraryChanges = {};
    Set<Library> librariesUsed = {};
-
+ 
    new(
-@@ -2903,6 +2913,11 @@ class IncrementalKernelTarget extends KernelTarget
+@@ -3177,6 +3187,11 @@ class IncrementalKernelTarget extends KernelTarget
    @override
    ChangedStructureNotifier get changedStructureNotifier => this;
-
+ 
 +  @override
 +  void registerLibraryChange(Library library) {
 +    libraryChanges.add(library);
@@ -39,16 +39,16 @@ index 4c0c1d1f..bc5ae18f 100644
    // Coverage-ignore(suite): Not run.
    void registerClassMemberChange(Class c) {
 diff --git a/pkg/kernel/lib/target/changed_structure_notifier.dart b/pkg/kernel/lib/target/changed_structure_notifier.dart
-index e1b2c7f1..7596987d 100644
+index e1b2c7f13b08bc0526ba9af538edd684e454cbc9..7596987d4d16064ee6b08c15d91884fede82aee9 100644
 --- a/pkg/kernel/lib/target/changed_structure_notifier.dart
 +++ b/pkg/kernel/lib/target/changed_structure_notifier.dart
 @@ -2,11 +2,14 @@
  // for details. All rights reserved. Use of this source code is governed by a
  // BSD-style license that can be found in the LICENSE file.
-
+ 
 -import 'package:kernel/ast.dart' show Class;
 +import 'package:kernel/ast.dart' show Class, Library;
-
+ 
  /// Meant for notifying the backend (the compiler) that the structure has
  /// changed, in turn allowing it to update its internal model.
  abstract class ChangedStructureNotifier {
@@ -57,20 +57,20 @@ index e1b2c7f1..7596987d 100644
 +
    /// Mark the members of class [cls] have changed.
    void registerClassMemberChange(Class cls);
-
+ 
 diff --git a/pkg/vm/lib/modular/target/vm.dart b/pkg/vm/lib/modular/target/vm.dart
-index 7d91430c..1ad5d3d5 100644
+index b4bdd1bb07a41d41a9bb9437c570250dd83967eb..7ea7d2590fc8f632bdbe6191c9ed083c3156d237 100644
 --- a/pkg/vm/lib/modular/target/vm.dart
 +++ b/pkg/vm/lib/modular/target/vm.dart
 @@ -13,6 +13,7 @@ import 'package:kernel/transformations/track_widget_constructor_locations.dart';
-
+ 
  import '../transformations/call_site_annotator.dart' as callSiteAnnotator;
  import '../transformations/deeply_immutable.dart' as deeply_immutable;
 +import '../transformations/flax_default_calls.dart';
  import '../transformations/lowering.dart'
      as lowering
      show transformLibraries, transformProcedure;
-@@ -188,6 +189,14 @@ class VmTarget extends Target {
+@@ -191,6 +192,14 @@ class VmTarget extends Target {
      void Function(String msg)? logger,
      ChangedStructureNotifier? changedStructureNotifier,
    }) {
@@ -85,11 +85,1057 @@ index 7d91430c..1ad5d3d5 100644
      transformMixins.transformLibraries(
        this,
        coreTypes,
+diff --git a/pkg/vm/lib/modular/transformations/flax_default_calls.dart b/pkg/vm/lib/modular/transformations/flax_default_calls.dart
+new file mode 100644
+index 0000000000000000000000000000000000000000..8100857ed02d97fa56f31a90fc0be38acfd97a58
+--- /dev/null
++++ b/pkg/vm/lib/modular/transformations/flax_default_calls.dart
+@@ -0,0 +1,963 @@
++// Copyright (c) 2026, the Dart project authors. Please see the AUTHORS file
++// for details. All rights reserved. Use of this source code is governed by a
++// BSD-style license that can be found in the LICENSE file.
++
++import 'dart:convert';
++
++import 'package:crypto/crypto.dart';
++import 'package:kernel/ast.dart';
++import 'package:kernel/class_hierarchy.dart';
++import 'package:kernel/clone.dart';
++import 'package:kernel/core_types.dart';
++import 'package:kernel/type_algebra.dart';
++import 'package:kernel/reference_from_index.dart';
++import 'package:kernel/target/changed_structure_notifier.dart';
++
++class _GeneratedLocations extends RecursiveVisitor {
++  _GeneratedLocations(this.offset);
++  final int offset;
++  @override
++  void defaultNode(Node node) {
++    if (node is TreeNode && node.fileOffset == TreeNode.noOffset) {
++      node.fileOffset = offset;
++    }
++    node.visitChildren(this);
++  }
++}
++
++class _FixedCalls extends Transformer {
++  _FixedCalls(
++    this.component,
++    this.core,
++    this.libraries,
++    this.hierarchy, {
++    this.buildSdk = false,
++    this.referenceFromIndex,
++    this.changedStructureNotifier,
++  });
++  final Component component;
++  final CoreTypes core;
++  final List<Library> libraries;
++  final ClassHierarchy hierarchy;
++  final bool buildSdk;
++  final ReferenceFromIndex? referenceFromIndex;
++  final ChangedStructureNotifier? changedStructureNotifier;
++  Reference? priorReference(Library library, Class? owner, Name name) {
++    final index = referenceFromIndex?.lookupLibrary(library);
++    return (owner == null ? index : index?.lookupIndexedClass(owner.name))
++        ?.lookupGetterReference(name);
++  }
++
++  Member? current;
++  final entries = <Object, Procedure>{};
++  late final extensionTargets = <Reference, Procedure>{
++    for (final library in component.libraries)
++      for (final descriptor in [
++        for (final extension in library.extensions)
++          for (final member in extension.memberDescriptors)
++            if (!member.isStatic &&
++                member.tearOffReference != null &&
++                member.memberReference != null)
++              (member.tearOffReference!, member.memberReference!),
++        for (final extension in library.extensionTypeDeclarations)
++          for (final member in extension.memberDescriptors)
++            if (!member.isStatic &&
++                member.tearOffReference != null &&
++                member.memberReference != null)
++              (member.tearOffReference!, member.memberReference!),
++      ])
++        descriptor.$1: descriptor.$2.asProcedure,
++  };
++  bool sameLayout(List<String> a, List<String> b) {
++    if (a.length != b.length) return false;
++    for (var i = 0; i < a.length; i++) {
++      if (a[i] != b[i]) return false;
++    }
++    return true;
++  }
++
++  void checkLayout(Member target, List<String> names) {
++    final fn = target.function!;
++    final positional = names.takeWhile((name) => name.isEmpty).length;
++    final named = names.skip(positional).toList();
++    if (positional > fn.positionalParameters.length ||
++        named.any(
++          (name) =>
++              name.isEmpty ||
++              !fn.namedParameters.any((p) => p.parameterName == name),
++        ) ||
++        named.toSet().length != named.length) {
++      throw StateError('Fixed layout does not match ${target.name.text}');
++    }
++  }
++
++  List<String> layout(Member member) => [
++    for (final _ in member.function!.positionalParameters) '',
++    ...([for (final p in member.function!.namedParameters) p.parameterName]
++      ..sort()),
++  ];
++  String entryName(
++    Member target,
++    List<String> names, {
++    Class? owner,
++    bool superCall = false,
++  }) {
++    final identity = jsonEncode([
++      'mask32-v1',
++      target.enclosingLibrary.importUri.toString(),
++      target.enclosingClass?.name,
++      target.name.text,
++      if (superCall)
++        [owner?.enclosingLibrary.importUri.toString(), owner?.name],
++      names,
++    ]);
++    return r'_flaxFixed#' +
++        target.name.text +
++        r'$' +
++        sha256.convert(utf8.encode(identity)).toString().substring(0, 24);
++  }
++
++  void run() {
++    if (buildSdk) {
++      final targets = [
++        for (final l in libraries)
++          if (l.importUri.isScheme('dart'))
++            for (final c in l.classes)
++              if (!c.name.startsWith('_'))
++                for (final p in c.procedures)
++                  if (!p.name.isPrivate &&
++                      !p.isStatic &&
++                      p.kind == ProcedureKind.Method &&
++                      !p.name.text.startsWith(r'_flaxFixed#') &&
++                      (p.function.namedParameters.isNotEmpty ||
++                          p.function.positionalParameters.length >
++                              p.function.requiredParameterCount))
++                    p,
++      ];
++      for (final target in targets) {
++        current = target;
++        virtualEntry(target, layout(target));
++      }
++    }
++    for (final library in libraries) {
++      for (final field in library.fields.toList()) {
++        current = field;
++        field.transformChildren(this);
++      }
++      for (final p in library.procedures.toList()) {
++        current = p;
++        p.transformChildren(this);
++      }
++      for (final c in library.classes.toList()) {
++        for (final field in c.fields.toList()) {
++          current = field;
++          field.transformChildren(this);
++        }
++        for (final constructor in c.constructors.toList()) {
++          current = constructor;
++          constructor.transformChildren(this);
++        }
++        for (final p in c.procedures.toList()) {
++          current = p;
++          p.transformChildren(this);
++        }
++      }
++    }
++  }
++
++  Procedure validator(Library library) {
++    const name = r'$flaxValidateFixedMask#v1';
++    if (library.procedures.where((p) => p.name.text == name).firstOrNull
++        case final previous?) {
++      return previous;
++    }
++    final provided = PositionalParameter(
++      parameterName: 'provided',
++      type: core.intNonNullableRawType,
++    );
++    final required = PositionalParameter(
++      parameterName: 'required',
++      type: core.intNonNullableRawType,
++    );
++    final length = PositionalParameter(
++      parameterName: 'length',
++      type: core.intNonNullableRawType,
++    );
++    final positional = PositionalParameter(
++      parameterName: 'positional',
++      type: core.intNonNullableRawType,
++    );
++    Expression op(Expression value, String name, Expression other) =>
++        invokeCore(value, 'int', name, [other]);
++    Expression equals(Expression a, Expression b) => EqualsCall(
++      a,
++      b,
++      functionType: core.index
++          .getProcedure('dart:core', 'Object', '==')
++          .function
++          .computeFunctionType(Nullability.nonNullable),
++      interfaceTarget: core.index.getProcedure('dart:core', 'Object', '=='),
++    );
++    final bits = CachedExpression.fromValue(
++      value: op(
++        VariableGet(provided),
++        '&',
++        op(
++          op(IntLiteral(1), '<<', VariableGet(positional)),
++          '-',
++          IntLiteral(1),
++        ),
++      ),
++      type: core.intNonNullableRawType,
++    );
++    final invalid = LogicalExpression(
++      LogicalExpression(
++        op(VariableGet(provided), '<', IntLiteral(0)),
++        LogicalExpressionOperator.OR,
++        Not(
++          equals(
++            op(VariableGet(provided), '>>', VariableGet(length)),
++            IntLiteral(0),
++          ),
++        ),
++      ),
++      LogicalExpressionOperator.OR,
++      LogicalExpression(
++        Not(
++          equals(
++            op(VariableGet(provided), '&', VariableGet(required)),
++            VariableGet(required),
++          ),
++        ),
++        LogicalExpressionOperator.OR,
++        Not(
++          equals(
++            op(
++              bits.createRead(),
++              '&',
++              op(bits.createRead(), '+', IntLiteral(1)),
++            ),
++            IntLiteral(0),
++          ),
++        ),
++      ),
++    );
++    final result = Procedure(
++      Name(name),
++      ProcedureKind.Method,
++      FunctionNode(
++        Block([
++          IfStatement(
++            bits.createLet(body: invalid),
++            ExpressionStatement(
++              Throw(
++                ConstructorInvocation(
++                  core.index.getConstructor('dart:core', 'ArgumentError', ''),
++                  Arguments(
++                    ExpressionList(StringLiteral('Invalid fixed arguments')),
++                  ),
++                ),
++              ),
++            ),
++            null,
++          ),
++        ]),
++        positionalParameters: PositionalParameterList(
++          provided,
++          required,
++          length,
++          positional,
++        ),
++        requiredParameterCount: 4,
++        returnType: const VoidType(),
++      ),
++      isStatic: true,
++      fileUri: library.fileUri,
++      reference: priorReference(library, null, Name(name)),
++    );
++    result.accept(_GeneratedLocations(0));
++    library.addProcedure(result);
++    changedStructureNotifier?.registerLibraryChange(library);
++    return result;
++  }
++
++  Expression invokeCore(
++    Expression receiver,
++    String owner,
++    String name,
++    List<Expression> args,
++  ) {
++    final target =
++        hierarchy.getInterfaceMember(
++              core.index.getClass('dart:core', owner),
++              Name(name),
++            )
++            as Procedure;
++    return InstanceInvocation(
++      InstanceAccessKind.Instance,
++      receiver,
++      Name(name),
++      Arguments(ExpressionList.from(args)),
++      interfaceTarget: target,
++      functionType: owner == 'List'
++          ? FunctionType(
++              DartTypeList(core.intNonNullableRawType),
++              core.objectNullableRawType,
++              Nullability.nonNullable,
++            )
++          : target.function
++                .computeFunctionType(Nullability.nonNullable)
++                .withoutTypeParameters,
++    );
++  }
++
++  Expression present(List<PositionalParameter> masks, int index) => Not(
++    EqualsCall(
++      invokeCore(VariableGet(masks[index ~/ 32]), 'int', '&', [
++        IntLiteral(1 << (index % 32)),
++      ]),
++      IntLiteral(0),
++      functionType: core.index
++          .getProcedure('dart:core', 'Object', '==')
++          .function
++          .computeFunctionType(Nullability.nonNullable),
++      interfaceTarget: core.index.getProcedure('dart:core', 'Object', '=='),
++    ),
++  );
++  List<String> readNames(Expression e) {
++    if (e is ConstantExpression && e.constant is ListConstant) {
++      return (e.constant as ListConstant).entries
++          .map((v) => (v as StringConstant).value)
++          .toList();
++    }
++    if (e is ListLiteral) {
++      return e.expressions.map((v) => (v as StringLiteral).value).toList();
++    }
++    throw StateError('Fixed layout must be constant: $e');
++  }
++
++  List<NominalParameter> cloneParameters(
++    List<TypeParameter> source,
++    Map<TypeParameter, DartType> substitutions,
++  ) {
++    final result = [for (final p in source) NominalParameter(p.name)];
++    for (var i = 0; i < source.length; i++) {
++      substitutions[source[i]] = TypeParameterType(
++        result[i],
++        Nullability.nonNullable,
++      );
++    }
++    for (var i = 0; i < source.length; i++) {
++      result[i].bound = substitute(source[i].bound, substitutions);
++      result[i].defaultType = substitute(source[i].defaultType, substitutions);
++    }
++    return result;
++  }
++
++  Procedure entry(
++    Member target,
++    List<String> names, {
++    Class? owner,
++    bool superCall = false,
++    Name? sharedName,
++  }) {
++    checkLayout(target, names);
++    final key = (target, owner, superCall, sharedName, jsonEncode(names));
++    final previous = entries[key];
++    if (previous != null) return previous;
++    final library =
++        owner?.enclosingLibrary ??
++        (target.enclosingLibrary.importUri.isScheme('dart')
++            ? current!.enclosingLibrary
++            : target.enclosingLibrary);
++    final name =
++        sharedName ??
++        Name(
++          entryName(target, names, owner: owner, superCall: superCall),
++          library,
++        );
++    final existing = owner == null ? library.procedures : owner.procedures;
++    if (existing.where((p) => p.name == name).firstOrNull
++        case final previous?) {
++      entries[key] = previous;
++      return previous;
++    }
++    if (!buildSdk && library.importUri.isScheme('dart')) {
++      throw StateError(
++        'Fixed entry is absent from the precompiled SDK: ${target.name.text}; build a matching fixed-entry SDK',
++      );
++    }
++    final fn = target.function!;
++    final substitutions = <TypeParameter, DartType>{};
++    if (owner != null &&
++        target.enclosingClass != null &&
++        owner != target.enclosingClass) {
++      final parent = hierarchy.getClassAsInstanceOf(
++        owner,
++        target.enclosingClass!,
++      );
++      if (parent == null) throw StateError('Bad super owner');
++      substitutions.addAll(getSubstitutionMap(parent));
++    }
++    final originalParameters = target is Constructor
++        ? target.enclosingClass.typeParameters
++        : fn.typeParameters;
++    final types = cloneParameters(originalParameters, substitutions);
++    final slots = [
++      for (var i = 0; i < names.length; i++)
++        PositionalParameter(
++          parameterName: 'slot$i',
++          type: core.objectNullableRawType,
++        ),
++    ];
++    final masks = [
++      for (var i = 0; i < (names.length + 31) ~/ 32; i++)
++        PositionalParameter(
++          parameterName: 'provided$i',
++          type: core.intNonNullableRawType,
++        ),
++    ];
++    final positional = <Expression>[];
++    final named = <NamedExpression>[];
++    final positionalCount = names.takeWhile((name) => name.isEmpty).length;
++    final requiredMasks = List<int>.filled(masks.length, 0);
++    Expression argument(
++      FunctionParameter p,
++      int index, {
++      bool positionalRequired = false,
++    }) {
++      final required = p.isRequired || positionalRequired;
++      final type = substitute(p.type, substitutions);
++      if (index < 0) {
++        if (required) {
++          throw StateError('Required parameter missing from fixed layout');
++        }
++        return p.defaultValue == null
++            ? NullLiteral()
++            : CloneVisitorNotMembers(
++                typeSubstitution: substitutions,
++              ).clone(p.defaultValue!);
++      }
++      final actual = AsExpression(VariableGet(slots[index]), type)
++        ..isTypeError = true;
++      if (required) {
++        requiredMasks[index ~/ 32] |= 1 << (index % 32);
++        return actual;
++      }
++      final fallback = p.defaultValue == null
++          ? NullLiteral()
++          : CloneVisitorNotMembers(
++              typeSubstitution: substitutions,
++            ).clone(p.defaultValue!);
++      return ConditionalExpression(
++        present(masks, index),
++        actual,
++        fallback,
++        type,
++      );
++    }
++
++    for (var i = 0; i < fn.positionalParameters.length; i++) {
++      positional.add(
++        argument(
++          fn.positionalParameters[i],
++          i < positionalCount ? i : -1,
++          positionalRequired: i < fn.requiredParameterCount,
++        ),
++      );
++    }
++    for (final p in fn.namedParameters) {
++      named.add(
++        NamedExpression(
++          p.parameterName,
++          argument(p, names.indexOf(p.parameterName)),
++        ),
++      );
++    }
++    named.sort((a, b) => a.name.compareTo(b.name));
++    final typeArguments = DartTypeList.generate(
++      types.length,
++      (i) => TypeParameterType(types[i], Nullability.nonNullable),
++    );
++    final args = Arguments(
++      ExpressionList.from(positional),
++      named: NamedExpressionList.from(named),
++      types: typeArguments,
++    );
++    Expression call;
++    DartType result;
++    if (target is Constructor) {
++      call = ConstructorInvocation(target, args);
++      result = InterfaceType(
++        target.enclosingClass,
++        Nullability.nonNullable,
++        DartTypeList.from(typeArguments),
++      );
++    } else {
++      final p = target as Procedure;
++      result = substitute(fn.returnType, substitutions);
++      if (owner == null) {
++        call = StaticInvocation(p, args);
++      } else if (superCall) {
++        call = SuperMethodInvocation(ThisExpression(), p.name, args, p);
++      } else {
++        call = InstanceInvocation(
++          InstanceAccessKind.Instance,
++          ThisExpression(),
++          p.name,
++          args,
++          interfaceTarget: p,
++          functionType: FunctionType(
++            DartTypeList.generate(
++              fn.positionalParameters.length,
++              (i) => substitute(fn.positionalParameters[i].type, substitutions),
++            ),
++            result,
++            Nullability.nonNullable,
++            namedParameters: NamedDartTypeList.generate(
++              fn.namedParameters.length,
++              (i) => NamedType(
++                fn.namedParameters[i].parameterName,
++                substitute(fn.namedParameters[i].type, substitutions),
++                isRequired: fn.namedParameters[i].isRequired,
++              ),
++            )..sort((a, b) => a.name.compareTo(b.name)),
++            requiredParameterCount: fn.requiredParameterCount,
++          ),
++        );
++      }
++    }
++    final marker = validator(library);
++    final statements = <Statement>[
++      for (var i = 0; i < masks.length; i++)
++        ExpressionStatement(
++          StaticInvocation(
++            marker,
++            Arguments(
++              ExpressionList(
++                VariableGet(masks[i]),
++                IntLiteral(requiredMasks[i]),
++                IntLiteral((names.length - i * 32).clamp(0, 32)),
++                IntLiteral((positionalCount - i * 32).clamp(0, 32)),
++              ),
++            ),
++          ),
++        ),
++      for (var i = 1; i < masks.length && i * 32 < positionalCount; i++)
++        IfStatement(
++          Not(
++            EqualsCall(
++              VariableGet(masks[i - 1]),
++              IntLiteral(0xffffffff),
++              functionType: core.index
++                  .getProcedure('dart:core', 'Object', '==')
++                  .function
++                  .computeFunctionType(Nullability.nonNullable),
++              interfaceTarget: core.index.getProcedure(
++                'dart:core',
++                'Object',
++                '==',
++              ),
++            ),
++          ),
++          ExpressionStatement(
++            StaticInvocation(
++              marker,
++              Arguments(
++                ExpressionList(
++                  VariableGet(masks[i]),
++                  IntLiteral(0),
++                  IntLiteral(0),
++                  IntLiteral(0),
++                ),
++              ),
++            ),
++          ),
++          null,
++        ),
++      ReturnStatement(call),
++    ];
++    final procedure = Procedure(
++      name,
++      ProcedureKind.Method,
++      FunctionNode(
++        Block(statements),
++        positionalParameters: PositionalParameterList.from([
++          ...slots,
++          ...masks,
++        ]),
++        requiredParameterCount: slots.length + masks.length,
++        typeParameters: TypeParameterList.from(types),
++        returnType: result,
++      ),
++      isStatic: owner == null,
++      fileUri: target.fileUri,
++      reference: priorReference(library, owner, name),
++    );
++    if (superCall) procedure.containsSuperCalls = true;
++    procedure.accept(
++      _GeneratedLocations(target.fileOffset < 0 ? 0 : target.fileOffset),
++    );
++    if (owner == null) {
++      library.addProcedure(procedure);
++    } else {
++      owner.addProcedure(procedure);
++      changedStructureNotifier?.registerClassMemberChange(owner);
++    }
++    changedStructureNotifier?.registerLibraryChange(library);
++    entries[key] = procedure;
++    return procedure;
++  }
++
++  Procedure virtualEntry(Procedure target, List<String> names) {
++    final owner = target.enclosingClass!;
++    final key = ('virtual', target, jsonEncode(names));
++    if (entries[key] case final previous?) return previous;
++    final name = Name(entryName(target, names), target.enclosingLibrary);
++    final base = entry(target, names, owner: owner, sharedName: name);
++    entries[key] = base;
++    for (final c
++        in hierarchy.knownLibraries.expand((l) => l.classes).toList()) {
++      if (c == owner || hierarchy.getClassAsInstanceOf(c, owner) == null) {
++        continue;
++      }
++      var declared = false;
++      for (final p in c.procedures.toList()) {
++        if (p.name == target.name &&
++            !p.isStatic &&
++            !p.isAbstract &&
++            p.kind == ProcedureKind.Method &&
++            (buildSdk || !c.enclosingLibrary.importUri.isScheme('dart'))) {
++          entry(p, names, owner: c, sharedName: name);
++          declared = true;
++        }
++      }
++      if (!declared &&
++          (buildSdk || !c.enclosingLibrary.importUri.isScheme('dart')) &&
++          (c.superclass == null ||
++              hierarchy.getClassAsInstanceOf(c.superclass!, owner) == null)) {
++        final inherited = hierarchy.getDispatchTarget(c, target.name);
++        if (inherited is Procedure && !inherited.isAbstract) {
++          entry(inherited, names, owner: c, sharedName: name);
++        }
++      }
++    }
++    return base;
++  }
++
++  @override
++  TreeNode visitStaticInvocation(StaticInvocation node) {
++    if (node.target.name.text != 'flaxInvokeWithDefaults' ||
++        node.target.enclosingLibrary.importUri.toString() !=
++            'package:flax/bindings.dart') {
++      return super.visitStaticInvocation(node);
++    }
++    final original = node.arguments.positional;
++    if (original.length != 4) throw StateError('Wrong fixed marker');
++    var names = readNames(original[3]);
++    final vector = original[1];
++    if (vector is! ListLiteral || vector.expressions.length != names.length) {
++      throw StateError(
++        'Fixed call must have a literal argument vector matching its layout',
++      );
++    }
++    var values = [...vector.expressions];
++    var provided = original[2] is ListLiteral
++        ? [...(original[2] as ListLiteral).expressions]
++        : [original[2]];
++    if (provided.length != (names.length + 31) ~/ 32) {
++      throw StateError('Fixed mask word count does not match its layout');
++    }
++    final originalTarget = original[0];
++    Expression target = originalTarget;
++    DartTypeList typeArgs = DartTypeList.empty;
++    var requiresTargetCheck = false;
++    while (target is AsExpression) {
++      requiresTargetCheck = true;
++      target = target.operand;
++    }
++    if (target is Instantiation) {
++      typeArgs = target.typeArguments;
++      target = target.expression;
++    }
++    while (target is AsExpression) {
++      requiresTargetCheck = true;
++      target = target.operand;
++    }
++    final locals = <CachedExpression>[];
++    final maskChecks = <Statement>[];
++    CachedExpression? receiver;
++    Member? boundMember;
++    if (target is StaticInvocation &&
++        (target.target.isExtensionMember ||
++            target.target.isExtensionTypeMember)) {
++      boundMember = extensionTargets[target.target.reference];
++      if (boundMember != null) {
++        if (target.arguments.positional.length != 1 ||
++            target.arguments.named.isNotEmpty) {
++          throw StateError('Invalid bound extension tear-off');
++        }
++        // The synthesized tear-off only captures this receiver. Preserve its
++        // evaluation order without allocating the temporary bound closure.
++        final bound = target.target.function;
++        final receiverType =
++            substitute(bound.positionalParameters.single.type, {
++              for (var i = 0; i < bound.typeParameters.length; i++)
++                bound.typeParameters[i]: target.arguments.types[i],
++            });
++        receiver = CachedExpression.fromValue(
++          value: AsExpression(target.arguments.positional.single, receiverType)
++            ..isTypeError = true,
++          type: core.objectNullableRawType,
++        );
++        target.arguments.positional[0] = receiver.createRead()
++          ..parent = target.arguments;
++        typeArgs = DartTypeList.from([...target.arguments.types, ...typeArgs]);
++        final slots = [
++          for (final expression in values)
++            CachedExpression.fromValue(
++              value: expression,
++              type: core.objectNullableRawType,
++            ),
++        ];
++        final words = [
++          for (final expression in provided)
++            CachedExpression.fromValue(
++              value: expression,
++              type: core.intNonNullableRawType,
++            ),
++        ];
++        locals.addAll([...slots, ...words]);
++        final positional = names.takeWhile((name) => name.isEmpty).length;
++        for (var i = 0; i < words.length; i++) {
++          maskChecks.add(
++            ExpressionStatement(
++              StaticInvocation(
++                validator(current!.enclosingLibrary),
++                Arguments(
++                  ExpressionList(
++                    words[i].createRead(),
++                    IntLiteral(0),
++                    IntLiteral((names.length - i * 32).clamp(0, 32)),
++                    IntLiteral((positional - i * 32).clamp(0, 32)),
++                  ),
++                ),
++              ),
++            ),
++          );
++        }
++        Expression op(Expression value, String name, int operand) =>
++            invokeCore(value, 'int', name, [IntLiteral(operand)]);
++        names = ['', ...names];
++        values = [
++          receiver.createRead(),
++          for (final slot in slots) slot.createRead(),
++        ];
++        provided = [
++          for (var i = 0; i < (names.length + 31) ~/ 32; i++)
++            invokeCore(
++              i < words.length
++                  ? op(op(words[i].createRead(), '&', 0x7fffffff), '<<', 1)
++                  : IntLiteral(0),
++              'int',
++              '|',
++              [
++                i == 0
++                    ? IntLiteral(1)
++                    : op(op(words[i - 1].createRead(), '>>', 31), '&', 1),
++              ],
++            ),
++        ];
++      }
++    }
++    final canonical =
++        target is InstanceTearOff &&
++            target.interfaceTarget.enclosingLibrary.importUri.isScheme('dart')
++        ? layout(target.interfaceTarget)
++        : null;
++    if (canonical != null && !sameLayout(names, canonical)) {
++      checkLayout((target as InstanceTearOff).interfaceTarget, names);
++      for (final expression in [...values, ...provided]) {
++        locals.add(
++          CachedExpression.fromValue(
++            value: expression,
++            type: core.objectNullableRawType,
++          ),
++        );
++      }
++      final oldNames = names;
++      for (var word = 0; word < provided.length; word++) {
++        maskChecks.add(
++          ExpressionStatement(
++            StaticInvocation(
++              validator(current!.enclosingLibrary),
++              Arguments(
++                ExpressionList(
++                  AsExpression(
++                    locals[oldNames.length + word].createRead(),
++                    core.intNonNullableRawType,
++                  )..isTypeError = true,
++                  IntLiteral(0),
++                  IntLiteral((oldNames.length - word * 32).clamp(0, 32)),
++                  IntLiteral(
++                    (oldNames.takeWhile((name) => name.isEmpty).length -
++                            word * 32)
++                        .clamp(0, 32),
++                  ),
++                ),
++              ),
++            ),
++          ),
++        );
++      }
++      final positions = oldNames.takeWhile((n) => n.isEmpty).length;
++      final count = canonical.takeWhile((n) => n.isEmpty).length;
++      final indices = [
++        for (var i = 0; i < canonical.length; i++)
++          i < count ? (i < positions ? i : -1) : oldNames.indexOf(canonical[i]),
++      ];
++      values = [
++        for (final index in indices)
++          index < 0 ? NullLiteral() : locals[index].createRead(),
++      ];
++      provided = [
++        for (var word = 0; word < (canonical.length + 31) ~/ 32; word++)
++          IntLiteral(0),
++      ];
++      for (var index = 0; index < indices.length; index++) {
++        final source = indices[index];
++        if (source < 0) continue;
++        final input = AsExpression(
++          locals[oldNames.length + source ~/ 32].createRead(),
++          core.intNonNullableRawType,
++        )..isTypeError = true;
++        final bit = invokeCore(input, 'int', '&', [
++          IntLiteral(1 << (source % 32)),
++        ]);
++        final shifted = index % 32 >= source % 32
++            ? invokeCore(bit, 'int', '<<', [
++                IntLiteral(index % 32 - source % 32),
++              ])
++            : invokeCore(bit, 'int', '>>', [
++                IntLiteral(source % 32 - index % 32),
++              ]);
++        provided[index ~/ 32] = invokeCore(provided[index ~/ 32], 'int', '|', [
++          shifted,
++        ]);
++      }
++      names = canonical;
++    }
++    final actuals = [...values, ...provided];
++    final entryType = FunctionType(
++      DartTypeList.generate(
++        names.length + provided.length,
++        (i) => i < names.length
++            ? core.objectNullableRawType
++            : core.intNonNullableRawType,
++      ),
++      const DynamicType(),
++      Nullability.nonNullable,
++    );
++    Member? member = boundMember;
++    if (target is ConstantExpression) {
++      Constant c = target.constant;
++      if (c is InstantiationConstant) {
++        typeArgs = c.types;
++        c = c.tearOffConstant;
++      }
++      if (c is TearOffConstant) member = c.target;
++    } else if (target is ConstructorTearOff) {
++      member = target.target;
++    } else if (target is StaticTearOff) {
++      member = target.target;
++    }
++    Expression replacement;
++    if (member != null) {
++      final helper = entry(member, names);
++      replacement = StaticInvocation(
++        helper,
++        Arguments(ExpressionList.from(actuals), types: typeArgs),
++      );
++    } else if (target is InstanceTearOff) {
++      final helper = virtualEntry(target.interfaceTarget, names);
++      receiver = CachedExpression.fromValue(
++        value: target.receiver,
++        type: InterfaceType(
++          target.interfaceTarget.enclosingClass!,
++          Nullability.nonNullable,
++          DartTypeList.filledWithDynamic(
++            target.interfaceTarget.enclosingClass!.typeParameters.length,
++          ),
++        ),
++      );
++      target.receiver = receiver.createRead()..parent = target;
++      replacement = InstanceInvocation(
++        InstanceAccessKind.Instance,
++        receiver.createRead(),
++        helper.name,
++        Arguments(ExpressionList.from(actuals), types: typeArgs),
++        interfaceTarget: helper,
++        functionType: entryType,
++        resultType: const DynamicType(),
++      );
++    } else if (target is SuperPropertyGet) {
++      final helper = entry(
++        target.interfaceTarget,
++        names,
++        owner: current!.enclosingClass!,
++        superCall: true,
++      );
++      replacement = InstanceInvocation(
++        InstanceAccessKind.Instance,
++        ThisExpression(),
++        helper.name,
++        Arguments(ExpressionList.from(actuals), types: typeArgs),
++        interfaceTarget: helper,
++        functionType: entryType,
++        resultType: const DynamicType(),
++      );
++    } else {
++      throw StateError('Flax default calls require a statically known target');
++    }
++    if (maskChecks.isNotEmpty) {
++      replacement = BlockExpression(Block(maskChecks), replacement);
++    }
++    for (final variable in locals.reversed) {
++      replacement = variable.createLet(body: replacement);
++    }
++    if (requiresTargetCheck) {
++      replacement = BlockExpression(
++        Block([ExpressionStatement(originalTarget)]),
++        replacement,
++      );
++    }
++    if (receiver != null) {
++      replacement = receiver.createLet(body: replacement);
++    }
++    replacement.fileOffset = node.fileOffset;
++    replacement.accept(
++      _GeneratedLocations(node.fileOffset < 0 ? 0 : node.fileOffset),
++    );
++    return replacement;
++  }
++}
++
++/// Lower generated Flax calls before mixin and FFI transformations.
++void transformFlaxDefaultCalls(
++  Component component,
++  CoreTypes core,
++  List<Library> libraries,
++  ClassHierarchy hierarchy,
++  ReferenceFromIndex? referenceFromIndex,
++  ChangedStructureNotifier? changedStructureNotifier,
++) {
++  _FixedCalls(
++    component,
++    core,
++    libraries,
++    hierarchy,
++    buildSdk: libraries.any((library) => library.importUri.isScheme('dart')),
++    referenceFromIndex: referenceFromIndex,
++    changedStructureNotifier: changedStructureNotifier,
++  ).run();
++}
+diff --git a/pkg/vm/lib/transformations/record_use/record_use.dart b/pkg/vm/lib/transformations/record_use/record_use.dart
+index b8149b0f860ca60ece5d73581091dc13e652e51e..51c4cf62d61b82449ba0cea75ee1239a6f147446 100644
+--- a/pkg/vm/lib/transformations/record_use/record_use.dart
++++ b/pkg/vm/lib/transformations/record_use/record_use.dart
+@@ -9,7 +9,9 @@ import 'package:collection/collection.dart';
+ import 'package:front_end/src/api_prototype/lowering_predicates.dart';
+ import 'package:front_end/src/kernel/record_use.dart' show isBeingRecorded;
+ import 'package:kernel/ast.dart' as ast;
++import 'package:kernel/core_types.dart';
+ import 'package:record_use/record_use.dart';
++import 'package:vm/modular/transformations/pragma.dart';
+ import 'package:vm/metadata/loading_units.dart' as vm_metadata;
+ import 'package:vm/transformations/record_use/record_call.dart';
+ import 'package:vm/transformations/record_use/record_instance.dart';
+@@ -54,7 +56,9 @@ ast.Component transformComponent(
+ 
+   final callRecorder = CallRecorder(loadingUnitLookup);
+   final instanceRecorder = InstanceRecorder(loadingUnitLookup);
+-  component.accept(_RecordUseVisitor(callRecorder, instanceRecorder));
++  component.accept(
++    _RecordUseVisitor(callRecorder, instanceRecorder, CoreTypes(component)),
++  );
+ 
+   final usages = _usages(
+     callRecorder.callsForMethod,
+@@ -71,8 +75,14 @@ ast.Component transformComponent(
+ class _RecordUseVisitor extends ast.RecursiveVisitor {
+   final CallRecorder staticCallRecorder;
+   final InstanceRecorder instanceUseRecorder;
++  final CoreTypes coreTypes;
++  bool _inFlaxRuntimeIconCreator = false;
+ 
+-  _RecordUseVisitor(this.staticCallRecorder, this.instanceUseRecorder);
++  _RecordUseVisitor(
++    this.staticCallRecorder,
++    this.instanceUseRecorder,
++    this.coreTypes,
++  );
+ 
+   @override
+   void visitProcedure(ast.Procedure node) {
+@@ -84,7 +94,16 @@ class _RecordUseVisitor extends ast.RecursiveVisitor {
+         node.isRedirectingFactory) {
+       return;
+     }
+-    super.visitProcedure(node);
++    final previous = _inFlaxRuntimeIconCreator;
++    _inFlaxRuntimeIconCreator = node.hasPragma(
++      'flax:runtime-icon-data',
++      coreTypes,
++    );
++    try {
++      super.visitProcedure(node);
++    } finally {
++      _inFlaxRuntimeIconCreator = previous;
++    }
+   }
+ 
+   @override
+@@ -142,7 +161,16 @@ class _RecordUseVisitor extends ast.RecursiveVisitor {
+   void visitConstructorInvocation(ast.ConstructorInvocation node) {
+     if (_isAnnotation(node)) return;
+ 
+-    instanceUseRecorder.recordConstructorInvocation(node);
++    final cls = node.target.enclosingClass;
++    // Business-owned icon fonts are delivered separately from host font subsets.
++    // Only the actual marked leaf creator opts out; shared default-call entries
++    // must not inherit a caller's pragma. Still traverse arguments and constants.
++    if (!_inFlaxRuntimeIconCreator ||
++        cls.name != 'IconData' ||
++        cls.enclosingLibrary.importUri.toString() !=
++            'package:flutter/src/widgets/icon_data.dart') {
++      instanceUseRecorder.recordConstructorInvocation(node);
++    }
+ 
+     super.visitConstructorInvocation(node);
+   }
 diff --git a/pkg/vm/lib/transformations/type_flow/analysis.dart b/pkg/vm/lib/transformations/type_flow/analysis.dart
-index 0fbd6cd4..95d32e3a 100644
+index 7cccf141b437610891808337649ab330a984d192..9bce008155130fe39dfc8b01fe9f254678c2e383 100644
 --- a/pkg/vm/lib/transformations/type_flow/analysis.dart
 +++ b/pkg/vm/lib/transformations/type_flow/analysis.dart
-@@ -1682,7 +1682,8 @@ class _ClassHierarchyCache extends TypeHierarchy {
+@@ -1760,7 +1760,8 @@ class _ClassHierarchyCache extends TypeHierarchy {
    @override
    Type getRecordType(RecordShape shape, bool allocated) {
      final cls = getRecordClass(shape);
@@ -97,9 +1143,9 @@ index 0fbd6cd4..95d32e3a 100644
 +    // The Flax VM API may allocate a referenced Record shape without a literal.
 +    return addAllocatedClass(cls);
    }
-
+ 
    _TFClassImpl getRecordClass(RecordShape shape) =>
-@@ -2113,6 +2114,11 @@ class TypeFlowAnalysis
+@@ -2191,6 +2192,11 @@ class TypeFlowAnalysis
          );
        }
        fieldValue = _FieldValue(field, typeGuardSummary, hierarchyCache);
@@ -111,11 +1157,335 @@ index 0fbd6cd4..95d32e3a 100644
        _fieldValues[field] = fieldValue;
      }
      return fieldValue;
+diff --git a/pkg/vm/test/transformations/record_use_flax_test.dart b/pkg/vm/test/transformations/record_use_flax_test.dart
+new file mode 100644
+index 0000000000000000000000000000000000000000..c804366f9976d54caf8f8ccafff4bbe94946ea3e
+--- /dev/null
++++ b/pkg/vm/test/transformations/record_use_flax_test.dart
+@@ -0,0 +1,318 @@
++// Copyright (c) 2026, the Dart project authors. Please see the AUTHORS file
++// for details. All rights reserved. Use of this source code is governed by a
++// BSD-style license that can be found in the LICENSE file.
++
++import 'dart:convert';
++import 'dart:io';
++
++import 'package:kernel/ast.dart' as ast;
++import 'package:record_use/record_use.dart' as records;
++import 'package:test/test.dart';
++import 'package:vm/transformations/record_use/record_use.dart';
++
++const _iconUri = 'package:flutter/src/widgets/icon_data.dart';
++const _marker = 'flax:runtime-icon-data';
++
++// Collector-level tests use the post-reachability AST contract: every procedure
++// supplied here is reachable. Application/TFA and font asset tests are separate.
++class _Fixture {
++  final component = ast.Component();
++  late final core = library('dart:core');
++  late final meta = library('package:meta/meta.dart');
++  late final app = library('package:flax_recording_test/main.dart');
++  late final pragma = plainClass(core, 'pragma', ['name', 'options']);
++  late final lookalike = plainClass(
++    library('package:flax_recording_test/foreign.dart'),
++    'pragma',
++    ['name', 'options'],
++  );
++  late final recordUse = plainClass(meta, 'RecordUse', []);
++  late final icon = recordedClass(library(_iconUri), 'IconData');
++  late final foreignIcon = recordedClass(
++    library('package:flax_recording_test/icon.dart'),
++    'IconData',
++  );
++  late final other = recordedClass(
++    library('package:flax_recording_test/other.dart'),
++    'Other',
++  );
++
++  _Fixture() {
++    // Ensure the core pragma exists before CoreTypes indexes the component.
++    pragma;
++    icon;
++    foreignIcon;
++    other;
++  }
++
++  ast.Library library(String uri) {
++    final library = ast.Library(Uri.parse(uri), fileUri: Uri.parse(uri));
++    component.libraries.add(library);
++    library.parent = component;
++    return library;
++  }
++
++  ast.Class plainClass(ast.Library owner, String name, List<String> fields) {
++    final cls = ast.Class(
++      name: name,
++      fileUri: owner.fileUri,
++      fields: [
++        for (final field in fields)
++          ast.Field.immutable(ast.Name(field), fileUri: owner.fileUri),
++      ],
++    );
++    owner.addClass(cls);
++    return cls;
++  }
++
++  ast.ConstantExpression annotation(ast.Class cls, {String? name}) =>
++      ast.ConstantExpression(
++        ast.InstanceConstant(cls.reference, ast.DartTypeList.empty, {
++          for (final field in cls.fields)
++            field.fieldReference: field.name.text == 'name'
++                ? ast.StringConstant(name!)
++                : ast.NullConstant(),
++        }),
++      );
++
++  ast.Class recordedClass(ast.Library owner, String name) {
++    final cls = plainClass(owner, name, ['codePoint']);
++    cls.addAnnotation(annotation(recordUse));
++    cls.addConstructor(
++      ast.Constructor(
++        ast.FunctionNode(
++          ast.EmptyStatement(),
++          positionalParameters: ast.PositionalParameterList(
++            ast.PositionalParameter(parameterName: 'codePoint'),
++          ),
++        ),
++        name: ast.Name(''),
++        isConst: true,
++        fileUri: owner.fileUri,
++      ),
++    );
++    return cls;
++  }
++
++  ast.ConstructorInvocation create(ast.Class cls, ast.Expression value) =>
++      ast.ConstructorInvocation(
++        cls.constructors.single,
++        ast.Arguments(ast.ExpressionList(value)),
++      );
++
++  ast.ConstantExpression constantIcon(int codePoint) => ast.ConstantExpression(
++    ast.InstanceConstant(icon.reference, ast.DartTypeList.empty, {
++      icon.fields.single.fieldReference: ast.IntConstant(codePoint),
++    }),
++  );
++
++  ast.Procedure creator(
++    String name,
++    List<ast.Expression> Function(ast.PositionalParameter) body, {
++    String? marker,
++    bool foreignPragma = false,
++  }) {
++    final value = ast.PositionalParameter(parameterName: 'value');
++    final procedure = ast.Procedure(
++      ast.Name(name, app),
++      ast.ProcedureKind.Method,
++      ast.FunctionNode(
++        ast.Block([
++          for (final expression in body(value))
++            ast.ExpressionStatement(expression),
++        ]),
++        positionalParameters: ast.PositionalParameterList(value),
++      ),
++      isStatic: true,
++      fileUri: app.fileUri,
++    );
++    if (marker != null) {
++      procedure.addAnnotation(
++        annotation(foreignPragma ? lookalike : pragma, name: marker),
++      );
++    }
++    app.addProcedure(procedure);
++    return procedure;
++  }
++
++  records.Recordings collect() {
++    final directory = Directory.systemTemp.createTempSync('flax-record-use-');
++    try {
++      final output = directory.uri.resolve('recorded_uses.json');
++      transformComponent(
++        component,
++        output,
++        loadingUnitLookup: (_) => const records.LoadingUnit('0'),
++      );
++      return records.Recordings.fromJson(
++        jsonDecode(File.fromUri(output).readAsStringSync()),
++      );
++    } finally {
++      directory.deleteSync(recursive: true);
++    }
++  }
++
++  List<records.InstanceReference> uses(
++    records.Recordings result,
++    ast.Class cls,
++  ) =>
++      result.instances[records.Class(
++        cls.name,
++        records.Library(cls.enclosingLibrary.importUri.toString()),
++      )] ??
++      [];
++}
++
++void main() {
++  test(
++    'exact core pragma omits only lexical runtime Flutter IconData creation',
++    () {
++      final f = _Fixture();
++      f.creator(
++        'markedLeaf',
++        (value) => [f.create(f.icon, ast.VariableGet(value))],
++        marker: _marker,
++      );
++      expect(f.uses(f.collect(), f.icon), isEmpty);
++    },
++  );
++
++  test(
++    'marked body still traverses constants, other classes and recorded calls',
++    () {
++      final f = _Fixture();
++      final call = f.creator('recordedCall', (_) => []);
++      call.addAnnotation(f.annotation(f.recordUse));
++      f.creator(
++        'markedLeaf',
++        (value) => [
++          f.create(f.icon, ast.VariableGet(value)),
++          f.constantIcon(77),
++          f.create(f.other, ast.VariableGet(value)),
++          f.create(f.icon, f.create(f.other, ast.IntLiteral(2))),
++          f.create(f.icon, f.constantIcon(88)),
++          f.create(
++            f.icon,
++            ast.StaticInvocation(
++              call,
++              ast.Arguments(ast.ExpressionList(ast.VariableGet(value))),
++            ),
++          ),
++          ast.StaticInvocation(
++            call,
++            ast.Arguments(ast.ExpressionList(ast.IntLiteral(1))),
++          ),
++        ],
++        marker: _marker,
++      );
++      final result = f.collect();
++      expect(f.uses(result, f.icon), hasLength(2));
++      expect(
++        f.uses(result, f.icon),
++        everyElement(isA<records.InstanceConstantReference>()),
++      );
++      expect(
++        f.uses(result, f.other).whereType<records.InstanceCreationReference>(),
++        hasLength(2),
++      );
++      expect(result.calls.values.expand((calls) => calls), hasLength(2));
++    },
++  );
++
++  test('unmarked, wrong spelling and non-core lookalike stay recorded', () {
++    for (final (name, marker, foreign) in [
++      ('unmarked', null, false),
++      ('wrongName', 'flax:runtime-icon-datum', false),
++      ('foreignPragma', _marker, true),
++    ]) {
++      final f = _Fixture();
++      f.creator(
++        name,
++        (value) => [f.create(f.icon, ast.VariableGet(value))],
++        marker: marker,
++        foreignPragma: foreign,
++      );
++      final use = f.uses(f.collect(), f.icon).single;
++      expect(use, isA<records.InstanceCreationReference>(), reason: name);
++      expect(
++        (use as records.InstanceCreationReference).positionalArguments.single,
++        isA<records.NonConstant>(),
++        reason: name,
++      );
++    }
++  });
++
++  test('same-named foreign IconData is not exempt', () {
++    final f = _Fixture();
++    f.creator(
++      'markedLeaf',
++      (value) => [f.create(f.foreignIcon, ast.VariableGet(value))],
++      marker: _marker,
++    );
++    expect(
++      f
++          .uses(f.collect(), f.foreignIcon)
++          .whereType<records.InstanceCreationReference>(),
++      hasLength(1),
++    );
++  });
++
++  test('indirect and shared fixed entries do not inherit caller marker', () {
++    for (final name in ['unmarkedCallee', r'_flaxFixed#IconData$shared']) {
++      final f = _Fixture();
++      final callee = f.creator(
++        name,
++        (value) => [f.create(f.icon, ast.VariableGet(value))],
++      );
++      f.creator(
++        'markedCaller',
++        (value) => [
++          ast.StaticInvocation(
++            callee,
++            ast.Arguments(ast.ExpressionList(ast.VariableGet(value))),
++          ),
++        ],
++        marker: _marker,
++      );
++      f.creator(
++        'unmarkedSibling',
++        (value) => [
++          ast.StaticInvocation(
++            callee,
++            ast.Arguments(ast.ExpressionList(ast.VariableGet(value))),
++          ),
++        ],
++      );
++      expect(
++        f.uses(f.collect(), f.icon).single,
++        isA<records.InstanceCreationReference>(),
++        reason: name,
++      );
++    }
++  });
++
++  test('constructor tear-offs in marked code remain recorded', () {
++    final f = _Fixture();
++    f.creator(
++      'markedLeaf',
++      (_) => [ast.ConstructorTearOff(f.icon.constructors.single)],
++      marker: _marker,
++    );
++    expect(
++      f.uses(f.collect(), f.icon).single,
++      isA<records.ConstructorTearoffReference>(),
++    );
++  });
++
++  test(
++    'ordinary non-const syntax with constant arguments remains recorded',
++    () {
++      final f = _Fixture();
++      f.creator('ordinary', (_) => [f.create(f.icon, ast.IntLiteral(42))]);
++      final use =
++          f.uses(f.collect(), f.icon).single
++              as records.InstanceCreationReference;
++      expect(use.positionalArguments.single, const records.IntConstant(42));
++    },
++  );
++}
 diff --git a/runtime/BUILD.gn b/runtime/BUILD.gn
-index 5c3eb760..360a19f1 100644
+index 9da80ef6f3cc6bcf570d183abe6f8f30d75165e3..ab45c630f50ca92ebbc6cd256d3e488ed949f09d 100644
 --- a/runtime/BUILD.gn
 +++ b/runtime/BUILD.gn
-@@ -352,6 +352,7 @@ source_set("dart_api") {
+@@ -357,6 +357,7 @@ source_set("dart_api") {
    sources = [
      "include/analyze_snapshot_api.h",
      "include/dart_api.h",
@@ -123,7 +1493,7 @@ index 5c3eb760..360a19f1 100644
      "include/dart_api_dl.c",
      "include/dart_api_dl.h",
      "include/dart_native_api.h",
-@@ -390,6 +391,7 @@ library_for_all_configs("libdart") {
+@@ -395,6 +396,7 @@ library_for_all_configs("libdart") {
      "$target_gen_dir/version.cc",
      "include/analyze_snapshot_api.h",
      "include/dart_api.h",
@@ -132,10 +1502,10 @@ index 5c3eb760..360a19f1 100644
      "include/dart_tools_api.h",
      "vm/analyze_snapshot_api_impl.cc",
 diff --git a/runtime/bin/BUILD.gn b/runtime/bin/BUILD.gn
-index ecff06a6..467fad02 100644
+index 9c62239d51a6002f4241c79d0ebe8ce655301954..d2833949346f4910d25707eb1117a2c4acd0065d 100644
 --- a/runtime/bin/BUILD.gn
 +++ b/runtime/bin/BUILD.gn
-@@ -1125,6 +1125,7 @@ source_set("run_vm_tests_set") {
+@@ -1206,6 +1206,7 @@ source_set("run_vm_tests_set") {
    deps = [
      "//third_party/boringssl",  # for secure_socket_utils_test
      "//third_party/perfetto:libprotozero",  # for timeline_test
@@ -143,8 +1513,88 @@ index ecff06a6..467fad02 100644
    ]
  
    if (is_fuchsia) {
+diff --git a/runtime/include/dart_flax_api.h b/runtime/include/dart_flax_api.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..6d78c0482422e691729bc23bb0ba6bac18decb16
+--- /dev/null
++++ b/runtime/include/dart_flax_api.h
+@@ -0,0 +1,74 @@
++// Experimental Flax cross-heap tracing. Not part of the public Dart API.
++#ifndef RUNTIME_INCLUDE_DART_FLAX_API_H_
++#define RUNTIME_INCLUDE_DART_FLAX_API_H_
++#include "dart_api.h"
++#ifdef __cplusplus
++extern "C" {
++#endif
++// The VM owns the epoch. The collector runs synchronously on its owner in VM
++// execution state, outside the GC safepoint. No application execution, ordinary
++// Dart API calls, microtasks, or heap allocation are allowed in the callback.
++typedef uint64_t Dart_FlaxGCEpoch;
++typedef void (*Dart_FlaxCollector)(void*, Dart_FlaxGCEpoch);
++// Try to stage Dart roots for an embedder major already in its atomic pause.
++// Zero leaves the caller in native state. A nonzero epoch requires a matching
++// Finish on this thread before leaving the pause. Only GCCheckpoint and Finish
++// may enter Dart during that interval, and no application code may execute.
++DART_EXPORT Dart_FlaxGCEpoch Dart_FlaxTryBeginEmbedderGC(void* collector_peer);
++// Reserve before taking the V8 Locker. A positive result is the number of
++// isolates in the stable group. The owner remains in native state until Begin.
++DART_EXPORT int32_t Dart_FlaxTryReserveEmbedderGC(void* collector_peer);
++// Release the matching reservation and return its full closed time in us.
++// Finish must already have returned if a marker was staged.
++DART_EXPORT int64_t Dart_FlaxReleaseEmbedderGCReservation(void);
++// Commit only after tracing has reached closure. A matching Finish restores
++// native state even if an intervening Dart GC retired the epoch. False means
++// there was no precise commit. Passing commit=false retains the Dart peers.
++DART_EXPORT bool Dart_FlaxFinishEmbedderGC(Dart_FlaxGCEpoch epoch, bool commit);
++// A checkpoint acquires a short GC safepoint, validates the epoch, and drains
++// ordinary strong/ephemeron marking before reporting newly reached origins.
++// The origin sink may only copy handle identities; it must not enter V8 or Dart.
++// No VM visitor escapes. False means the epoch was aborted by an intervening GC;
++// the collector must preserve all peers and request a fresh owner pass.
++DART_EXPORT bool Dart_FlaxGCCheckpoint(
++    Dart_FlaxGCEpoch epoch,
++    const Dart_WeakPersistentHandle* targets,
++    intptr_t target_count,
++    void (*origin_sink)(void*, Dart_WeakPersistentHandle),
++    void* peer,
++    bool* all_targets_marked);
++DART_EXPORT bool Dart_FlaxSetCollector(Dart_FlaxCollector collector,
++                                       void* peer);
++DART_EXPORT bool Dart_FlaxRegisterHandle(Dart_WeakPersistentHandle handle,
++                                         bool is_origin);
++DART_EXPORT void Dart_FlaxSetCollectionRequest(void (*request)(void*));
++// Controlled GC for this experiment, separate from automatic allocation GC.
++DART_EXPORT void Dart_FlaxCollect(bool young, bool compact);
++// Pin a writable Uint8List (or view) until its last native buffer owner releases
++// it. Pin/view calls require the owning isolate. Release runs on that isolate,
++// or on any thread after isolate shutdown has retired the root.
++typedef struct {
++  void* token;
++  void* data;
++  intptr_t byte_length;
++  intptr_t offset;
++  intptr_t length;
++} Dart_FlaxBuffer;
++DART_EXPORT Dart_Handle Dart_FlaxPinUint8List(Dart_Handle, Dart_FlaxBuffer*);
++DART_EXPORT void Dart_FlaxReleaseBuffer(void* token);
++DART_EXPORT Dart_Handle Dart_FlaxUint8ListView(void* token,
++                                              intptr_t offset,
++                                              intptr_t length);
++// Owning-isolate APIs. Errors are ordinary Dart API error handles.
++// Type parts: [display, nullable, library, declaration, children, shape, parents].
++DART_EXPORT Dart_Handle Dart_FlaxTypeParts(Dart_Handle type);
++// A null type constructs a runtime layout from sorted named fields.
++DART_EXPORT Dart_Handle Dart_FlaxRecordFields(Dart_Handle record);
++DART_EXPORT Dart_Handle Dart_FlaxNewRecord(Dart_Handle type, Dart_Handle names,
++                                         Dart_Handle fields);
++DART_EXPORT Dart_Handle Dart_FlaxNullableType(Dart_Handle type);
++DART_EXPORT Dart_Handle Dart_FlaxInstantiate(Dart_Handle closure, Dart_Handle types);
++#ifdef __cplusplus
++}
++#endif
++#endif
 diff --git a/runtime/vm/dart_api_impl.cc b/runtime/vm/dart_api_impl.cc
-index ac526ee0..38806aa6 100644
+index ac526ee01b1f2745c907841f02a851cfb5ad60bf..38806aa6df75f0f700f4d7b81ed879649eec0049 100644
 --- a/runtime/vm/dart_api_impl.cc
 +++ b/runtime/vm/dart_api_impl.cc
 @@ -3,6 +3,7 @@
@@ -683,2128 +2133,8 @@ index ac526ee0..38806aa6 100644
 +}
 +
 +}  // namespace dart
-diff --git a/runtime/vm/dart_api_state.h b/runtime/vm/dart_api_state.h
-index 394ac210..f481149b 100644
---- a/runtime/vm/dart_api_state.h
-+++ b/runtime/vm/dart_api_state.h
-@@ -5,7 +5,10 @@
- #ifndef RUNTIME_VM_DART_API_STATE_H_
- #define RUNTIME_VM_DART_API_STATE_H_
- 
-+#include <unordered_map>
-+
- #include "include/dart_api.h"
-+#include "include/dart_flax_api.h"
- #include "platform/utils.h"
- #include "vm/bitfield.h"
- #include "vm/dart_api_impl.h"
-@@ -726,9 +729,67 @@ class ApiState {
-   }
-   void FreeWeakPersistentHandle(FinalizablePersistentHandle* weak_ref) {
-     MutexLocker ml(&mutex_);
-+    flax_handles_.erase(weak_ref);
-     weak_persistent_handles_.FreeHandle(weak_ref);
-   }
- 
-+  // Experimental: minor collections retain bridge targets until a joint major
-+  // collection. Normal major root enumeration deliberately omits these handles.
-+  void VisitFlaxHandles(ObjectPointerVisitor* visitor) {
-+    MutexLocker ml(&mutex_);
-+    for (auto& entry : flax_handles_) {
-+      auto* handle = entry.first;
-+      if (!handle->IsFinalizedNotFreed() && handle->ptr()->IsHeapObject()) {
-+        // Keep the weak slot in from-space until the ordinary weak visitor
-+        // sees the forwarding header. Updating it early looks unreachable.
-+        ObjectPtr object = handle->ptr();
-+        visitor->VisitPointer(&object);
-+      }
-+    }
-+  }
-+
-+  bool RegisterFlaxHandle(Dart_WeakPersistentHandle object, bool is_origin) {
-+    MutexLocker ml(&mutex_);
-+    if (!weak_persistent_handles_.IsValidHandle(object) ||
-+        weak_persistent_handles_.IsFreeHandle(object))
-+      return false;
-+    auto* handle = reinterpret_cast<FinalizablePersistentHandle*>(object);
-+    if (handle->auto_delete() || handle->IsFinalizedNotFreed()) return false;
-+    return flax_handles_.emplace(handle, is_origin).second;
-+  }
-+
-+  bool SetFlaxCollector(Dart_FlaxCollector collector,
-+                        void* peer,
-+                        Thread* owner) {
-+    if (flax_epoch_ != 0 || flax_callback_active_) return false;
-+    if (flax_collector_ != nullptr && collector != nullptr) return false;
-+    if (flax_collector_ != nullptr && flax_owner_ != owner) return false;
-+    flax_collector_ = collector;
-+    flax_peer_ = peer;
-+    flax_owner_ = collector == nullptr ? nullptr : owner;
-+    if (collector == nullptr) flax_request_ = nullptr;
-+    return true;
-+  }
-+  Dart_FlaxCollector flax_collector() const { return flax_collector_; }
-+  void* flax_peer() const { return flax_peer_; }
-+  Thread* flax_owner() const { return flax_owner_; }
-+  Dart_FlaxGCEpoch flax_epoch() const { return flax_epoch_; }
-+  void BeginFlaxEpoch() {
-+    RELEASE_ASSERT(flax_epoch_ == 0);
-+    RELEASE_ASSERT(++flax_epoch_counter_ != 0);
-+    flax_epoch_ = flax_epoch_counter_;
-+  }
-+  void EndFlaxEpoch() { flax_epoch_ = 0; }
-+  bool flax_callback_active() const { return flax_callback_active_; }
-+  void set_flax_callback_active(bool active) { flax_callback_active_ = active; }
-+  const auto& flax_handles() const { return flax_handles_; }
-+  void SetFlaxCollectionRequest(void (*request)(void*)) {
-+    flax_request_ = request;
-+  }
-+  void RequestFlaxCollection() const {
-+    if (flax_request_ != nullptr) flax_request_(flax_peer_);
-+  }
-+
-   bool IsValidPersistentHandle(Dart_PersistentHandle object) {
-     MutexLocker ml(&mutex_);
-     return persistent_handles_.IsValidHandle(object);
-@@ -781,6 +842,14 @@ class ApiState {
-   PersistentHandles persistent_handles_;
-   FinalizablePersistentHandles weak_persistent_handles_;
-   WeakTable acquired_table_;
-+  std::unordered_map<FinalizablePersistentHandle*, bool> flax_handles_;
-+  Dart_FlaxCollector flax_collector_ = nullptr;
-+  void* flax_peer_ = nullptr;
-+  Thread* flax_owner_ = nullptr;
-+  void (*flax_request_)(void*) = nullptr;
-+  Dart_FlaxGCEpoch flax_epoch_counter_ = 0;
-+  Dart_FlaxGCEpoch flax_epoch_ = 0;
-+  bool flax_callback_active_ = false;
- 
-   DISALLOW_COPY_AND_ASSIGN(ApiState);
- };
-diff --git a/runtime/vm/heap/marker.cc b/runtime/vm/heap/marker.cc
-index f58905a0..c54f7aaa 100644
---- a/runtime/vm/heap/marker.cc
-+++ b/runtime/vm/heap/marker.cc
-@@ -4,6 +4,10 @@
- 
- #include "vm/heap/marker.h"
- 
-+#include <unordered_map>
-+#include <unordered_set>
-+#include <vector>
-+
- #include "platform/assert.h"
- #include "platform/atomic.h"
- #include "platform/thread_sanitizer.h"
-@@ -59,6 +63,56 @@ class MarkingVisitor : public ObjectPointerVisitor {
-     return raw->untag()->IsMarked();
-   }
- 
-+  void DrainFlaxMarking() {
-+    do {
-+      ProcessDeferredMarking();
-+      DrainMarkingStack();
-+    } while (ProcessPendingWeakProperties() || !deferred_work_list_.IsEmpty());
-+  }
-+
-+  // Index only bridge origins at the safepoint. The VM reports newly marked
-+  // origins directly; this neither scans nor projects the JavaScript heap.
-+  void BeginFlaxTracing(ApiState* state) {
-+    flax_state_ = state;
-+    for (auto& entry : state->flax_handles()) {
-+      auto* handle = entry.first;
-+      if (!entry.second || handle->IsFinalizedNotFreed()) continue;
-+      ObjectPtr object = handle->ptr();
-+      if (!object->IsHeapObject()) continue;
-+      auto api = handle->ApiWeakPersistentHandle();
-+      flax_origins_[static_cast<uword>(object)].push_back(api);
-+      if (object->untag()->IsMarked()) QueueFlaxOrigin(api);
-+    }
-+  }
-+
-+  static bool FlaxIsMarked(void* context, Dart_WeakPersistentHandle api) {
-+    auto* visitor = static_cast<MarkingVisitor*>(context);
-+    auto* handle = reinterpret_cast<FinalizablePersistentHandle*>(api);
-+    if (!visitor->flax_state_->flax_handles().contains(handle) ||
-+        handle->IsFinalizedNotFreed())
-+      return false;
-+    ObjectPtr object = handle->ptr();
-+    return object->IsHeapObject() && object->untag()->IsMarked();
-+  }
-+
-+  void MarkFlaxTargets(const Dart_WeakPersistentHandle* targets,
-+                       intptr_t count) {
-+    for (intptr_t i = 0; i < count; i++) {
-+      auto* handle = reinterpret_cast<FinalizablePersistentHandle*>(targets[i]);
-+      RELEASE_ASSERT(flax_state_->flax_handles().contains(handle));
-+      // A finalized origin must never be resurrected by a live JS target.
-+      if (!handle->IsFinalizedNotFreed()) MarkObject(handle->ptr());
-+    }
-+    FinishedRoots();
-+    DrainFlaxMarking();
-+  }
-+
-+  static Dart_WeakPersistentHandle FlaxNextOrigin(void* context) {
-+    auto* visitor = static_cast<MarkingVisitor*>(context);
-+    if (visitor->flax_next_ == visitor->flax_marked_.size()) return nullptr;
-+    return visitor->flax_marked_[visitor->flax_next_++];
-+  }
-+
-   void FinishedRoots() {
-     // Nothing to remember for roots. Don't carry over to objects.
-     has_evacuation_candidate_ = false;
-@@ -245,6 +299,8 @@ class MarkingVisitor : public ObjectPointerVisitor {
-       ObjectPtr obj;
-       while (MarkerWorkList::Pop(&old_work_list_, &new_work_list_, &obj)) {
-         ASSERT(!has_evacuation_candidate_);
-+        // Barrier-pushed objects may already have their mark bit set.
-+        FlaxObjectMarked(obj);
- 
-         const intptr_t class_id = obj->GetClassIdOfHeapObject();
-         ASSERT(class_id != kIllegalCid);
-@@ -495,6 +551,7 @@ class MarkingVisitor : public ObjectPointerVisitor {
-           marked_bytes_ += size;
-         }
-       }
-+      FlaxObjectMarked(obj);
-       if (has_evacuation_candidate_) {
-         has_evacuation_candidate_ = false;
-         if (!obj->untag()->IsCardRemembered() &&
-@@ -632,6 +689,19 @@ class MarkingVisitor : public ObjectPointerVisitor {
-   GCLinkedLists* delayed() { return &delayed_; }
- 
-  private:
-+  void QueueFlaxOrigin(Dart_WeakPersistentHandle handle) {
-+    if (flax_reported_.insert(handle).second) flax_marked_.push_back(handle);
-+  }
-+
-+  void FlaxObjectMarked(ObjectPtr object) {
-+    if (flax_state_ == nullptr) return;
-+    auto found = flax_origins_.find(static_cast<uword>(object));
-+    if (found != flax_origins_.end()) {
-+      for (auto api : found->second)
-+        QueueFlaxOrigin(api);
-+    }
-+  }
-+
-   DART_FORCE_INLINE
-   bool MarkObject(ObjectPtr obj) {
-     if (obj->IsImmediateObject()) {
-@@ -642,6 +712,7 @@ class MarkingVisitor : public ObjectPointerVisitor {
- #if defined(HOST_HAS_FAST_WRITE_WRITE_FENCE)
-       // Ignore race: TSAN doesn't support fences.
-       if (obj->untag()->TryAcquireMarkBitIgnoreRace()) {
-+        FlaxObjectMarked(obj);
-         new_work_list_.Push(obj);
-       }
- #else
-@@ -650,6 +721,7 @@ class MarkingVisitor : public ObjectPointerVisitor {
-         // initializing store.
-         deferred_work_list_.Push(obj);
-       } else if (obj->untag()->TryAcquireMarkBit()) {
-+        FlaxObjectMarked(obj);
-         new_work_list_.Push(obj);
-       }
- #endif
-@@ -683,12 +755,19 @@ class MarkingVisitor : public ObjectPointerVisitor {
-     }
- 
-     if (obj->untag()->TryAcquireMarkBit()) {
-+      FlaxObjectMarked(obj);
-       old_work_list_.Push(obj);
-     }
- 
-     return UntaggedObject::IsEvacuationCandidate(tags);
-   }
- 
-+  ApiState* flax_state_ = nullptr;
-+  std::unordered_map<uword, std::vector<Dart_WeakPersistentHandle>>
-+      flax_origins_;
-+  std::vector<Dart_WeakPersistentHandle> flax_marked_;
-+  std::unordered_set<Dart_WeakPersistentHandle> flax_reported_;
-+  size_t flax_next_ = 0;
-   PageSpace* page_space_;
-   MarkerWorkList old_work_list_;
-   MarkerWorkList new_work_list_;
-@@ -970,6 +1049,14 @@ class ParallelMarkTask : public SafepointTask {
-       visitor_->ProcessDeferredMarking();
-       barrier_->Sync();
- 
-+      // The ordinary mark stays parallel. A registered foreign collector joins
-+      // on the safepoint owner before any weak references are cleared.
-+      if (thread->isolate_group()->api_state()->flax_collector() != nullptr) {
-+        thread->ReleaseStoreBuffer();
-+        visitor_->AddMicros(OS::GetCurrentMonotonicMicros() - start);
-+        return;
-+      }
-+
-       // Phase 3: Weak processing and statistics.
-       visitor_->MournWeakProperties();
-       visitor_->MournWeakReferences();
-@@ -1110,6 +1197,7 @@ GCMarker::~GCMarker() {
-       delete visitors_[i];
-     }
-   }
-+  isolate_group_->api_state()->EndFlaxEpoch();
-   delete[] visitors_;
- }
- 
-@@ -1286,7 +1374,13 @@ class VerifyAfterMarkingVisitor : public ObjectVisitor,
-   bool failed_ = false;
- };
- 
--void GCMarker::MarkObjects(PageSpace* page_space) {
-+void GCMarker::MarkObjects(PageSpace* page_space,
-+                           bool defer_flax_tracing,
-+                           bool stage_flax) {
-+  ApiState* api = isolate_group_->api_state();
-+  const bool completing_flax = api->flax_epoch() != 0;
-+  // Retire the token before any abort, weak processing, or moving collection.
-+  if (completing_flax) api->EndFlaxEpoch();
-   if (isolate_group_->old_marking_stack() != nullptr) {
-     isolate_group_->DisableIncrementalBarrier();
-   }
-@@ -1295,6 +1389,7 @@ void GCMarker::MarkObjects(PageSpace* page_space) {
- 
-   const int num_tasks = FLAG_marker_tasks;
-   RELEASE_ASSERT(num_tasks > 0);
-+  auto collector = api->flax_collector();
-   ThreadBarrier* barrier = new ThreadBarrier(num_tasks, /*initial=*/1);
- 
-   ResetSlices();
-@@ -1324,6 +1419,47 @@ void GCMarker::MarkObjects(PageSpace* page_space) {
-   }
-   visitors_[0]->Adopt(&global_list_);
-   isolate_group_->safepoint_handler()->RunTasks(&tasks);
-+  if (collector != nullptr) {
-+    // Merge pending weak work only after the parallel tasks finish. Newly
-+    // discovered cross-heap edges must reach a fixed point before mourning.
-+    for (intptr_t i = 0; i < num_tasks; i++) {
-+      visitors_[i]->Flush(&global_list_);
-+    }
-+    auto* visitor = visitors_[0];
-+    visitor->Adopt(&global_list_);
-+    auto* thread = Thread::Current();
-+    int64_t start = OS::GetCurrentMonotonicMicros();
-+    visitor->set_concurrent(false);
-+    visitor->ProcessDeferredMarking();
-+    visitor->DrainFlaxMarking();
-+    if (stage_flax) {
-+      RELEASE_ASSERT(thread == api->flax_owner());
-+      RELEASE_ASSERT(!completing_flax && !defer_flax_tracing);
-+      visitor->BeginFlaxTracing(api);
-+      api->BeginFlaxEpoch();
-+      isolate_group_->EnableIncrementalBarrier(
-+          &old_marking_stack_, &new_marking_stack_, &deferred_marking_stack_);
-+      isolate_group_->DeferredMarkLiveTemporaries();
-+      thread->ReleaseStoreBuffer();
-+      visitor->AddMicros(OS::GetCurrentMonotonicMicros() - start);
-+      return;  // The VM owns all visitors and weak lists until commit/abort.
-+    } else if (!completing_flax || defer_flax_tracing) {
-+      // Retain conditional targets until the immediate fresh pass, or until an
-+      // owner-thread major when this thread cannot enter the JS isolate.
-+      api->VisitFlaxHandles(visitor);
-+      visitor->FinishedRoots();
-+      visitor->DrainFlaxMarking();
-+      if (!defer_flax_tracing || completing_flax) {
-+        api->RequestFlaxCollection();
-+      }
-+    }
-+    visitor->MournWeakProperties();
-+    visitor->MournWeakReferences();
-+    visitor->MournWeakArrays();
-+    thread->ReleaseStoreBuffer();
-+    IterateWeakRoots(thread);
-+    visitor->AddMicros(OS::GetCurrentMonotonicMicros() - start);
-+  }
- 
-   for (intptr_t i = 0; i < num_tasks; i++) {
-     MarkingVisitor* visitor = visitors_[i];
-@@ -1349,6 +1485,46 @@ void GCMarker::MarkObjects(PageSpace* page_space) {
-   Epilogue();
- }
- 
-+bool GCMarker::FlaxCheckpoint(const Dart_WeakPersistentHandle* targets,
-+                              intptr_t target_count,
-+                              void (*origin_sink)(void*,
-+                                                  Dart_WeakPersistentHandle),
-+                              void* peer,
-+                              bool* all_targets_marked) {
-+  RELEASE_ASSERT(Thread::Current()->OwnsGCSafepoint());
-+  auto* api = isolate_group_->api_state();
-+  RELEASE_ASSERT(api->flax_epoch() != 0);
-+  auto* visitor = visitors_[0];
-+  for (intptr_t i = 0; i < target_count; i++) {
-+    RELEASE_ASSERT(api->flax_handles().contains(
-+        reinterpret_cast<FinalizablePersistentHandle*>(targets[i])));
-+  }
-+  isolate_group_->FlushMarkingStacks();
-+  heap_->old_space()->WriteProtectCode(false);
-+  Prologue();
-+  visitor->MarkFlaxTargets(targets, target_count);
-+  while (auto origin = MarkingVisitor::FlaxNextOrigin(visitor)) {
-+    if (origin_sink != nullptr) origin_sink(peer, origin);
-+  }
-+  if (all_targets_marked != nullptr) {
-+    *all_targets_marked = true;
-+    for (auto& entry : api->flax_handles()) {
-+      if (!entry.second && !entry.first->IsFinalizedNotFreed() &&
-+          !MarkingVisitor::FlaxIsMarked(
-+              visitor, entry.first->ApiWeakPersistentHandle())) {
-+        *all_targets_marked = false;
-+        break;
-+      }
-+    }
-+  }
-+  Thread::Current()->ReleaseStoreBuffer();
-+  heap_->old_space()->WriteProtectCode(true);
-+  // Other mutators may resume in a barrier-eliminated initialization sequence.
-+  // Keep its live temporaries deferred until the next checkpoint or commit.
-+  isolate_group_->DeferredMarkLiveTemporaries();
-+  return true;
-+}
-+
- void GCMarker::PruneWeak(Scavenger* scavenger) {
-   scavenger->PruneWeak(&global_list_);
-   for (intptr_t i = 0, n = FLAG_marker_tasks; i < n; i++) {
-diff --git a/runtime/vm/heap/scavenger.cc b/runtime/vm/heap/scavenger.cc
-index 9fba03d6..269af227 100644
---- a/runtime/vm/heap/scavenger.cc
-+++ b/runtime/vm/heap/scavenger.cc
-@@ -1163,6 +1163,7 @@ void Scavenger::IterateIsolateRoots(ObjectPointerVisitor* visitor) {
-   TIMELINE_FUNCTION_GC_DURATION(Thread::Current(), "IterateIsolateRoots");
-   heap_->isolate_group()->VisitObjectPointers(
-       visitor, ValidationPolicy::kDontValidateFrames);
-+  heap_->isolate_group()->api_state()->VisitFlaxHandles(visitor);
- }
- 
- void Scavenger::IterateStoreBuffers(ScavengerVisitor* visitor) {
-diff --git a/runtime/vm/object.cc b/runtime/vm/object.cc
-index ad6572f3..ed2b8954 100644
---- a/runtime/vm/object.cc
-+++ b/runtime/vm/object.cc
-@@ -23497,7 +23497,8 @@ AbstractTypePtr TypeParameter::InstantiateFrom(
-              base() - num_free_fun_type_params);
-       ASSERT(TypeParameter::Cast(result).nullability() == nullability());
-       AbstractType& upper_bound = AbstractType::Handle(zone, bound());
--      if (!upper_bound.IsInstantiated()) {
-+      // Only a type parameter can become Never; expanding an F-bound recurses.
-+      if (upper_bound.IsTypeParameter() && !upper_bound.IsInstantiated()) {
-         upper_bound = upper_bound.InstantiateFrom(
-             instantiator_type_arguments, function_type_arguments,
-             num_free_fun_type_params, space, function_type_mapping,
-diff --git a/runtime/vm/visitor.cc b/runtime/vm/visitor.cc
-index 37806bb6..de8133f8 100644
---- a/runtime/vm/visitor.cc
-+++ b/runtime/vm/visitor.cc
-@@ -5,6 +5,7 @@
- #include "vm/visitor.h"
- 
- #include "vm/isolate.h"
-+#include "vm/raw_object.h"
- 
- namespace dart {
- 
-diff --git a/sdk/lib/_internal/vm/lib/async_patch.dart b/sdk/lib/_internal/vm/lib/async_patch.dart
-index f7a03957..93a0f8ca 100644
---- a/sdk/lib/_internal/vm/lib/async_patch.dart
-+++ b/sdk/lib/_internal/vm/lib/async_patch.dart
-@@ -40,6 +40,8 @@ void _asyncStarMoveNextHelper(stream) {
- // async* generator functions.
- @pragma("vm:entry-point")
- class _AsyncStarStreamController<T> {
-+  @pragma("vm:entry-point")
-+  Object? _flaxPendingDependency;
-   @pragma("vm:entry-point")
-   StreamController<T> controller;
-   @pragma("vm:entry-point")
-@@ -162,7 +164,7 @@ class _AsyncStarStreamController<T> {
-       return null;
-     }
-     if (cancellationFuture == null) {
--      cancellationFuture = _Future();
-+      cancellationFuture = _Future().._flaxPendingDependency = this;
-       // Only resume the generator if it is suspended at a yield.
-       // Cancellation does not affect an async generator that is
-       // suspended at an await.
-@@ -199,11 +201,13 @@ class _SuspendState {
- 
-     @pragma("vm:invisible")
-     thenCallback(value) {
-+      suspendState._flaxRetainAwaited(null);
-       suspendState._resume(value, null, null);
-     }
- 
-     @pragma("vm:invisible")
-     errorCallback(Object exception, StackTrace stackTrace) {
-+      suspendState._flaxRetainAwaited(null);
-       suspendState._resume(null, exception, stackTrace);
-     }
- 
-@@ -307,9 +311,19 @@ class _SuspendState {
-     );
-   }
- 
-+  void _flaxRetainAwaited(Object? source) {
-+    final owner = _functionData;
-+    if (owner is _Future) {
-+      owner._flaxPendingDependency = source;
-+    } else if (owner is _AsyncStarStreamController) {
-+      owner._flaxPendingDependency = source;
-+    }
-+  }
-+
-   @pragma("vm:entry-point", "call")
-   @pragma("vm:invisible")
-   Object? _await(Object? object) {
-+    _flaxRetainAwaited(object is Future ? object : null);
-     if (_thenCallback == null) {
-       _createAsyncCallbacks();
-     }
-@@ -333,6 +347,7 @@ class _SuspendState {
-   @pragma("vm:entry-point", "call")
-   @pragma("vm:invisible")
-   Object? _awaitWithTypeCheck<T>(Object? object) {
-+    _flaxRetainAwaited(object is Future<T> ? object : null);
-     if (_thenCallback == null) {
-       _createAsyncCallbacks();
-     }
-diff --git a/sdk/lib/async/broadcast_stream_controller.dart b/sdk/lib/async/broadcast_stream_controller.dart
-index eeaeeaf8..5216fcae 100644
---- a/sdk/lib/async/broadcast_stream_controller.dart
-+++ b/sdk/lib/async/broadcast_stream_controller.dart
-@@ -153,7 +153,8 @@ abstract class _BroadcastStreamController<T>
- 
-   bool get _mayAddEvent => (_state < _STATE_CLOSED);
- 
--  _Future<void> _ensureDoneFuture() => _doneFuture ??= _Future<void>();
-+  _Future<void> _ensureDoneFuture() =>
-+      _doneFuture ??= (_Future<void>().._flaxPendingDependency = this);
- 
-   // Linked list helpers
- 
-diff --git a/sdk/lib/async/future.dart b/sdk/lib/async/future.dart
-index 490b12d0..16a80e55 100644
---- a/sdk/lib/async/future.dart
-+++ b/sdk/lib/async/future.dart
-@@ -521,6 +521,8 @@ abstract interface class Future<T> {
-   }) {
-     @pragma('vm:awaiter-link')
-     final _Future<List<T>> _future = _Future<List<T>>();
-+    final dependencies = <Future?>[];
-+    _future._flaxPendingDependency = dependencies;
-     List<T?>? values; // Collects the values. Set to null on error.
-     int remaining = 0; // How many futures are we waiting for.
-     Object? error; // The first error from a future.
-@@ -560,11 +562,13 @@ abstract interface class Future<T> {
-     }
- 
-     try {
-+      // Other Iterables may be single-use; only Lists have a reusable length.
-+      if (futures is List) dependencies.length = futures.length;
-       // As each future completes, put its value into the corresponding
-       // position in the list of values.
-       for (var future in futures) {
-         int pos = remaining;
--        future.then((T value) {
-+        final dependency = future.then<Null>((T value) {
-           var remainingResults = --remaining;
-           List<T?>? valueList = values;
-           if (valueList != null) {
-@@ -590,6 +594,11 @@ abstract interface class Future<T> {
-             }
-           }
-         }, onError: handleError);
-+        if (pos < dependencies.length) {
-+          dependencies[pos] = dependency;
-+        } else {
-+          dependencies.add(dependency);
-+        }
-         // Increment the 'remaining' after the call to 'then'.
-         // If that call throws, we don't expect any future callback from
-         // the future, and we also don't increment remaining.
-@@ -655,6 +664,8 @@ abstract interface class Future<T> {
-   /// ```
-   static Future<T> any<T>(Iterable<Future<T>> futures) {
-     var completer = Completer<T>.sync();
-+    final dependencies = <Future>[];
-+    (completer.future as _Future)._flaxPendingDependency = dependencies;
-     void onValue(T value) {
-       if (!completer.isCompleted) completer.complete(value);
-     }
-@@ -664,6 +675,7 @@ abstract interface class Future<T> {
-     }
- 
-     for (var future in futures) {
-+      dependencies.add(future);
-       future.then(onValue, onError: onError);
-     }
-     return completer.future;
-@@ -760,6 +772,7 @@ abstract interface class Future<T> {
-           return;
-         }
-         if (result is Future<bool>) {
-+          doneSignal._flaxPendingDependency = result;
-           result.then(nextIteration, onError: doneSignal._completeError);
-           return;
-         }
-diff --git a/sdk/lib/async/future_extensions.dart b/sdk/lib/async/future_extensions.dart
-index 0d0d59b5..4881417a 100644
---- a/sdk/lib/async/future_extensions.dart
-+++ b/sdk/lib/async/future_extensions.dart
-@@ -35,7 +35,7 @@ extension FutureIterable<T> on Iterable<Future<T>> {
-     @pragma('vm:awaiter-link')
-     final c = Completer<List<T>>.sync();
- 
--    _FutureResult._waitAll(results, (errors) {
-+    _FutureResult._waitAll(results, c.future as _Future, (errors) {
-       if (errors == 0) {
-         c.complete([for (var r in results) r.value]);
-       } else {
-@@ -85,7 +85,7 @@ extension FutureRecord2<T1, T2> on (Future<T1>, Future<T2>) {
-     final v1 = _FutureResult<T1>($1);
-     final v2 = _FutureResult<T2>($2);
- 
--    _FutureResult._waitAll([v1, v2], (int errors) {
-+    _FutureResult._waitAll([v1, v2], c.future as _Future, (int errors) {
-       if (errors == 0) {
-         c.complete((v1.value, v2.value));
-       } else {
-@@ -114,7 +114,7 @@ extension FutureRecord3<T1, T2, T3> on (Future<T1>, Future<T2>, Future<T3>) {
-     final v2 = _FutureResult<T2>($2);
-     final v3 = _FutureResult<T3>($3);
- 
--    _FutureResult._waitAll([v1, v2, v3], (int errors) {
-+    _FutureResult._waitAll([v1, v2, v3], c.future as _Future, (int errors) {
-       if (errors == 0) {
-         c.complete((v1.value, v2.value, v3.value));
-       } else {
-@@ -145,7 +145,7 @@ extension FutureRecord4<T1, T2, T3, T4>
-     final v3 = _FutureResult<T3>($3);
-     final v4 = _FutureResult<T4>($4);
- 
--    _FutureResult._waitAll([v1, v2, v3, v4], (int errors) {
-+    _FutureResult._waitAll([v1, v2, v3, v4], c.future as _Future, (int errors) {
-       if (errors == 0) {
-         c.complete((v1.value, v2.value, v3.value, v4.value));
-       } else {
-@@ -181,7 +181,7 @@ extension FutureRecord5<T1, T2, T3, T4, T5>
-     final v4 = _FutureResult<T4>($4);
-     final v5 = _FutureResult<T5>($5);
- 
--    _FutureResult._waitAll([v1, v2, v3, v4, v5], (int errors) {
-+    _FutureResult._waitAll([v1, v2, v3, v4, v5], c.future as _Future, (int errors) {
-       if (errors == 0) {
-         c.complete((v1.value, v2.value, v3.value, v4.value, v5.value));
-       } else {
-@@ -239,7 +239,7 @@ extension FutureRecord6<T1, T2, T3, T4, T5, T6>
-     final v5 = _FutureResult<T5>($5);
-     final v6 = _FutureResult<T6>($6);
- 
--    _FutureResult._waitAll([v1, v2, v3, v4, v5, v6], (int errors) {
-+    _FutureResult._waitAll([v1, v2, v3, v4, v5, v6], c.future as _Future, (int errors) {
-       if (errors == 0) {
-         c.complete((
-           v1.value,
-@@ -309,7 +309,7 @@ extension FutureRecord7<T1, T2, T3, T4, T5, T6, T7>
-     final v6 = _FutureResult<T6>($6);
-     final v7 = _FutureResult<T7>($7);
- 
--    _FutureResult._waitAll([v1, v2, v3, v4, v5, v6, v7], (int errors) {
-+    _FutureResult._waitAll([v1, v2, v3, v4, v5, v6, v7], c.future as _Future, (int errors) {
-       if (errors == 0) {
-         c.complete((
-           v1.value,
-@@ -385,7 +385,7 @@ extension FutureRecord8<T1, T2, T3, T4, T5, T6, T7, T8>
-     final v7 = _FutureResult<T7>($7);
-     final v8 = _FutureResult<T8>($8);
- 
--    _FutureResult._waitAll([v1, v2, v3, v4, v5, v6, v7, v8], (int errors) {
-+    _FutureResult._waitAll([v1, v2, v3, v4, v5, v6, v7, v8], c.future as _Future, (int errors) {
-       if (errors == 0) {
-         c.complete((
-           v1.value,
-@@ -467,7 +467,7 @@ extension FutureRecord9<T1, T2, T3, T4, T5, T6, T7, T8, T9>
-     final v8 = _FutureResult<T8>($8);
-     final v9 = _FutureResult<T9>($9);
- 
--    _FutureResult._waitAll([v1, v2, v3, v4, v5, v6, v7, v8, v9], (int errors) {
-+    _FutureResult._waitAll([v1, v2, v3, v4, v5, v6, v7, v8, v9], c.future as _Future, (int errors) {
-       if (errors == 0) {
-         c.complete((
-           v1.value,
-@@ -642,9 +642,11 @@ class _FutureResult<T> {
-   /// List must not be empty.
-   static void _waitAll(
-     List<_FutureResult> results,
-+    _Future owner,
-     @pragma('vm:awaiter-link') void Function(int) whenReady,
-   ) {
-     assert(results.isNotEmpty);
-+    owner._flaxPendingDependency = results;
-     var ready = 0;
-     var errors = 0;
-     void onReady(int error) {
-diff --git a/sdk/lib/async/future_impl.dart b/sdk/lib/async/future_impl.dart
-index bddb11da..615b74d1 100644
---- a/sdk/lib/async/future_impl.dart
-+++ b/sdk/lib/async/future_impl.dart
-@@ -332,6 +332,10 @@ class _Future<T> implements Future<T> {
-   /// listener callbacks used to create this future should be run in.
-   final _Zone _zone;
- 
-+  // A live consumer keeps its unresolved producer; settlement drops the edge.
-+  @pragma("vm:entry-point")
-+  Object? _flaxPendingDependency;
-+
-   /// Either the result, a list of listeners or another future.
-   ///
-   /// The result of the future is either a value or an error.
-@@ -382,6 +386,7 @@ class _Future<T> implements Future<T> {
- 
-   void _setChained(_Future source) {
-     assert(_mayAddListener);
-+    _flaxPendingDependency = null;
-     _state = _stateChained | (_state & _stateIgnoreError);
-     _resultOrListeners = source;
-   }
-@@ -499,12 +504,14 @@ class _Future<T> implements Future<T> {
-   // This method is used by async/await.
-   void _setValue(T value) {
-     assert(!_isComplete); // But may have a completion pending.
-+    _flaxPendingDependency = null;
-     _state = _stateValue;
-     _resultOrListeners = value;
-   }
- 
-   void _setErrorObject(AsyncError error) {
-     assert(!_isComplete); // But may have a completion pending.
-+    _flaxPendingDependency = null;
-     _state = _stateError | (_state & _stateIgnoreError);
-     _resultOrListeners = error;
-   }
-@@ -515,6 +522,7 @@ class _Future<T> implements Future<T> {
-   void _cloneResult(_Future source) {
-     assert(!_isComplete);
-     assert(source._isComplete);
-+    _flaxPendingDependency = null;
-     _state =
-         (source._state & _completionStateMask) | (_state & _stateIgnoreError);
-     _resultOrListeners = source._resultOrListeners;
-@@ -522,6 +530,7 @@ class _Future<T> implements Future<T> {
- 
-   void _addListener(_FutureListener listener) {
-     assert(listener._nextListener == null);
-+    if (!_isComplete) listener.result._flaxPendingDependency = this;
-     if (_mayAddListener) {
-       listener._nextListener = _resultOrListeners;
-       _resultOrListeners = listener;
-@@ -610,6 +619,7 @@ class _Future<T> implements Future<T> {
-   void _chainForeignFuture(Future source) {
-     assert(!_isComplete);
-     assert(source is! _Future);
-+    _flaxPendingDependency = source;
- 
-     // Mark the target as chained (and as such half-completed).
-     _setPendingComplete();
-@@ -1033,6 +1043,7 @@ class _Future<T> implements Future<T> {
-     if (_isComplete) return _Future.immediate(this);
-     @pragma('vm:awaiter-link')
-     _Future<T> _future = _Future<T>();
-+    _future._flaxPendingDependency = this;
-     Timer timer;
-     if (onTimeout == null) {
-       timer = Timer(timeLimit, () {
-diff --git a/sdk/lib/async/stream.dart b/sdk/lib/async/stream.dart
-index f400c841..e76a3361 100644
---- a/sdk/lib/async/stream.dart
-+++ b/sdk/lib/async/stream.dart
-@@ -247,12 +247,16 @@ abstract mixin class Stream<T> {
-       null,
-       null,
-     );
-+    controller._flaxPendingDependency = future;
-+    controller.onCancel = () => controller._flaxPendingDependency = null;
-     future.then(
-       (value) {
-+        controller._flaxPendingDependency = null;
-         controller._add(value);
-         controller._closeUnchecked();
-       },
-       onError: (error, stackTrace) {
-+        controller._flaxPendingDependency = null;
-         controller._addError(error, stackTrace);
-         controller._closeUnchecked();
-       },
-@@ -301,6 +305,9 @@ abstract mixin class Stream<T> {
-       null,
-       null,
-     );
-+    final dependencies = <Future?>[];
-+    controller._flaxPendingDependency = dependencies;
-+    controller.onCancel = () => controller._flaxPendingDependency = null;
-     int count = 0;
-     // Declare these as variables holding closures instead of as
-     // function declarations.
-@@ -308,23 +315,37 @@ abstract mixin class Stream<T> {
-     void onValue(T value) {
-       if (!controller.isClosed) {
-         controller._add(value);
--        if (--count == 0) controller._closeUnchecked();
-+        if (--count == 0) {
-+          controller._flaxPendingDependency = null;
-+          controller._closeUnchecked();
-+        }
-       }
-     }
- 
-     void onError(Object error, StackTrace stack) {
-       if (!controller.isClosed) {
-         controller._addError(error, stack);
--        if (--count == 0) controller._closeUnchecked();
-+        if (--count == 0) {
-+          controller._flaxPendingDependency = null;
-+          controller._closeUnchecked();
-+        }
-       }
-     }
- 
-     // The futures are already running, so start listening to them immediately
-     // (instead of waiting for the stream to be listened on).
-     // If we wait, we might not catch errors in the futures in time.
-+    if (futures is List) dependencies.length = futures.length;
-+    var dependencyIndex = 0;
-     for (var future in futures) {
-       count++;
--      future.then(onValue, onError: onError);
-+      final dependency = future.then<void>(onValue, onError: onError);
-+      if (dependencyIndex < dependencies.length) {
-+        dependencies[dependencyIndex] = dependency;
-+      } else {
-+        dependencies.add(dependency);
-+      }
-+      dependencyIndex++;
-     }
-     // Use schedule microtask since controller is sync.
-     if (count == 0) scheduleMicrotask(controller.close);
-@@ -1066,6 +1087,7 @@ abstract mixin class Stream<T> {
-   Future<T> reduce(T combine(T previous, T element)) {
-     @pragma('vm:awaiter-link')
-     _Future<T> result = _Future<T>();
-+    result._flaxPendingDependency = this;
-     bool seenFirst = false;
-     late T value;
-     StreamSubscription<T> subscription = this.listen(
-@@ -1120,6 +1142,7 @@ abstract mixin class Stream<T> {
-   /// ```
-   Future<S> fold<S>(S initialValue, S combine(S previous, T element)) {
-     _Future<S> result = _Future<S>();
-+    result._flaxPendingDependency = this;
-     S value = initialValue;
-     StreamSubscription<T> subscription = this.listen(
-       null,
-@@ -1158,6 +1181,7 @@ abstract mixin class Stream<T> {
-   /// ```
-   Future<String> join([String separator = ""]) {
-     _Future<String> result = _Future<String>();
-+    result._flaxPendingDependency = this;
-     StringBuffer buffer = StringBuffer();
-     bool first = true;
-     StreamSubscription<T> subscription = this.listen(
-@@ -1211,6 +1235,7 @@ abstract mixin class Stream<T> {
-   /// ```
-   Future<bool> contains(Object? needle) {
-     _Future<bool> future = _Future<bool>();
-+    future._flaxPendingDependency = this;
-     StreamSubscription<T> subscription = this.listen(
-       null,
-       onError: future._completeError,
-@@ -1280,6 +1305,7 @@ abstract mixin class Stream<T> {
-   /// ```
-   Future<bool> every(bool test(T element)) {
-     _Future<bool> future = _Future<bool>();
-+    future._flaxPendingDependency = this;
-     StreamSubscription<T> subscription = this.listen(
-       null,
-       onError: future._completeError,
-@@ -1322,6 +1348,7 @@ abstract mixin class Stream<T> {
-   /// ```
-   Future<bool> any(bool test(T element)) {
-     _Future<bool> future = _Future<bool>();
-+    future._flaxPendingDependency = this;
-     StreamSubscription<T> subscription = this.listen(
-       null,
-       onError: future._completeError,
-@@ -1353,6 +1380,7 @@ abstract mixin class Stream<T> {
-   /// be reused after finding its length.
-   Future<int> get length {
-     _Future<int> future = _Future<int>();
-+    future._flaxPendingDependency = this;
-     int count = 0;
-     this.listen(
-       (_) {
-@@ -1381,6 +1409,7 @@ abstract mixin class Stream<T> {
-   /// be reused after checking whether it is empty.
-   Future<bool> get isEmpty {
-     _Future<bool> future = _Future<bool>();
-+    future._flaxPendingDependency = this;
-     StreamSubscription<T> subscription = this.listen(
-       null,
-       onError: future._completeError,
-@@ -1413,6 +1442,7 @@ abstract mixin class Stream<T> {
-   Future<List<T>> toList() {
-     List<T> result = <T>[];
-     _Future<List<T>> future = _Future<List<T>>();
-+    future._flaxPendingDependency = this;
-     this.listen(
-       (T data) {
-         result.add(data);
-@@ -1444,6 +1474,7 @@ abstract mixin class Stream<T> {
-   Future<Set<T>> toSet() {
-     Set<T> result = Set<T>();
-     _Future<Set<T>> future = _Future<Set<T>>();
-+    future._flaxPendingDependency = this;
-     this.listen(
-       (T data) {
-         result.add(data);
-@@ -1646,6 +1677,7 @@ abstract mixin class Stream<T> {
-   Future<T> get first {
-     @pragma('vm:awaiter-link')
-     _Future<T> future = _Future<T>();
-+    future._flaxPendingDependency = this;
-     StreamSubscription<T> subscription = this.listen(
-       null,
-       onError: future._completeError,
-@@ -1674,6 +1706,7 @@ abstract mixin class Stream<T> {
-   Future<T> get last {
-     @pragma('vm:awaiter-link')
-     _Future<T> future = _Future<T>();
-+    future._flaxPendingDependency = this;
-     late T result;
-     bool foundResult = false;
-     listen(
-@@ -1708,6 +1741,7 @@ abstract mixin class Stream<T> {
-   Future<T> get single {
-     @pragma('vm:awaiter-link')
-     _Future<T> future = _Future<T>();
-+    future._flaxPendingDependency = this;
-     late T result;
-     bool foundResult = false;
-     StreamSubscription<T> subscription = this.listen(
-@@ -1779,6 +1813,7 @@ abstract mixin class Stream<T> {
-   Future<T> firstWhere(bool test(T element), {T orElse()?}) {
-     @pragma('vm:awaiter-link')
-     _Future<T> future = _Future();
-+    future._flaxPendingDependency = this;
-     StreamSubscription<T> subscription = this.listen(
-       null,
-       onError: future._completeError,
-@@ -1833,6 +1868,7 @@ abstract mixin class Stream<T> {
-   Future<T> lastWhere(bool test(T element), {T orElse()?}) {
-     @pragma('vm:awaiter-link')
-     _Future<T> future = _Future();
-+    future._flaxPendingDependency = this;
-     late T result;
-     bool foundResult = false;
-     StreamSubscription<T> subscription = this.listen(
-@@ -1901,6 +1937,7 @@ abstract mixin class Stream<T> {
-   Future<T> singleWhere(bool test(T element), {T orElse()?}) {
-     @pragma('vm:awaiter-link')
-     _Future<T> future = _Future<T>();
-+    future._flaxPendingDependency = this;
-     late T result;
-     bool foundResult = false;
-     StreamSubscription<T> subscription = this.listen(
-@@ -1959,6 +1996,7 @@ abstract mixin class Stream<T> {
-     RangeError.checkNotNegative(index, "index");
-     @pragma('vm:awaiter-link')
-     _Future<T> result = _Future<T>();
-+    result._flaxPendingDependency = this;
-     int elementIndex = 0;
-     StreamSubscription<T> subscription;
-     subscription = this.listen(
-diff --git a/sdk/lib/async/stream_controller.dart b/sdk/lib/async/stream_controller.dart
-index 23068cbe..819ab33c 100644
---- a/sdk/lib/async/stream_controller.dart
-+++ b/sdk/lib/async/stream_controller.dart
-@@ -426,6 +426,8 @@ abstract class _StreamControllerBase<T>
- ///
- /// Controls a stream that only supports a single controller.
- abstract class _StreamController<T> implements _StreamControllerBase<T> {
-+  @pragma("vm:entry-point")
-+  Object? _flaxPendingDependency;
-   // The states are bit-flags. More than one can be set at a time.
-   //
-   // The "subscription state" goes through the states:
-@@ -610,7 +612,9 @@ abstract class _StreamController<T> implements _StreamControllerBase<T> {
-   Future<void> get done => _ensureDoneFuture();
- 
-   Future<void> _ensureDoneFuture() =>
--      _doneFuture ??= _isCanceled ? Future._nullFuture : _Future<void>();
-+      _doneFuture ??= _isCanceled
-+          ? Future._nullFuture
-+          : (_Future<void>().._flaxPendingDependency = this);
- 
-   /// Send or enqueue a data event.
-   void add(T value) {
-@@ -930,7 +934,9 @@ class _AddStreamState<T> {
-             : controller._addError,
-         onDone: controller._close,
-         cancelOnError: cancelOnError,
--      );
-+      ) {
-+    addStreamFuture._flaxPendingDependency = this;
-+  }
- 
-   static makeErrorHandler(_EventSink controller) => (Object e, StackTrace s) {
-     controller._addError(e, s);
-diff --git a/sdk/lib/async/stream_impl.dart b/sdk/lib/async/stream_impl.dart
-index 9bb5a9a9..80eca234 100644
---- a/sdk/lib/async/stream_impl.dart
-+++ b/sdk/lib/async/stream_impl.dart
-@@ -252,6 +252,7 @@ class _BufferingStreamSubscription<T>
-     }
-     // Overwrite the onDone and onError handlers.
-     _Future<E> result = new _Future<E>();
-+    result._flaxPendingDependency = this;
-     _onDone = () {
-       result._complete(resultValue);
-     };
-@@ -791,6 +792,7 @@ class _DoneStreamSubscription<T> implements StreamSubscription<T> {
-       resultValue = futureValue;
-     }
-     _Future<E> result = _Future<E>();
-+    result._flaxPendingDependency = this;
-     if (!_isDone(_state)) {
-       _onDone = _zone.registerCallback(() {
-         result._completeWithValue(resultValue);
-@@ -1043,6 +1045,7 @@ class _StreamIterator<T> implements StreamIterator<T> {
-     if (subscription != null) {
-       if (_hasValue) {
-         var future = new _Future<bool>();
-+        future._flaxPendingDependency = this;
-         _stateData = future;
-         _hasValue = false;
-         subscription.resume();
-@@ -1064,6 +1067,7 @@ class _StreamIterator<T> implements StreamIterator<T> {
-     if (stateData != null) {
-       Stream<T> stream = stateData as dynamic;
-       var future = new _Future<bool>();
-+      future._flaxPendingDependency = this;
-       _stateData = future;
-       // The `listen` call may invoke user code, and it might try to emit
-       // events.
-diff --git a/runtime/include/dart_flax_api.h b/runtime/include/dart_flax_api.h
-new file mode 100644
-index 00000000..6d78c048
---- /dev/null
-+++ b/runtime/include/dart_flax_api.h
-@@ -0,0 +1,74 @@
-+// Experimental Flax cross-heap tracing. Not part of the public Dart API.
-+#ifndef RUNTIME_INCLUDE_DART_FLAX_API_H_
-+#define RUNTIME_INCLUDE_DART_FLAX_API_H_
-+#include "dart_api.h"
-+#ifdef __cplusplus
-+extern "C" {
-+#endif
-+// The VM owns the epoch. The collector runs synchronously on its owner in VM
-+// execution state, outside the GC safepoint. No application execution, ordinary
-+// Dart API calls, microtasks, or heap allocation are allowed in the callback.
-+typedef uint64_t Dart_FlaxGCEpoch;
-+typedef void (*Dart_FlaxCollector)(void*, Dart_FlaxGCEpoch);
-+// Try to stage Dart roots for an embedder major already in its atomic pause.
-+// Zero leaves the caller in native state. A nonzero epoch requires a matching
-+// Finish on this thread before leaving the pause. Only GCCheckpoint and Finish
-+// may enter Dart during that interval, and no application code may execute.
-+DART_EXPORT Dart_FlaxGCEpoch Dart_FlaxTryBeginEmbedderGC(void* collector_peer);
-+// Reserve before taking the V8 Locker. A positive result is the number of
-+// isolates in the stable group. The owner remains in native state until Begin.
-+DART_EXPORT int32_t Dart_FlaxTryReserveEmbedderGC(void* collector_peer);
-+// Release the matching reservation and return its full closed time in us.
-+// Finish must already have returned if a marker was staged.
-+DART_EXPORT int64_t Dart_FlaxReleaseEmbedderGCReservation(void);
-+// Commit only after tracing has reached closure. A matching Finish restores
-+// native state even if an intervening Dart GC retired the epoch. False means
-+// there was no precise commit. Passing commit=false retains the Dart peers.
-+DART_EXPORT bool Dart_FlaxFinishEmbedderGC(Dart_FlaxGCEpoch epoch, bool commit);
-+// A checkpoint acquires a short GC safepoint, validates the epoch, and drains
-+// ordinary strong/ephemeron marking before reporting newly reached origins.
-+// The origin sink may only copy handle identities; it must not enter V8 or Dart.
-+// No VM visitor escapes. False means the epoch was aborted by an intervening GC;
-+// the collector must preserve all peers and request a fresh owner pass.
-+DART_EXPORT bool Dart_FlaxGCCheckpoint(
-+    Dart_FlaxGCEpoch epoch,
-+    const Dart_WeakPersistentHandle* targets,
-+    intptr_t target_count,
-+    void (*origin_sink)(void*, Dart_WeakPersistentHandle),
-+    void* peer,
-+    bool* all_targets_marked);
-+DART_EXPORT bool Dart_FlaxSetCollector(Dart_FlaxCollector collector,
-+                                       void* peer);
-+DART_EXPORT bool Dart_FlaxRegisterHandle(Dart_WeakPersistentHandle handle,
-+                                         bool is_origin);
-+DART_EXPORT void Dart_FlaxSetCollectionRequest(void (*request)(void*));
-+// Controlled GC for this experiment, separate from automatic allocation GC.
-+DART_EXPORT void Dart_FlaxCollect(bool young, bool compact);
-+// Pin a writable Uint8List (or view) until its last native buffer owner releases
-+// it. Pin/view calls require the owning isolate. Release runs on that isolate,
-+// or on any thread after isolate shutdown has retired the root.
-+typedef struct {
-+  void* token;
-+  void* data;
-+  intptr_t byte_length;
-+  intptr_t offset;
-+  intptr_t length;
-+} Dart_FlaxBuffer;
-+DART_EXPORT Dart_Handle Dart_FlaxPinUint8List(Dart_Handle, Dart_FlaxBuffer*);
-+DART_EXPORT void Dart_FlaxReleaseBuffer(void* token);
-+DART_EXPORT Dart_Handle Dart_FlaxUint8ListView(void* token,
-+                                              intptr_t offset,
-+                                              intptr_t length);
-+// Owning-isolate APIs. Errors are ordinary Dart API error handles.
-+// Type parts: [display, nullable, library, declaration, children, shape, parents].
-+DART_EXPORT Dart_Handle Dart_FlaxTypeParts(Dart_Handle type);
-+// A null type constructs a runtime layout from sorted named fields.
-+DART_EXPORT Dart_Handle Dart_FlaxRecordFields(Dart_Handle record);
-+DART_EXPORT Dart_Handle Dart_FlaxNewRecord(Dart_Handle type, Dart_Handle names,
-+                                         Dart_Handle fields);
-+DART_EXPORT Dart_Handle Dart_FlaxNullableType(Dart_Handle type);
-+DART_EXPORT Dart_Handle Dart_FlaxInstantiate(Dart_Handle closure, Dart_Handle types);
-+#ifdef __cplusplus
-+}
-+#endif
-+#endif
-diff --git a/pkg/vm/lib/modular/transformations/flax_default_calls.dart b/pkg/vm/lib/modular/transformations/flax_default_calls.dart
-new file mode 100644
-index 00000000..57b86ef4
---- /dev/null
-+++ b/pkg/vm/lib/modular/transformations/flax_default_calls.dart
-@@ -0,0 +1,944 @@
-+// Copyright (c) 2026, the Dart project authors. Please see the AUTHORS file
-+// for details. All rights reserved. Use of this source code is governed by a
-+// BSD-style license that can be found in the LICENSE file.
-+
-+import 'dart:convert';
-+
-+import 'package:crypto/crypto.dart';
-+import 'package:kernel/ast.dart';
-+import 'package:kernel/class_hierarchy.dart';
-+import 'package:kernel/clone.dart';
-+import 'package:kernel/core_types.dart';
-+import 'package:kernel/type_algebra.dart';
-+import 'package:kernel/reference_from_index.dart';
-+import 'package:kernel/target/changed_structure_notifier.dart';
-+
-+class _GeneratedLocations extends RecursiveVisitor {
-+  _GeneratedLocations(this.offset);
-+  final int offset;
-+  @override
-+  void defaultNode(Node node) {
-+    if (node is TreeNode && node.fileOffset == TreeNode.noOffset) {
-+      node.fileOffset = offset;
-+    }
-+    node.visitChildren(this);
-+  }
-+}
-+
-+class _FixedCalls extends Transformer {
-+  _FixedCalls(
-+    this.component,
-+    this.core,
-+    this.libraries,
-+    this.hierarchy, {
-+    this.buildSdk = false,
-+    this.referenceFromIndex,
-+    this.changedStructureNotifier,
-+  });
-+  final Component component;
-+  final CoreTypes core;
-+  final List<Library> libraries;
-+  final ClassHierarchy hierarchy;
-+  final bool buildSdk;
-+  final ReferenceFromIndex? referenceFromIndex;
-+  final ChangedStructureNotifier? changedStructureNotifier;
-+  Reference? priorReference(Library library, Class? owner, Name name) {
-+    final index = referenceFromIndex?.lookupLibrary(library);
-+    return (owner == null ? index : index?.lookupIndexedClass(owner.name))
-+        ?.lookupGetterReference(name);
-+  }
-+
-+  Member? current;
-+  final entries = <Object, Procedure>{};
-+  late final extensionTargets = <Reference, Procedure>{
-+    for (final library in component.libraries)
-+      for (final descriptor in [
-+        for (final extension in library.extensions)
-+          for (final member in extension.memberDescriptors)
-+            if (!member.isStatic &&
-+                member.tearOffReference != null &&
-+                member.memberReference != null)
-+              (member.tearOffReference!, member.memberReference!),
-+        for (final extension in library.extensionTypeDeclarations)
-+          for (final member in extension.memberDescriptors)
-+            if (!member.isStatic &&
-+                member.tearOffReference != null &&
-+                member.memberReference != null)
-+              (member.tearOffReference!, member.memberReference!),
-+      ])
-+        descriptor.$1: descriptor.$2.asProcedure,
-+  };
-+  bool sameLayout(List<String> a, List<String> b) {
-+    if (a.length != b.length) return false;
-+    for (var i = 0; i < a.length; i++) {
-+      if (a[i] != b[i]) return false;
-+    }
-+    return true;
-+  }
-+
-+  void checkLayout(Member target, List<String> names) {
-+    final fn = target.function!;
-+    final positional = names.takeWhile((name) => name.isEmpty).length;
-+    final named = names.skip(positional).toList();
-+    if (positional > fn.positionalParameters.length ||
-+        named.any(
-+          (name) =>
-+              name.isEmpty ||
-+              !fn.namedParameters.any((p) => p.parameterName == name),
-+        ) ||
-+        named.toSet().length != named.length) {
-+      throw StateError('Fixed layout does not match ${target.name.text}');
-+    }
-+  }
-+
-+  List<String> layout(Member member) => [
-+    for (final _ in member.function!.positionalParameters) '',
-+    ...([for (final p in member.function!.namedParameters) p.parameterName]
-+      ..sort()),
-+  ];
-+  String entryName(
-+    Member target,
-+    List<String> names, {
-+    Class? owner,
-+    bool superCall = false,
-+  }) {
-+    final identity = jsonEncode([
-+      'mask32-v1',
-+      target.enclosingLibrary.importUri.toString(),
-+      target.enclosingClass?.name,
-+      target.name.text,
-+      if (superCall)
-+        [owner?.enclosingLibrary.importUri.toString(), owner?.name],
-+      names,
-+    ]);
-+    return r'_flaxFixed#' +
-+        target.name.text +
-+        r'$' +
-+        sha256.convert(utf8.encode(identity)).toString().substring(0, 24);
-+  }
-+
-+  void run() {
-+    if (buildSdk) {
-+      final targets = [
-+        for (final l in libraries)
-+          if (l.importUri.isScheme('dart'))
-+            for (final c in l.classes)
-+              if (!c.name.startsWith('_'))
-+                for (final p in c.procedures)
-+                  if (!p.name.isPrivate &&
-+                      !p.isStatic &&
-+                      p.kind == ProcedureKind.Method &&
-+                      !p.name.text.startsWith(r'_flaxFixed#') &&
-+                      (p.function.namedParameters.isNotEmpty ||
-+                          p.function.positionalParameters.length >
-+                              p.function.requiredParameterCount))
-+                    p,
-+      ];
-+      for (final target in targets) {
-+        current = target;
-+        virtualEntry(target, layout(target));
-+      }
-+    }
-+    for (final library in libraries) {
-+      for (final field in library.fields.toList()) {
-+        current = field;
-+        field.transformChildren(this);
-+      }
-+      for (final p in library.procedures.toList()) {
-+        current = p;
-+        p.transformChildren(this);
-+      }
-+      for (final c in library.classes.toList()) {
-+        for (final field in c.fields.toList()) {
-+          current = field;
-+          field.transformChildren(this);
-+        }
-+        for (final constructor in c.constructors.toList()) {
-+          current = constructor;
-+          constructor.transformChildren(this);
-+        }
-+        for (final p in c.procedures.toList()) {
-+          current = p;
-+          p.transformChildren(this);
-+        }
-+      }
-+    }
-+  }
-+
-+  Procedure validator(Library library) {
-+    const name = r'$flaxValidateFixedMask#v1';
-+    if (library.procedures.where((p) => p.name.text == name).firstOrNull
-+        case final previous?) {
-+      return previous;
-+    }
-+    final provided = PositionalParameter(
-+      cosmeticName: 'provided',
-+      type: core.intNonNullableRawType,
-+    );
-+    final required = PositionalParameter(
-+      cosmeticName: 'required',
-+      type: core.intNonNullableRawType,
-+    );
-+    final length = PositionalParameter(
-+      cosmeticName: 'length',
-+      type: core.intNonNullableRawType,
-+    );
-+    final positional = PositionalParameter(
-+      cosmeticName: 'positional',
-+      type: core.intNonNullableRawType,
-+    );
-+    Expression op(Expression value, String name, Expression other) =>
-+        invokeCore(value, 'int', name, [other]);
-+    Expression equals(Expression a, Expression b) => EqualsCall(
-+      a,
-+      b,
-+      functionType: core.index
-+          .getProcedure('dart:core', 'Object', '==')
-+          .function
-+          .computeFunctionType(Nullability.nonNullable),
-+      interfaceTarget: core.index.getProcedure('dart:core', 'Object', '=='),
-+    );
-+    final bits = SyntheticVariable(
-+      initializer: op(
-+        VariableGet(provided),
-+        '&',
-+        op(
-+          op(IntLiteral(1), '<<', VariableGet(positional)),
-+          '-',
-+          IntLiteral(1),
-+        ),
-+      ),
-+      type: core.intNonNullableRawType,
-+    );
-+    final invalid = LogicalExpression(
-+      LogicalExpression(
-+        op(VariableGet(provided), '<', IntLiteral(0)),
-+        LogicalExpressionOperator.OR,
-+        Not(
-+          equals(
-+            op(VariableGet(provided), '>>', VariableGet(length)),
-+            IntLiteral(0),
-+          ),
-+        ),
-+      ),
-+      LogicalExpressionOperator.OR,
-+      LogicalExpression(
-+        Not(
-+          equals(
-+            op(VariableGet(provided), '&', VariableGet(required)),
-+            VariableGet(required),
-+          ),
-+        ),
-+        LogicalExpressionOperator.OR,
-+        Not(
-+          equals(
-+            op(
-+              VariableGet(bits),
-+              '&',
-+              op(VariableGet(bits), '+', IntLiteral(1)),
-+            ),
-+            IntLiteral(0),
-+          ),
-+        ),
-+      ),
-+    );
-+    final result = Procedure(
-+      Name(name),
-+      ProcedureKind.Method,
-+      FunctionNode(
-+        Block([
-+          IfStatement(
-+            Let(bits, invalid),
-+            ExpressionStatement(
-+              Throw(
-+                ConstructorInvocation(
-+                  core.index.getConstructor('dart:core', 'ArgumentError', ''),
-+                  Arguments([StringLiteral('Invalid fixed arguments')]),
-+                ),
-+              ),
-+            ),
-+            null,
-+          ),
-+        ]),
-+        positionalParameters: [provided, required, length, positional],
-+        requiredParameterCount: 4,
-+        returnType: const VoidType(),
-+      ),
-+      isStatic: true,
-+      fileUri: library.fileUri,
-+      reference: priorReference(library, null, Name(name)),
-+    );
-+    result.accept(_GeneratedLocations(0));
-+    library.addProcedure(result);
-+    changedStructureNotifier?.registerLibraryChange(library);
-+    return result;
-+  }
-+
-+  Expression invokeCore(
-+    Expression receiver,
-+    String owner,
-+    String name,
-+    List<Expression> args,
-+  ) {
-+    final target =
-+        hierarchy.getInterfaceMember(
-+              core.index.getClass('dart:core', owner),
-+              Name(name),
-+            )
-+            as Procedure;
-+    return InstanceInvocation(
-+      InstanceAccessKind.Instance,
-+      receiver,
-+      Name(name),
-+      Arguments(args),
-+      interfaceTarget: target,
-+      functionType: owner == 'List'
-+          ? FunctionType(
-+              [core.intNonNullableRawType],
-+              core.objectNullableRawType,
-+              Nullability.nonNullable,
-+            )
-+          : target.function
-+                .computeFunctionType(Nullability.nonNullable)
-+                .withoutTypeParameters,
-+    );
-+  }
-+
-+  Expression present(List<PositionalParameter> masks, int index) => Not(
-+    EqualsCall(
-+      invokeCore(VariableGet(masks[index ~/ 32]), 'int', '&', [
-+        IntLiteral(1 << (index % 32)),
-+      ]),
-+      IntLiteral(0),
-+      functionType: core.index
-+          .getProcedure('dart:core', 'Object', '==')
-+          .function
-+          .computeFunctionType(Nullability.nonNullable),
-+      interfaceTarget: core.index.getProcedure('dart:core', 'Object', '=='),
-+    ),
-+  );
-+  List<String> readNames(Expression e) {
-+    if (e is ConstantExpression && e.constant is ListConstant) {
-+      return (e.constant as ListConstant).entries
-+          .map((v) => (v as StringConstant).value)
-+          .toList();
-+    }
-+    if (e is ListLiteral) {
-+      return e.expressions.map((v) => (v as StringLiteral).value).toList();
-+    }
-+    throw StateError('Fixed layout must be constant: $e');
-+  }
-+
-+  List<NominalParameter> cloneParameters(
-+    List<TypeParameter> source,
-+    Map<TypeParameter, DartType> substitutions,
-+  ) {
-+    final result = [for (final p in source) NominalParameter(p.name)];
-+    for (var i = 0; i < source.length; i++) {
-+      substitutions[source[i]] = TypeParameterType(
-+        result[i],
-+        Nullability.nonNullable,
-+      );
-+    }
-+    for (var i = 0; i < source.length; i++) {
-+      result[i].bound = substitute(source[i].bound, substitutions);
-+      result[i].defaultType = substitute(source[i].defaultType, substitutions);
-+    }
-+    return result;
-+  }
-+
-+  Procedure entry(
-+    Member target,
-+    List<String> names, {
-+    Class? owner,
-+    bool superCall = false,
-+    Name? sharedName,
-+  }) {
-+    checkLayout(target, names);
-+    final key = (target, owner, superCall, sharedName, jsonEncode(names));
-+    final previous = entries[key];
-+    if (previous != null) return previous;
-+    final library =
-+        owner?.enclosingLibrary ??
-+        (target.enclosingLibrary.importUri.isScheme('dart')
-+            ? current!.enclosingLibrary
-+            : target.enclosingLibrary);
-+    final name =
-+        sharedName ??
-+        Name(
-+          entryName(target, names, owner: owner, superCall: superCall),
-+          library,
-+        );
-+    final existing = owner == null ? library.procedures : owner.procedures;
-+    if (existing.where((p) => p.name == name).firstOrNull
-+        case final previous?) {
-+      entries[key] = previous;
-+      return previous;
-+    }
-+    if (!buildSdk && library.importUri.isScheme('dart')) {
-+      throw StateError(
-+        'Fixed entry is absent from the precompiled SDK: ${target.name.text}; build a matching fixed-entry SDK',
-+      );
-+    }
-+    final fn = target.function!;
-+    final substitutions = <TypeParameter, DartType>{};
-+    if (owner != null &&
-+        target.enclosingClass != null &&
-+        owner != target.enclosingClass) {
-+      final parent = hierarchy.getClassAsInstanceOf(
-+        owner,
-+        target.enclosingClass!,
-+      );
-+      if (parent == null) throw StateError('Bad super owner');
-+      substitutions.addAll(getSubstitutionMap(parent));
-+    }
-+    final originalParameters = target is Constructor
-+        ? target.enclosingClass.typeParameters
-+        : fn.typeParameters;
-+    final types = cloneParameters(originalParameters, substitutions);
-+    final slots = [
-+      for (var i = 0; i < names.length; i++)
-+        PositionalParameter(
-+          cosmeticName: 'slot$i',
-+          type: core.objectNullableRawType,
-+        ),
-+    ];
-+    final masks = [
-+      for (var i = 0; i < (names.length + 31) ~/ 32; i++)
-+        PositionalParameter(
-+          cosmeticName: 'provided$i',
-+          type: core.intNonNullableRawType,
-+        ),
-+    ];
-+    final positional = <Expression>[];
-+    final named = <NamedExpression>[];
-+    final positionalCount = names.takeWhile((name) => name.isEmpty).length;
-+    final requiredMasks = List<int>.filled(masks.length, 0);
-+    Expression argument(
-+      FunctionParameter p,
-+      int index, {
-+      bool positionalRequired = false,
-+    }) {
-+      final required = p.isRequired || positionalRequired;
-+      final type = substitute(p.type, substitutions);
-+      if (index < 0) {
-+        if (required) {
-+          throw StateError('Required parameter missing from fixed layout');
-+        }
-+        return p.defaultValue == null
-+            ? NullLiteral()
-+            : CloneVisitorNotMembers(
-+                typeSubstitution: substitutions,
-+              ).clone(p.defaultValue!);
-+      }
-+      final actual = AsExpression(VariableGet(slots[index]), type)
-+        ..isTypeError = true;
-+      if (required) {
-+        requiredMasks[index ~/ 32] |= 1 << (index % 32);
-+        return actual;
-+      }
-+      final fallback = p.defaultValue == null
-+          ? NullLiteral()
-+          : CloneVisitorNotMembers(
-+              typeSubstitution: substitutions,
-+            ).clone(p.defaultValue!);
-+      return ConditionalExpression(
-+        present(masks, index),
-+        actual,
-+        fallback,
-+        type,
-+      );
-+    }
-+
-+    for (var i = 0; i < fn.positionalParameters.length; i++) {
-+      positional.add(
-+        argument(
-+          fn.positionalParameters[i],
-+          i < positionalCount ? i : -1,
-+          positionalRequired: i < fn.requiredParameterCount,
-+        ),
-+      );
-+    }
-+    for (final p in fn.namedParameters) {
-+      named.add(
-+        NamedExpression(
-+          p.parameterName,
-+          argument(p, names.indexOf(p.parameterName)),
-+        ),
-+      );
-+    }
-+    named.sort((a, b) => a.name.compareTo(b.name));
-+    final args = Arguments(
-+      positional,
-+      named: named,
-+      types: [
-+        for (final p in types) TypeParameterType(p, Nullability.nonNullable),
-+      ],
-+    );
-+    Expression call;
-+    DartType result;
-+    if (target is Constructor) {
-+      call = ConstructorInvocation(target, args);
-+      result = InterfaceType(target.enclosingClass, Nullability.nonNullable, [
-+        for (final p in types) TypeParameterType(p, Nullability.nonNullable),
-+      ]);
-+    } else {
-+      final p = target as Procedure;
-+      result = substitute(fn.returnType, substitutions);
-+      if (owner == null) {
-+        call = StaticInvocation(p, args);
-+      } else if (superCall) {
-+        call = SuperMethodInvocation(ThisExpression(), p.name, args, p);
-+      } else {
-+        call = InstanceInvocation(
-+          InstanceAccessKind.Instance,
-+          ThisExpression(),
-+          p.name,
-+          args,
-+          interfaceTarget: p,
-+          functionType: FunctionType(
-+            [
-+              for (final v in fn.positionalParameters)
-+                substitute(v.type, substitutions),
-+            ],
-+            result,
-+            Nullability.nonNullable,
-+            namedParameters: ([
-+              for (final v in fn.namedParameters)
-+                NamedType(
-+                  v.parameterName,
-+                  substitute(v.type, substitutions),
-+                  isRequired: v.isRequired,
-+                ),
-+            ]..sort((a, b) => a.name.compareTo(b.name))),
-+            requiredParameterCount: fn.requiredParameterCount,
-+          ),
-+        );
-+      }
-+    }
-+    final marker = validator(library);
-+    final statements = <Statement>[
-+      for (var i = 0; i < masks.length; i++)
-+        ExpressionStatement(
-+          StaticInvocation(
-+            marker,
-+            Arguments([
-+              VariableGet(masks[i]),
-+              IntLiteral(requiredMasks[i]),
-+              IntLiteral((names.length - i * 32).clamp(0, 32)),
-+              IntLiteral((positionalCount - i * 32).clamp(0, 32)),
-+            ]),
-+          ),
-+        ),
-+      for (var i = 1; i < masks.length && i * 32 < positionalCount; i++)
-+        IfStatement(
-+          Not(
-+            EqualsCall(
-+              VariableGet(masks[i - 1]),
-+              IntLiteral(0xffffffff),
-+              functionType: core.index
-+                  .getProcedure('dart:core', 'Object', '==')
-+                  .function
-+                  .computeFunctionType(Nullability.nonNullable),
-+              interfaceTarget: core.index.getProcedure(
-+                'dart:core',
-+                'Object',
-+                '==',
-+              ),
-+            ),
-+          ),
-+          ExpressionStatement(
-+            StaticInvocation(
-+              marker,
-+              Arguments([
-+                VariableGet(masks[i]),
-+                IntLiteral(0),
-+                IntLiteral(0),
-+                IntLiteral(0),
-+              ]),
-+            ),
-+          ),
-+          null,
-+        ),
-+      ReturnStatement(call),
-+    ];
-+    final procedure = Procedure(
-+      name,
-+      ProcedureKind.Method,
-+      FunctionNode(
-+        Block(statements),
-+        positionalParameters: [...slots, ...masks],
-+        requiredParameterCount: slots.length + masks.length,
-+        typeParameters: types,
-+        returnType: result,
-+      ),
-+      isStatic: owner == null,
-+      fileUri: target.fileUri,
-+      reference: priorReference(library, owner, name),
-+    );
-+    if (superCall) procedure.containsSuperCalls = true;
-+    procedure.accept(
-+      _GeneratedLocations(target.fileOffset < 0 ? 0 : target.fileOffset),
-+    );
-+    if (owner == null) {
-+      library.addProcedure(procedure);
-+    } else {
-+      owner.addProcedure(procedure);
-+      changedStructureNotifier?.registerClassMemberChange(owner);
-+    }
-+    changedStructureNotifier?.registerLibraryChange(library);
-+    entries[key] = procedure;
-+    return procedure;
-+  }
-+
-+  Procedure virtualEntry(Procedure target, List<String> names) {
-+    final owner = target.enclosingClass!;
-+    final key = ('virtual', target, jsonEncode(names));
-+    if (entries[key] case final previous?) return previous;
-+    final name = Name(entryName(target, names), target.enclosingLibrary);
-+    final base = entry(target, names, owner: owner, sharedName: name);
-+    entries[key] = base;
-+    for (final c
-+        in hierarchy.knownLibraries.expand((l) => l.classes).toList()) {
-+      if (c == owner || hierarchy.getClassAsInstanceOf(c, owner) == null) {
-+        continue;
-+      }
-+      var declared = false;
-+      for (final p in c.procedures.toList()) {
-+        if (p.name == target.name &&
-+            !p.isStatic &&
-+            !p.isAbstract &&
-+            p.kind == ProcedureKind.Method &&
-+            (buildSdk || !c.enclosingLibrary.importUri.isScheme('dart'))) {
-+          entry(p, names, owner: c, sharedName: name);
-+          declared = true;
-+        }
-+      }
-+      if (!declared &&
-+          (buildSdk || !c.enclosingLibrary.importUri.isScheme('dart')) &&
-+          (c.superclass == null ||
-+              hierarchy.getClassAsInstanceOf(c.superclass!, owner) == null)) {
-+        final inherited = hierarchy.getDispatchTarget(c, target.name);
-+        if (inherited is Procedure && !inherited.isAbstract) {
-+          entry(inherited, names, owner: c, sharedName: name);
-+        }
-+      }
-+    }
-+    return base;
-+  }
-+
-+  @override
-+  TreeNode visitStaticInvocation(StaticInvocation node) {
-+    if (node.target.name.text != 'flaxInvokeWithDefaults' ||
-+        node.target.enclosingLibrary.importUri.toString() !=
-+            'package:flax/bindings.dart') {
-+      return super.visitStaticInvocation(node);
-+    }
-+    final original = node.arguments.positional;
-+    if (original.length != 4) throw StateError('Wrong fixed marker');
-+    var names = readNames(original[3]);
-+    final vector = original[1];
-+    if (vector is! ListLiteral || vector.expressions.length != names.length) {
-+      throw StateError(
-+        'Fixed call must have a literal argument vector matching its layout',
-+      );
-+    }
-+    var values = [...vector.expressions];
-+    var provided = original[2] is ListLiteral
-+        ? [...(original[2] as ListLiteral).expressions]
-+        : [original[2]];
-+    if (provided.length != (names.length + 31) ~/ 32) {
-+      throw StateError('Fixed mask word count does not match its layout');
-+    }
-+    final originalTarget = original[0];
-+    Expression target = originalTarget;
-+    List<DartType> typeArgs = [];
-+    var requiresTargetCheck = false;
-+    while (target is AsExpression) {
-+      requiresTargetCheck = true;
-+      target = target.operand;
-+    }
-+    if (target is Instantiation) {
-+      typeArgs = target.typeArguments;
-+      target = target.expression;
-+    }
-+    while (target is AsExpression) {
-+      requiresTargetCheck = true;
-+      target = target.operand;
-+    }
-+    final locals = <SyntheticVariable>[];
-+    final maskChecks = <Statement>[];
-+    SyntheticVariable? receiver;
-+    Member? boundMember;
-+    if (target is StaticInvocation &&
-+        (target.target.isExtensionMember ||
-+            target.target.isExtensionTypeMember)) {
-+      boundMember = extensionTargets[target.target.reference];
-+      if (boundMember != null) {
-+        if (target.arguments.positional.length != 1 ||
-+            target.arguments.named.isNotEmpty) {
-+          throw StateError('Invalid bound extension tear-off');
-+        }
-+        // The synthesized tear-off only captures this receiver. Preserve its
-+        // evaluation order without allocating the temporary bound closure.
-+        final bound = target.target.function;
-+        final receiverType =
-+            substitute(bound.positionalParameters.single.type, {
-+              for (var i = 0; i < bound.typeParameters.length; i++)
-+                bound.typeParameters[i]: target.arguments.types[i],
-+            });
-+        receiver = SyntheticVariable(
-+          initializer: AsExpression(
-+            target.arguments.positional.single,
-+            receiverType,
-+          )..isTypeError = true,
-+          type: core.objectNullableRawType,
-+        );
-+        target.arguments.positional[0] = VariableGet(receiver)
-+          ..parent = target.arguments;
-+        typeArgs = [...target.arguments.types, ...typeArgs];
-+        final slots = [
-+          for (final expression in values)
-+            SyntheticVariable(
-+              initializer: expression,
-+              type: core.objectNullableRawType,
-+            ),
-+        ];
-+        final words = [
-+          for (final expression in provided)
-+            SyntheticVariable(
-+              initializer: expression,
-+              type: core.intNonNullableRawType,
-+            ),
-+        ];
-+        locals.addAll([...slots, ...words]);
-+        final positional = names.takeWhile((name) => name.isEmpty).length;
-+        for (var i = 0; i < words.length; i++) {
-+          maskChecks.add(
-+            ExpressionStatement(
-+              StaticInvocation(
-+                validator(current!.enclosingLibrary),
-+                Arguments([
-+                  VariableGet(words[i]),
-+                  IntLiteral(0),
-+                  IntLiteral((names.length - i * 32).clamp(0, 32)),
-+                  IntLiteral((positional - i * 32).clamp(0, 32)),
-+                ]),
-+              ),
-+            ),
-+          );
-+        }
-+        Expression op(Expression value, String name, int operand) =>
-+            invokeCore(value, 'int', name, [IntLiteral(operand)]);
-+        names = ['', ...names];
-+        values = [
-+          VariableGet(receiver),
-+          for (final slot in slots) VariableGet(slot),
-+        ];
-+        provided = [
-+          for (var i = 0; i < (names.length + 31) ~/ 32; i++)
-+            invokeCore(
-+              i < words.length
-+                  ? op(op(VariableGet(words[i]), '&', 0x7fffffff), '<<', 1)
-+                  : IntLiteral(0),
-+              'int',
-+              '|',
-+              [
-+                i == 0
-+                    ? IntLiteral(1)
-+                    : op(op(VariableGet(words[i - 1]), '>>', 31), '&', 1),
-+              ],
-+            ),
-+        ];
-+      }
-+    }
-+    final canonical =
-+        target is InstanceTearOff &&
-+            target.interfaceTarget.enclosingLibrary.importUri.isScheme('dart')
-+        ? layout(target.interfaceTarget)
-+        : null;
-+    if (canonical != null && !sameLayout(names, canonical)) {
-+      checkLayout((target as InstanceTearOff).interfaceTarget, names);
-+      for (final expression in [...values, ...provided]) {
-+        locals.add(
-+          SyntheticVariable(
-+            initializer: expression,
-+            type: core.objectNullableRawType,
-+          ),
-+        );
-+      }
-+      final oldNames = names;
-+      for (var word = 0; word < provided.length; word++) {
-+        maskChecks.add(
-+          ExpressionStatement(
-+            StaticInvocation(
-+              validator(current!.enclosingLibrary),
-+              Arguments([
-+                AsExpression(
-+                  VariableGet(locals[oldNames.length + word]),
-+                  core.intNonNullableRawType,
-+                )..isTypeError = true,
-+                IntLiteral(0),
-+                IntLiteral((oldNames.length - word * 32).clamp(0, 32)),
-+                IntLiteral(
-+                  (oldNames.takeWhile((name) => name.isEmpty).length -
-+                          word * 32)
-+                      .clamp(0, 32),
-+                ),
-+              ]),
-+            ),
-+          ),
-+        );
-+      }
-+      final positions = oldNames.takeWhile((n) => n.isEmpty).length;
-+      final count = canonical.takeWhile((n) => n.isEmpty).length;
-+      final indices = [
-+        for (var i = 0; i < canonical.length; i++)
-+          i < count ? (i < positions ? i : -1) : oldNames.indexOf(canonical[i]),
-+      ];
-+      values = [
-+        for (final index in indices)
-+          index < 0 ? NullLiteral() : VariableGet(locals[index]),
-+      ];
-+      provided = [
-+        for (var word = 0; word < (canonical.length + 31) ~/ 32; word++)
-+          IntLiteral(0),
-+      ];
-+      for (var index = 0; index < indices.length; index++) {
-+        final source = indices[index];
-+        if (source < 0) continue;
-+        final input = AsExpression(
-+          VariableGet(locals[oldNames.length + source ~/ 32]),
-+          core.intNonNullableRawType,
-+        )..isTypeError = true;
-+        final bit = invokeCore(input, 'int', '&', [
-+          IntLiteral(1 << (source % 32)),
-+        ]);
-+        final shifted = index % 32 >= source % 32
-+            ? invokeCore(bit, 'int', '<<', [
-+                IntLiteral(index % 32 - source % 32),
-+              ])
-+            : invokeCore(bit, 'int', '>>', [
-+                IntLiteral(source % 32 - index % 32),
-+              ]);
-+        provided[index ~/ 32] = invokeCore(provided[index ~/ 32], 'int', '|', [
-+          shifted,
-+        ]);
-+      }
-+      names = canonical;
-+    }
-+    final actuals = [...values, ...provided];
-+    final entryType = FunctionType(
-+      [
-+        for (final _ in names) core.objectNullableRawType,
-+        for (final _ in provided) core.intNonNullableRawType,
-+      ],
-+      const DynamicType(),
-+      Nullability.nonNullable,
-+    );
-+    Member? member = boundMember;
-+    if (target is ConstantExpression) {
-+      Constant c = target.constant;
-+      if (c is InstantiationConstant) {
-+        typeArgs = c.types;
-+        c = c.tearOffConstant;
-+      }
-+      if (c is TearOffConstant) member = c.target;
-+    } else if (target is ConstructorTearOff) {
-+      member = target.target;
-+    } else if (target is StaticTearOff) {
-+      member = target.target;
-+    }
-+    Expression replacement;
-+    if (member != null) {
-+      final helper = entry(member, names);
-+      replacement = StaticInvocation(
-+        helper,
-+        Arguments(actuals, types: typeArgs),
-+      );
-+    } else if (target is InstanceTearOff) {
-+      final helper = virtualEntry(target.interfaceTarget, names);
-+      receiver = SyntheticVariable(
-+        initializer: target.receiver,
-+        type: InterfaceType(
-+          target.interfaceTarget.enclosingClass!,
-+          Nullability.nonNullable,
-+          [
-+            for (
-+              var i = 0;
-+              i < target.interfaceTarget.enclosingClass!.typeParameters.length;
-+              i++
-+            )
-+              const DynamicType(),
-+          ],
-+        ),
-+      );
-+      target.receiver = VariableGet(receiver)..parent = target;
-+      replacement = InstanceInvocation(
-+        InstanceAccessKind.Instance,
-+        VariableGet(receiver),
-+        helper.name,
-+        Arguments(actuals, types: typeArgs),
-+        interfaceTarget: helper,
-+        functionType: entryType,
-+        resultType: const DynamicType(),
-+      );
-+    } else if (target is SuperPropertyGet) {
-+      final helper = entry(
-+        target.interfaceTarget,
-+        names,
-+        owner: current!.enclosingClass!,
-+        superCall: true,
-+      );
-+      replacement = InstanceInvocation(
-+        InstanceAccessKind.Instance,
-+        ThisExpression(),
-+        helper.name,
-+        Arguments(actuals, types: typeArgs),
-+        interfaceTarget: helper,
-+        functionType: entryType,
-+        resultType: const DynamicType(),
-+      );
-+    } else {
-+      throw StateError('Flax default calls require a statically known target');
-+    }
-+    if (maskChecks.isNotEmpty) {
-+      replacement = BlockExpression(Block(maskChecks), replacement);
-+    }
-+    for (final variable in locals.reversed) {
-+      replacement = Let(variable, replacement);
-+    }
-+    if (requiresTargetCheck) {
-+      replacement = BlockExpression(
-+        Block([ExpressionStatement(originalTarget)]),
-+        replacement,
-+      );
-+    }
-+    if (receiver != null) replacement = Let(receiver, replacement);
-+    replacement.fileOffset = node.fileOffset;
-+    replacement.accept(
-+      _GeneratedLocations(node.fileOffset < 0 ? 0 : node.fileOffset),
-+    );
-+    return replacement;
-+  }
-+}
-+
-+/// Lower generated Flax calls before mixin and FFI transformations.
-+void transformFlaxDefaultCalls(
-+  Component component,
-+  CoreTypes core,
-+  List<Library> libraries,
-+  ClassHierarchy hierarchy,
-+  ReferenceFromIndex? referenceFromIndex,
-+  ChangedStructureNotifier? changedStructureNotifier,
-+) {
-+  _FixedCalls(
-+    component,
-+    core,
-+    libraries,
-+    hierarchy,
-+    buildSdk: libraries.any((library) => library.importUri.isScheme('dart')),
-+    referenceFromIndex: referenceFromIndex,
-+    changedStructureNotifier: changedStructureNotifier,
-+  ).run();
-+}
-diff --git a/pkg/kernel/lib/const_finder.dart b/pkg/kernel/lib/const_finder.dart
-index 6a6576ad..ab9d3dcf 100644
---- a/pkg/kernel/lib/const_finder.dart
-+++ b/pkg/kernel/lib/const_finder.dart
-@@ -12,6 +12,7 @@ class _ConstVisitor extends RecursiveVisitor {
-     this.className,
-     this.annotationClassLibraryUri,
-     this.annotationClassName,
-+    this.nonConstantFactoryPragma,
-   ) : _visitedInstances = <String>{},
-       constantInstances = <Map<String, dynamic>>[],
-       nonConstantLocations = <Map<String, dynamic>>[];
-@@ -28,6 +29,8 @@ class _ConstVisitor extends RecursiveVisitor {
-   final List<Map<String, dynamic>> nonConstantLocations;
-
-   bool inIgnoredClass = false;
-+  final String? nonConstantFactoryPragma;
-+  bool inNonConstantFactory = false;
-
-   /// Whether or not we are currently within the declaration of the target
-   /// class.
-@@ -89,6 +92,26 @@ class _ConstVisitor extends RecursiveVisitor {
-
-   @override
-   void visitProcedure(Procedure node) {
-+    final bool previousFactory = inNonConstantFactory;
-+    inNonConstantFactory =
-+        nonConstantFactoryPragma != null &&
-+        node.annotations.any((Expression annotation) {
-+          if (annotation is! ConstantExpression ||
-+              annotation.constant is! InstanceConstant)
-+            return false;
-+          final InstanceConstant value =
-+              annotation.constant as InstanceConstant;
-+          return value.classNode.name == 'pragma' &&
-+              value.classNode.enclosingLibrary.importUri.toString() ==
-+                  'dart:core' &&
-+              value.fieldValues.entries.any(
-+                (entry) =>
-+                    entry.key.asField.name.text == 'name' &&
-+                    entry.value is StringConstant &&
-+                    (entry.value as StringConstant).value ==
-+                        nonConstantFactoryPragma,
-+              );
-+        });
-     // TODO(johnniwinther): Use lowering predicates.
-     final bool isTearOff =
-         node.isStatic &&
-@@ -98,6 +121,7 @@ class _ConstVisitor extends RecursiveVisitor {
-       inTargetTearOff = true;
-     }
-     super.visitProcedure(node);
-+    inNonConstantFactory = previousFactory;
-     inTargetTearOff = false;
-   }
-
-@@ -116,7 +140,7 @@ class _ConstVisitor extends RecursiveVisitor {
-   @override
-   void visitConstructorInvocation(ConstructorInvocation node) {
-     final Class parentClass = node.target.parent! as Class;
--    if (!inTargetTearOff && _matches(parentClass)) {
-+    if (!inTargetTearOff && !inNonConstantFactory && _matches(parentClass)) {
-       final Location location = node.location!;
-       nonConstantLocations.add(<String, dynamic>{
-         'file': location.file.toString(),
-@@ -193,11 +217,13 @@ class ConstFinder {
-     required String className,
-     String? annotationClassLibraryUri,
-     String? annotationClassName,
-+    String? nonConstantFactoryPragma,
-   }) : _visitor = _ConstVisitor(
-          classLibraryUri,
-          className,
-          annotationClassLibraryUri,
-          annotationClassName,
-+         nonConstantFactoryPragma,
-        );
-
-   final _ConstVisitor _visitor;
 diff --git a/runtime/vm/dart_api_impl_test.cc b/runtime/vm/dart_api_impl_test.cc
-index 2924029d..3f53cc1c 100644
+index c67fe8883b27e51864be1f77a194c23436512f1d..01a8c15f6cd594da7d7eb88f929e838d72a17fa6 100644
 --- a/runtime/vm/dart_api_impl_test.cc
 +++ b/runtime/vm/dart_api_impl_test.cc
 @@ -10,6 +10,7 @@
@@ -3207,8 +2537,106 @@ index 2924029d..3f53cc1c 100644
  TEST_CASE(DartAPI_WeakPersistentHandle) {
    Dart_WeakPersistentHandle weak_new_ref = nullptr;
    Dart_WeakPersistentHandle weak_old_ref = nullptr;
+diff --git a/runtime/vm/dart_api_state.h b/runtime/vm/dart_api_state.h
+index 394ac2109ed436b1f6dd8c3d58b2fd378f907c35..f481149bca5a7565fab0526b1834613d2b817545 100644
+--- a/runtime/vm/dart_api_state.h
++++ b/runtime/vm/dart_api_state.h
+@@ -5,7 +5,10 @@
+ #ifndef RUNTIME_VM_DART_API_STATE_H_
+ #define RUNTIME_VM_DART_API_STATE_H_
+ 
++#include <unordered_map>
++
+ #include "include/dart_api.h"
++#include "include/dart_flax_api.h"
+ #include "platform/utils.h"
+ #include "vm/bitfield.h"
+ #include "vm/dart_api_impl.h"
+@@ -726,9 +729,67 @@ class ApiState {
+   }
+   void FreeWeakPersistentHandle(FinalizablePersistentHandle* weak_ref) {
+     MutexLocker ml(&mutex_);
++    flax_handles_.erase(weak_ref);
+     weak_persistent_handles_.FreeHandle(weak_ref);
+   }
+ 
++  // Experimental: minor collections retain bridge targets until a joint major
++  // collection. Normal major root enumeration deliberately omits these handles.
++  void VisitFlaxHandles(ObjectPointerVisitor* visitor) {
++    MutexLocker ml(&mutex_);
++    for (auto& entry : flax_handles_) {
++      auto* handle = entry.first;
++      if (!handle->IsFinalizedNotFreed() && handle->ptr()->IsHeapObject()) {
++        // Keep the weak slot in from-space until the ordinary weak visitor
++        // sees the forwarding header. Updating it early looks unreachable.
++        ObjectPtr object = handle->ptr();
++        visitor->VisitPointer(&object);
++      }
++    }
++  }
++
++  bool RegisterFlaxHandle(Dart_WeakPersistentHandle object, bool is_origin) {
++    MutexLocker ml(&mutex_);
++    if (!weak_persistent_handles_.IsValidHandle(object) ||
++        weak_persistent_handles_.IsFreeHandle(object))
++      return false;
++    auto* handle = reinterpret_cast<FinalizablePersistentHandle*>(object);
++    if (handle->auto_delete() || handle->IsFinalizedNotFreed()) return false;
++    return flax_handles_.emplace(handle, is_origin).second;
++  }
++
++  bool SetFlaxCollector(Dart_FlaxCollector collector,
++                        void* peer,
++                        Thread* owner) {
++    if (flax_epoch_ != 0 || flax_callback_active_) return false;
++    if (flax_collector_ != nullptr && collector != nullptr) return false;
++    if (flax_collector_ != nullptr && flax_owner_ != owner) return false;
++    flax_collector_ = collector;
++    flax_peer_ = peer;
++    flax_owner_ = collector == nullptr ? nullptr : owner;
++    if (collector == nullptr) flax_request_ = nullptr;
++    return true;
++  }
++  Dart_FlaxCollector flax_collector() const { return flax_collector_; }
++  void* flax_peer() const { return flax_peer_; }
++  Thread* flax_owner() const { return flax_owner_; }
++  Dart_FlaxGCEpoch flax_epoch() const { return flax_epoch_; }
++  void BeginFlaxEpoch() {
++    RELEASE_ASSERT(flax_epoch_ == 0);
++    RELEASE_ASSERT(++flax_epoch_counter_ != 0);
++    flax_epoch_ = flax_epoch_counter_;
++  }
++  void EndFlaxEpoch() { flax_epoch_ = 0; }
++  bool flax_callback_active() const { return flax_callback_active_; }
++  void set_flax_callback_active(bool active) { flax_callback_active_ = active; }
++  const auto& flax_handles() const { return flax_handles_; }
++  void SetFlaxCollectionRequest(void (*request)(void*)) {
++    flax_request_ = request;
++  }
++  void RequestFlaxCollection() const {
++    if (flax_request_ != nullptr) flax_request_(flax_peer_);
++  }
++
+   bool IsValidPersistentHandle(Dart_PersistentHandle object) {
+     MutexLocker ml(&mutex_);
+     return persistent_handles_.IsValidHandle(object);
+@@ -781,6 +842,14 @@ class ApiState {
+   PersistentHandles persistent_handles_;
+   FinalizablePersistentHandles weak_persistent_handles_;
+   WeakTable acquired_table_;
++  std::unordered_map<FinalizablePersistentHandle*, bool> flax_handles_;
++  Dart_FlaxCollector flax_collector_ = nullptr;
++  void* flax_peer_ = nullptr;
++  Thread* flax_owner_ = nullptr;
++  void (*flax_request_)(void*) = nullptr;
++  Dart_FlaxGCEpoch flax_epoch_counter_ = 0;
++  Dart_FlaxGCEpoch flax_epoch_ = 0;
++  bool flax_callback_active_ = false;
+ 
+   DISALLOW_COPY_AND_ASSIGN(ApiState);
+ };
 diff --git a/runtime/vm/heap/heap.cc b/runtime/vm/heap/heap.cc
-index a356646c..56283b0e 100644
+index a356646c92521313b5337b9387039f3ba2d25e7f..56283b0e95ee849993604286107b924e62fd1a24 100644
 --- a/runtime/vm/heap/heap.cc
 +++ b/runtime/vm/heap/heap.cc
 @@ -3,6 +3,7 @@
@@ -3563,7 +2991,7 @@ index a356646c..56283b0e 100644
      case PageSpace::kSweepingRegular:
        if (mode_ != Dart_PerformanceMode_Latency) {
 diff --git a/runtime/vm/heap/heap.h b/runtime/vm/heap/heap.h
-index 5f0c8a1e..f393d029 100644
+index 5f0c8a1ea80ad9e2e516e4558572e162062f3f44..f393d02950055b52652f53bb110a27e19a812f0a 100644
 --- a/runtime/vm/heap/heap.h
 +++ b/runtime/vm/heap/heap.h
 @@ -11,6 +11,7 @@
@@ -3606,8 +3034,323 @@ index 5f0c8a1e..f393d029 100644
  
    // GC stats collection.
    void RecordBeforeGC(GCType type, GCReason reason);
+diff --git a/runtime/vm/heap/marker.cc b/runtime/vm/heap/marker.cc
+index e8aeef5b4d8118888a1edf63a95a06c54fe121b6..8b7c8a0e459ccc425656d66d5490551fb6fc9e35 100644
+--- a/runtime/vm/heap/marker.cc
++++ b/runtime/vm/heap/marker.cc
+@@ -4,6 +4,10 @@
+ 
+ #include "vm/heap/marker.h"
+ 
++#include <unordered_map>
++#include <unordered_set>
++#include <vector>
++
+ #include "platform/assert.h"
+ #include "platform/atomic.h"
+ #include "platform/thread_sanitizer.h"
+@@ -68,6 +72,56 @@ class MarkingVisitor : public ObjectPointerVisitor {
+     return raw->untag()->IsMarked();
+   }
+ 
++  void DrainFlaxMarking() {
++    do {
++      ProcessDeferredMarking();
++      DrainMarkingStack();
++    } while (ProcessPendingWeakProperties() || !deferred_work_list_.IsEmpty());
++  }
++
++  // Index only bridge origins at the safepoint. The VM reports newly marked
++  // origins directly; this neither scans nor projects the JavaScript heap.
++  void BeginFlaxTracing(ApiState* state) {
++    flax_state_ = state;
++    for (auto& entry : state->flax_handles()) {
++      auto* handle = entry.first;
++      if (!entry.second || handle->IsFinalizedNotFreed()) continue;
++      ObjectPtr object = handle->ptr();
++      if (!object->IsHeapObject()) continue;
++      auto api = handle->ApiWeakPersistentHandle();
++      flax_origins_[static_cast<uword>(object)].push_back(api);
++      if (object->untag()->IsMarked()) QueueFlaxOrigin(api);
++    }
++  }
++
++  static bool FlaxIsMarked(void* context, Dart_WeakPersistentHandle api) {
++    auto* visitor = static_cast<MarkingVisitor*>(context);
++    auto* handle = reinterpret_cast<FinalizablePersistentHandle*>(api);
++    if (!visitor->flax_state_->flax_handles().contains(handle) ||
++        handle->IsFinalizedNotFreed())
++      return false;
++    ObjectPtr object = handle->ptr();
++    return object->IsHeapObject() && object->untag()->IsMarked();
++  }
++
++  void MarkFlaxTargets(const Dart_WeakPersistentHandle* targets,
++                       intptr_t count) {
++    for (intptr_t i = 0; i < count; i++) {
++      auto* handle = reinterpret_cast<FinalizablePersistentHandle*>(targets[i]);
++      RELEASE_ASSERT(flax_state_->flax_handles().contains(handle));
++      // A finalized origin must never be resurrected by a live JS target.
++      if (!handle->IsFinalizedNotFreed()) MarkObject(handle->ptr());
++    }
++    FinishedRoots();
++    DrainFlaxMarking();
++  }
++
++  static Dart_WeakPersistentHandle FlaxNextOrigin(void* context) {
++    auto* visitor = static_cast<MarkingVisitor*>(context);
++    if (visitor->flax_next_ == visitor->flax_marked_.size()) return nullptr;
++    return visitor->flax_marked_[visitor->flax_next_++];
++  }
++
+   void FinishedRoots() {
+     // Nothing to remember for roots. Don't carry over to objects.
+     has_evacuation_candidate_ = false;
+@@ -254,6 +308,8 @@ class MarkingVisitor : public ObjectPointerVisitor {
+       ObjectPtr obj;
+       while (MarkerWorkList::Pop(&old_work_list_, &new_work_list_, &obj)) {
+         ASSERT(!has_evacuation_candidate_);
++        // Barrier-pushed objects may already have their mark bit set.
++        FlaxObjectMarked(obj);
+ 
+         const intptr_t class_id = obj->GetClassIdOfHeapObject();
+         ASSERT(class_id != kIllegalCid);
+@@ -504,6 +560,7 @@ class MarkingVisitor : public ObjectPointerVisitor {
+           marked_bytes_ += size;
+         }
+       }
++      FlaxObjectMarked(obj);
+       if (has_evacuation_candidate_) {
+         has_evacuation_candidate_ = false;
+         if (!obj->untag()->IsCardRemembered() &&
+@@ -641,6 +698,19 @@ class MarkingVisitor : public ObjectPointerVisitor {
+   GCLinkedLists* delayed() { return &delayed_; }
+ 
+  private:
++  void QueueFlaxOrigin(Dart_WeakPersistentHandle handle) {
++    if (flax_reported_.insert(handle).second) flax_marked_.push_back(handle);
++  }
++
++  void FlaxObjectMarked(ObjectPtr object) {
++    if (flax_state_ == nullptr) return;
++    auto found = flax_origins_.find(static_cast<uword>(object));
++    if (found != flax_origins_.end()) {
++      for (auto api : found->second)
++        QueueFlaxOrigin(api);
++    }
++  }
++
+   DART_FORCE_INLINE
+   bool MarkObject(ObjectPtr obj) {
+     if (obj->IsImmediateObject()) {
+@@ -651,6 +721,7 @@ class MarkingVisitor : public ObjectPointerVisitor {
+ #if defined(HOST_HAS_FAST_WRITE_WRITE_FENCE)
+       // Ignore race: TSAN doesn't support fences.
+       if (obj->untag()->TryAcquireMarkBitIgnoreRace()) {
++        FlaxObjectMarked(obj);
+         new_work_list_.Push(obj);
+       }
+ #else
+@@ -659,6 +730,7 @@ class MarkingVisitor : public ObjectPointerVisitor {
+         // initializing store.
+         deferred_work_list_.Push(obj);
+       } else if (obj->untag()->TryAcquireMarkBit()) {
++        FlaxObjectMarked(obj);
+         new_work_list_.Push(obj);
+       }
+ #endif
+@@ -692,12 +764,19 @@ class MarkingVisitor : public ObjectPointerVisitor {
+     }
+ 
+     if (obj->untag()->TryAcquireMarkBit()) {
++      FlaxObjectMarked(obj);
+       old_work_list_.Push(obj);
+     }
+ 
+     return UntaggedObject::IsEvacuationCandidate(tags);
+   }
+ 
++  ApiState* flax_state_ = nullptr;
++  std::unordered_map<uword, std::vector<Dart_WeakPersistentHandle>>
++      flax_origins_;
++  std::vector<Dart_WeakPersistentHandle> flax_marked_;
++  std::unordered_set<Dart_WeakPersistentHandle> flax_reported_;
++  size_t flax_next_ = 0;
+   PageSpace* page_space_;
+   MarkerWorkList old_work_list_;
+   MarkerWorkList new_work_list_;
+@@ -979,6 +1058,14 @@ class ParallelMarkTask : public SafepointTask {
+       visitor_->ProcessDeferredMarking();
+       barrier_->Sync();
+ 
++      // The ordinary mark stays parallel. A registered foreign collector joins
++      // on the safepoint owner before any weak references are cleared.
++      if (thread->isolate_group()->api_state()->flax_collector() != nullptr) {
++        thread->ReleaseStoreBuffer();
++        visitor_->AddMicros(OS::GetCurrentMonotonicMicros() - start);
++        return;
++      }
++
+       // Phase 3: Weak processing and statistics.
+       visitor_->MournWeakProperties();
+       visitor_->MournWeakReferences();
+@@ -1115,6 +1202,7 @@ GCMarker::~GCMarker() {
+       delete visitors_[i];
+     }
+   }
++  isolate_group_->api_state()->EndFlaxEpoch();
+   delete[] visitors_;
+ }
+ 
+@@ -1291,7 +1379,13 @@ class VerifyAfterMarkingVisitor : public ObjectVisitor,
+   bool failed_ = false;
+ };
+ 
+-void GCMarker::MarkObjects(PageSpace* page_space) {
++void GCMarker::MarkObjects(PageSpace* page_space,
++                           bool defer_flax_tracing,
++                           bool stage_flax) {
++  ApiState* api = isolate_group_->api_state();
++  const bool completing_flax = api->flax_epoch() != 0;
++  // Retire the token before any abort, weak processing, or moving collection.
++  if (completing_flax) api->EndFlaxEpoch();
+   if (isolate_group_->old_marking_stack() != nullptr) {
+     isolate_group_->DisableIncrementalBarrier();
+   }
+@@ -1299,6 +1393,7 @@ void GCMarker::MarkObjects(PageSpace* page_space) {
+   Prologue();
+ 
+   const intptr_t num_tasks = NumTasks();
++  auto collector = api->flax_collector();
+   ThreadBarrier* barrier = new ThreadBarrier(num_tasks, /*initial=*/1);
+ 
+   ResetSlices();
+@@ -1328,6 +1423,47 @@ void GCMarker::MarkObjects(PageSpace* page_space) {
+   }
+   visitors_[0]->Adopt(&global_list_);
+   isolate_group_->safepoint_handler()->RunTasks(&tasks);
++  if (collector != nullptr) {
++    // Merge pending weak work only after the parallel tasks finish. Newly
++    // discovered cross-heap edges must reach a fixed point before mourning.
++    for (intptr_t i = 0; i < num_tasks; i++) {
++      visitors_[i]->Flush(&global_list_);
++    }
++    auto* visitor = visitors_[0];
++    visitor->Adopt(&global_list_);
++    auto* thread = Thread::Current();
++    int64_t start = OS::GetCurrentMonotonicMicros();
++    visitor->set_concurrent(false);
++    visitor->ProcessDeferredMarking();
++    visitor->DrainFlaxMarking();
++    if (stage_flax) {
++      RELEASE_ASSERT(thread == api->flax_owner());
++      RELEASE_ASSERT(!completing_flax && !defer_flax_tracing);
++      visitor->BeginFlaxTracing(api);
++      api->BeginFlaxEpoch();
++      isolate_group_->EnableIncrementalBarrier(
++          &old_marking_stack_, &new_marking_stack_, &deferred_marking_stack_);
++      isolate_group_->DeferredMarkLiveTemporaries();
++      thread->ReleaseStoreBuffer();
++      visitor->AddMicros(OS::GetCurrentMonotonicMicros() - start);
++      return;  // The VM owns all visitors and weak lists until commit/abort.
++    } else if (!completing_flax || defer_flax_tracing) {
++      // Retain conditional targets until the immediate fresh pass, or until an
++      // owner-thread major when this thread cannot enter the JS isolate.
++      api->VisitFlaxHandles(visitor);
++      visitor->FinishedRoots();
++      visitor->DrainFlaxMarking();
++      if (!defer_flax_tracing || completing_flax) {
++        api->RequestFlaxCollection();
++      }
++    }
++    visitor->MournWeakProperties();
++    visitor->MournWeakReferences();
++    visitor->MournWeakArrays();
++    thread->ReleaseStoreBuffer();
++    IterateWeakRoots(thread);
++    visitor->AddMicros(OS::GetCurrentMonotonicMicros() - start);
++  }
+ 
+   for (intptr_t i = 0; i < num_tasks; i++) {
+     MarkingVisitor* visitor = visitors_[i];
+@@ -1353,6 +1489,46 @@ void GCMarker::MarkObjects(PageSpace* page_space) {
+   Epilogue();
+ }
+ 
++bool GCMarker::FlaxCheckpoint(const Dart_WeakPersistentHandle* targets,
++                              intptr_t target_count,
++                              void (*origin_sink)(void*,
++                                                  Dart_WeakPersistentHandle),
++                              void* peer,
++                              bool* all_targets_marked) {
++  RELEASE_ASSERT(Thread::Current()->OwnsGCSafepoint());
++  auto* api = isolate_group_->api_state();
++  RELEASE_ASSERT(api->flax_epoch() != 0);
++  auto* visitor = visitors_[0];
++  for (intptr_t i = 0; i < target_count; i++) {
++    RELEASE_ASSERT(api->flax_handles().contains(
++        reinterpret_cast<FinalizablePersistentHandle*>(targets[i])));
++  }
++  isolate_group_->FlushMarkingStacks();
++  heap_->old_space()->WriteProtectCode(false);
++  Prologue();
++  visitor->MarkFlaxTargets(targets, target_count);
++  while (auto origin = MarkingVisitor::FlaxNextOrigin(visitor)) {
++    if (origin_sink != nullptr) origin_sink(peer, origin);
++  }
++  if (all_targets_marked != nullptr) {
++    *all_targets_marked = true;
++    for (auto& entry : api->flax_handles()) {
++      if (!entry.second && !entry.first->IsFinalizedNotFreed() &&
++          !MarkingVisitor::FlaxIsMarked(
++              visitor, entry.first->ApiWeakPersistentHandle())) {
++        *all_targets_marked = false;
++        break;
++      }
++    }
++  }
++  Thread::Current()->ReleaseStoreBuffer();
++  heap_->old_space()->WriteProtectCode(true);
++  // Other mutators may resume in a barrier-eliminated initialization sequence.
++  // Keep its live temporaries deferred until the next checkpoint or commit.
++  isolate_group_->DeferredMarkLiveTemporaries();
++  return true;
++}
++
+ void GCMarker::PruneWeak(Scavenger* scavenger) {
+   scavenger->PruneWeak(&global_list_);
+   for (intptr_t i = 0, n = NumTasks(); i < n; i++) {
+diff --git a/runtime/vm/heap/marker.h b/runtime/vm/heap/marker.h
+index a909085132101b9067550e3c8f59322ea05f8d14..aa8677a3933072bb04bed3f56223fcbda8271c3b 100644
+--- a/runtime/vm/heap/marker.h
++++ b/runtime/vm/heap/marker.h
+@@ -5,6 +5,7 @@
+ #ifndef RUNTIME_VM_HEAP_MARKER_H_
+ #define RUNTIME_VM_HEAP_MARKER_H_
+ 
++#include "include/dart_flax_api.h"
+ #include "vm/allocation.h"
+ #include "vm/heap/gc_shared.h"
+ #include "vm/heap/pointer_block.h"
+@@ -45,7 +46,15 @@ class GCMarker {
+ 
+   // (Re)mark roots, drain the marking queue and finalize weak references.
+   // Does not required StartConcurrentMark to have been previously called.
+-  void MarkObjects(PageSpace* page_space);
++  void MarkObjects(PageSpace* page_space,
++                   bool defer_flax_tracing = false,
++                   bool stage_flax = false);
++
++  bool FlaxCheckpoint(const Dart_WeakPersistentHandle* targets,
++                      intptr_t target_count,
++                      void (*origin_sink)(void*, Dart_WeakPersistentHandle),
++                      void* peer,
++                      bool* all_targets_marked);
+ 
+   intptr_t marked_words() const { return marked_bytes_ >> kWordSizeLog2; }
+   intptr_t MarkedWordsPerMicro() const;
 diff --git a/runtime/vm/heap/pages.cc b/runtime/vm/heap/pages.cc
-index 8c3242ef..e68a096d 100644
+index 8c3242ef02b74abbe742d2424e20e063a398f69d..e68a096d79b085ec443a6bc9934194b91f172ed9 100644
 --- a/runtime/vm/heap/pages.cc
 +++ b/runtime/vm/heap/pages.cc
 @@ -3,6 +3,7 @@
@@ -3721,7 +3464,7 @@ index 8c3242ef..e68a096d 100644
    allocated_black_in_words_ = 0;
    mark_words_per_micro_ = marker_->MarkedWordsPerMicro();
 diff --git a/runtime/vm/heap/pages.h b/runtime/vm/heap/pages.h
-index d9977a48..b03bf5d2 100644
+index d9977a4812ab770382996127191af4627cf5b16b..b03bf5d2e8ca94c07875f9d673ada93504fd151a 100644
 --- a/runtime/vm/heap/pages.h
 +++ b/runtime/vm/heap/pages.h
 @@ -131,6 +131,7 @@ class PageSpace {
@@ -3758,40 +3501,23 @@ index d9977a48..b03bf5d2 100644
    void VerifyStoreBuffers(const char* msg);
    void SweepExecutable();
    void SweepNew();
-diff --git a/runtime/vm/heap/marker.h b/runtime/vm/heap/marker.h
-index a9090851..aa8677a3 100644
---- a/runtime/vm/heap/marker.h
-+++ b/runtime/vm/heap/marker.h
-@@ -5,6 +5,7 @@
- #ifndef RUNTIME_VM_HEAP_MARKER_H_
- #define RUNTIME_VM_HEAP_MARKER_H_
+diff --git a/runtime/vm/heap/scavenger.cc b/runtime/vm/heap/scavenger.cc
+index 23514857dfd4342748a9ec8539db576d2e428b57..206b29574a7d70d18e6f0523233c0f573a275e30 100644
+--- a/runtime/vm/heap/scavenger.cc
++++ b/runtime/vm/heap/scavenger.cc
+@@ -1181,6 +1181,7 @@ void Scavenger::IterateIsolateRoots(ObjectPointerVisitor* visitor) {
+   TIMELINE_FUNCTION_GC_DURATION(Thread::Current(), "IterateIsolateRoots");
+   heap_->isolate_group()->VisitObjectPointers(
+       visitor, ValidationPolicy::kDontValidateFrames);
++  heap_->isolate_group()->api_state()->VisitFlaxHandles(visitor);
+ }
  
-+#include "include/dart_flax_api.h"
- #include "vm/allocation.h"
- #include "vm/heap/gc_shared.h"
- #include "vm/heap/pointer_block.h"
-@@ -45,7 +46,15 @@ class GCMarker {
- 
-   // (Re)mark roots, drain the marking queue and finalize weak references.
-   // Does not required StartConcurrentMark to have been previously called.
--  void MarkObjects(PageSpace* page_space);
-+  void MarkObjects(PageSpace* page_space,
-+                   bool defer_flax_tracing = false,
-+                   bool stage_flax = false);
-+
-+  bool FlaxCheckpoint(const Dart_WeakPersistentHandle* targets,
-+                      intptr_t target_count,
-+                      void (*origin_sink)(void*, Dart_WeakPersistentHandle),
-+                      void* peer,
-+                      bool* all_targets_marked);
- 
-   intptr_t marked_words() const { return marked_bytes_ >> kWordSizeLog2; }
-   intptr_t MarkedWordsPerMicro() const;
+ void Scavenger::IterateStoreBuffers(ScavengerVisitor* visitor) {
 diff --git a/runtime/vm/isolate.cc b/runtime/vm/isolate.cc
-index 7f084f77..78c08026 100644
+index b1c390d7830aefadf740da55efec4dc3cd28bda3..3a9fd6a214b26a3f24b14818fc0a14965d805109 100644
 --- a/runtime/vm/isolate.cc
 +++ b/runtime/vm/isolate.cc
-@@ -578,6 +578,44 @@ void IsolateGroup::set_heap(std::unique_ptr<Heap> heap) {
+@@ -579,6 +579,44 @@ void IsolateGroup::set_heap(std::unique_ptr<Heap> heap) {
    heap_ = std::move(heap);
  }
  
@@ -3836,7 +3562,7 @@ index 7f084f77..78c08026 100644
  static constexpr intptr_t kActiveMutatorPreemptionTimeout = 120;
  
  void IsolateGroup::IncreaseMutatorCount(Thread* thread,
-@@ -597,10 +635,11 @@ void IsolateGroup::IncreaseMutatorCount(Thread* thread,
+@@ -598,10 +636,11 @@ void IsolateGroup::IncreaseMutatorCount(Thread* thread,
      // max_active_mutators) and only use monitors in the uncommon case.
      MonitorLocker ml(active_mutators_monitor_.get());
      ASSERT(active_mutators_ <= max_active_mutators_);
@@ -3850,7 +3576,7 @@ index 7f084f77..78c08026 100644
          if (was_stolen) {
            ml.WaitWithSafepointCheck(thread);
          } else {
-@@ -620,7 +659,7 @@ void IsolateGroup::IncreaseMutatorCount(Thread* thread,
+@@ -621,7 +660,7 @@ void IsolateGroup::IncreaseMutatorCount(Thread* thread,
        }
        waiting_mutators_--;
  
@@ -3859,7 +3585,7 @@ index 7f084f77..78c08026 100644
          active_mutators_ -=
              thread_registry()->StealActiveMutators(thread_pool());
          ASSERT(active_mutators_ >= 0);
-@@ -2585,6 +2624,7 @@ void IsolateGroup::MaybeIncreaseReloadEveryNStackOverflowChecks() {
+@@ -2590,6 +2629,7 @@ void IsolateGroup::MaybeIncreaseReloadEveryNStackOverflowChecks() {
  void Isolate::Shutdown() {
    Thread* thread = Thread::Current();
    ASSERT(this == thread->isolate());
@@ -3868,10 +3594,10 @@ index 7f084f77..78c08026 100644
    // Don't allow anymore dart code to execution on this isolate.
    thread->ClearStackLimit();
 diff --git a/runtime/vm/isolate.h b/runtime/vm/isolate.h
-index e5e6f00e..1be0b266 100644
+index 27573055184c3d4627ff04e75aa4da69ffe8f9c1..f1c04e90592b0d12aa2f3f099d80e8e0a87988af 100644
 --- a/runtime/vm/isolate.h
 +++ b/runtime/vm/isolate.h
-@@ -609,6 +609,11 @@ class IsolateGroup : public IntrusiveDListEntry<IsolateGroup> {
+@@ -612,6 +612,11 @@ class IsolateGroup : public IntrusiveDListEntry<IsolateGroup> {
    NO_SANITIZE_THREAD
    intptr_t MutatorCount() const { return active_mutators_; }
  
@@ -3883,7 +3609,7 @@ index e5e6f00e..1be0b266 100644
    bool HasTagHandler() const { return library_tag_handler() != nullptr; }
    ObjectPtr CallTagHandler(Dart_LibraryTag tag,
                             const Object& arg1,
-@@ -863,6 +868,9 @@ class IsolateGroup : public IntrusiveDListEntry<IsolateGroup> {
+@@ -866,6 +871,9 @@ class IsolateGroup : public IntrusiveDListEntry<IsolateGroup> {
   private:
    friend class Dart;  // For `object_store_ = ` in Dart::Init
    friend class Heap;
@@ -3893,7 +3619,7 @@ index e5e6f00e..1be0b266 100644
    friend class StackFrame;  // For `[isolates_].First()`.
    // For `object_store_shared_untag()`, `class_table_shared_untag()`
    friend class Isolate;
-@@ -1028,6 +1036,10 @@ class IsolateGroup : public IntrusiveDListEntry<IsolateGroup> {
+@@ -1032,6 +1040,10 @@ class IsolateGroup : public IntrusiveDListEntry<IsolateGroup> {
    std::unique_ptr<Roots> roots_;
  
    FfiCallbackMetadata::MetadataEntry* ffi_callback_list_head_ = nullptr;
@@ -3904,11 +3630,25 @@ index e5e6f00e..1be0b266 100644
  };
  
  // When an isolate sends-and-exits this class represent things that it passed
+diff --git a/runtime/vm/object.cc b/runtime/vm/object.cc
+index 9de49b5d8f738ec3c3d556e57ec36132e29bf847..fa668465d98cba1c87dd8123c529bb3996961d4d 100644
+--- a/runtime/vm/object.cc
++++ b/runtime/vm/object.cc
+@@ -23549,7 +23549,8 @@ AbstractTypePtr TypeParameter::InstantiateFrom(
+              base() - num_free_fun_type_params);
+       ASSERT(TypeParameter::Cast(result).nullability() == nullability());
+       AbstractType& upper_bound = AbstractType::Handle(zone, bound());
+-      if (!upper_bound.IsInstantiated()) {
++      // Only a type parameter can become Never; expanding an F-bound recurses.
++      if (upper_bound.IsTypeParameter() && !upper_bound.IsInstantiated()) {
+         upper_bound = upper_bound.InstantiateFrom(
+             instantiator_type_arguments, function_type_arguments,
+             num_free_fun_type_params, space, function_type_mapping,
 diff --git a/runtime/vm/thread.cc b/runtime/vm/thread.cc
-index 887450d2..5f5e2a78 100644
+index 8d81057cf607c549de4c896afe3d26722cbca61b..2269ce4391e60b8ae09d292fecb2b0471b27112c 100644
 --- a/runtime/vm/thread.cc
 +++ b/runtime/vm/thread.cc
-@@ -494,6 +494,7 @@ void Thread::ExitIsolate(bool isolate_shutdown) {
+@@ -498,6 +498,7 @@ void Thread::ExitIsolate(bool isolate_shutdown) {
  
    auto isolate = thread->isolate();
    auto group = thread->isolate_group();
@@ -3916,7 +3656,7 @@ index 887450d2..5f5e2a78 100644
  
    thread->set_vm_tag(isolate->is_runnable() ? VMTag::kIdleTagId
                                              : VMTag::kLoadWaitTagId);
-@@ -736,7 +737,8 @@ Thread* Thread::AddActiveThread(IsolateGroup* group,
+@@ -734,7 +735,8 @@ Thread* Thread::AddActiveThread(IsolateGroup* group,
    MonitorLocker ml(thread_registry->threads_lock());
  
    if (!bypass_safepoint) {
@@ -3927,7 +3667,7 @@ index 887450d2..5f5e2a78 100644
      }
    }
 diff --git a/runtime/vm/thread_registry.h b/runtime/vm/thread_registry.h
-index ebf477e4..c48f4ac6 100644
+index ebf477e42c3ba2a1d55d5d9cf3797e4e42dd560f..c48f4ac6ac0f10d85161a7d636d6bfe48e5f8945 100644
 --- a/runtime/vm/thread_registry.h
 +++ b/runtime/vm/thread_registry.h
 @@ -66,6 +66,7 @@ class ThreadRegistry {
@@ -3938,3 +3678,604 @@ index ebf477e4..c48f4ac6 100644
    friend class Thread;
    friend class SafepointHandler;
    DISALLOW_COPY_AND_ASSIGN(ThreadRegistry);
+diff --git a/runtime/vm/visitor.cc b/runtime/vm/visitor.cc
+index 37806bb6fda82ca40925eedf783d4f33bfcfdfbe..de8133f8cb7a13f812da14f17666a98296c2cc5a 100644
+--- a/runtime/vm/visitor.cc
++++ b/runtime/vm/visitor.cc
+@@ -5,6 +5,7 @@
+ #include "vm/visitor.h"
+ 
+ #include "vm/isolate.h"
++#include "vm/raw_object.h"
+ 
+ namespace dart {
+ 
+diff --git a/sdk/lib/_internal/vm/lib/async_patch.dart b/sdk/lib/_internal/vm/lib/async_patch.dart
+index 4eb27c82dcd41784c126a5a8451e3d4e16a7731e..e1059bdce6e989aa9a2e0510b2b00cd0b3599b0e 100644
+--- a/sdk/lib/_internal/vm/lib/async_patch.dart
++++ b/sdk/lib/_internal/vm/lib/async_patch.dart
+@@ -40,6 +40,8 @@ void _asyncStarMoveNextHelper(stream) {
+ // async* generator functions.
+ @pragma("vm:entry-point")
+ class _AsyncStarStreamController<T> {
++  @pragma("vm:entry-point")
++  Object? _flaxPendingDependency;
+   @pragma("vm:entry-point")
+   StreamController<T> controller;
+   @pragma("vm:entry-point")
+@@ -167,7 +169,7 @@ class _AsyncStarStreamController<T> {
+       return null;
+     }
+     if (cancellationFuture == null) {
+-      cancellationFuture = _Future();
++      cancellationFuture = _Future().._flaxPendingDependency = this;
+       // Only resume the generator if it is suspended at a yield.
+       // Cancellation does not affect an async generator that is
+       // suspended at an await.
+@@ -204,11 +206,13 @@ class _SuspendState {
+ 
+     @pragma("vm:invisible")
+     thenCallback(value) {
++      suspendState._flaxRetainAwaited(null);
+       suspendState._resume(value, null, null);
+     }
+ 
+     @pragma("vm:invisible")
+     errorCallback(Object exception, StackTrace stackTrace) {
++      suspendState._flaxRetainAwaited(null);
+       suspendState._resume(null, exception, stackTrace);
+     }
+ 
+@@ -312,9 +316,19 @@ class _SuspendState {
+     );
+   }
+ 
++  void _flaxRetainAwaited(Object? source) {
++    final owner = _functionData;
++    if (owner is _Future) {
++      owner._flaxPendingDependency = source;
++    } else if (owner is _AsyncStarStreamController) {
++      owner._flaxPendingDependency = source;
++    }
++  }
++
+   @pragma("vm:entry-point", "call")
+   @pragma("vm:invisible")
+   Object? _await(Object? object) {
++    _flaxRetainAwaited(object is Future ? object : null);
+     if (_thenCallback == null) {
+       _createAsyncCallbacks();
+     }
+@@ -338,6 +352,7 @@ class _SuspendState {
+   @pragma("vm:entry-point", "call")
+   @pragma("vm:invisible")
+   Object? _awaitWithTypeCheck<T>(Object? object) {
++    _flaxRetainAwaited(object is Future<T> ? object : null);
+     if (_thenCallback == null) {
+       _createAsyncCallbacks();
+     }
+diff --git a/sdk/lib/async/broadcast_stream_controller.dart b/sdk/lib/async/broadcast_stream_controller.dart
+index eeaeeaf832da08cd459472849ae219b3ca16ccc2..5216fcae115693d6935e12d8b7f282bccd68fd99 100644
+--- a/sdk/lib/async/broadcast_stream_controller.dart
++++ b/sdk/lib/async/broadcast_stream_controller.dart
+@@ -153,7 +153,8 @@ abstract class _BroadcastStreamController<T>
+ 
+   bool get _mayAddEvent => (_state < _STATE_CLOSED);
+ 
+-  _Future<void> _ensureDoneFuture() => _doneFuture ??= _Future<void>();
++  _Future<void> _ensureDoneFuture() =>
++      _doneFuture ??= (_Future<void>().._flaxPendingDependency = this);
+ 
+   // Linked list helpers
+ 
+diff --git a/sdk/lib/async/future.dart b/sdk/lib/async/future.dart
+index d74d98eaccd3ac38bd116d65af48ba87f5c9e1d4..13f33ca3a2b3872d7f96259da779ad83f8185897 100644
+--- a/sdk/lib/async/future.dart
++++ b/sdk/lib/async/future.dart
+@@ -521,6 +521,8 @@ abstract interface class Future<T> {
+   }) {
+     @pragma('vm:awaiter-link')
+     final _Future<List<T>> _future = _Future<List<T>>();
++    final dependencies = <Future?>[];
++    _future._flaxPendingDependency = dependencies;
+     List<T?>? values; // Collects the values. Set to null on error.
+     int remaining = 0; // How many futures are we waiting for.
+     Object? error; // The first error from a future.
+@@ -560,11 +562,13 @@ abstract interface class Future<T> {
+     }
+ 
+     try {
++      // Other Iterables may be single-use; only Lists have a reusable length.
++      if (futures is List) dependencies.length = futures.length;
+       // As each future completes, put its value into the corresponding
+       // position in the list of values.
+       for (var future in futures) {
+         int pos = remaining;
+-        future.then((T value) {
++        final dependency = future.then<Null>((T value) {
+           var remainingResults = --remaining;
+           List<T?>? valueList = values;
+           if (valueList != null) {
+@@ -590,6 +594,11 @@ abstract interface class Future<T> {
+             }
+           }
+         }, onError: handleError);
++        if (pos < dependencies.length) {
++          dependencies[pos] = dependency;
++        } else {
++          dependencies.add(dependency);
++        }
+         // Increment the 'remaining' after the call to 'then'.
+         // If that call throws, we don't expect any future callback from
+         // the future, and we also don't increment remaining.
+@@ -655,6 +664,8 @@ abstract interface class Future<T> {
+   /// ```
+   static Future<T> any<T>(Iterable<Future<T>> futures) {
+     var completer = Completer<T>.sync();
++    final dependencies = <Future>[];
++    (completer.future as _Future)._flaxPendingDependency = dependencies;
+     void onValue(T value) {
+       if (!completer.isCompleted) completer.complete(value);
+     }
+@@ -664,6 +675,7 @@ abstract interface class Future<T> {
+     }
+ 
+     for (var future in futures) {
++      dependencies.add(future);
+       future.then(onValue, onError: onError);
+     }
+     return completer.future;
+@@ -760,6 +772,7 @@ abstract interface class Future<T> {
+           return;
+         }
+         if (result is Future<bool>) {
++          doneSignal._flaxPendingDependency = result;
+           result.then(nextIteration, onError: doneSignal._completeError);
+           return;
+         }
+diff --git a/sdk/lib/async/future_extensions.dart b/sdk/lib/async/future_extensions.dart
+index ee57188325ffbcf1745e37cf74f37bb5ee2667a5..585de8e92ee4631cac28789090710f01704f351a 100644
+--- a/sdk/lib/async/future_extensions.dart
++++ b/sdk/lib/async/future_extensions.dart
+@@ -35,7 +35,7 @@ extension FutureIterable<T> on Iterable<Future<T>> {
+     @pragma('vm:awaiter-link')
+     final c = Completer<List<T>>.sync();
+ 
+-    _FutureResult._waitAll(results, (errors) {
++    _FutureResult._waitAll(results, c.future as _Future, (errors) {
+       if (errors == 0) {
+         c.complete([for (var r in results) r.value]);
+       } else {
+@@ -85,7 +85,7 @@ extension FutureRecord2<T1, T2> on (Future<T1>, Future<T2>) {
+     final v1 = _FutureResult<T1>($1);
+     final v2 = _FutureResult<T2>($2);
+ 
+-    _FutureResult._waitAll([v1, v2], (int errors) {
++    _FutureResult._waitAll([v1, v2], c.future as _Future, (int errors) {
+       if (errors == 0) {
+         c.complete((v1.value, v2.value));
+       } else {
+@@ -114,7 +114,7 @@ extension FutureRecord3<T1, T2, T3> on (Future<T1>, Future<T2>, Future<T3>) {
+     final v2 = _FutureResult<T2>($2);
+     final v3 = _FutureResult<T3>($3);
+ 
+-    _FutureResult._waitAll([v1, v2, v3], (int errors) {
++    _FutureResult._waitAll([v1, v2, v3], c.future as _Future, (int errors) {
+       if (errors == 0) {
+         c.complete((v1.value, v2.value, v3.value));
+       } else {
+@@ -145,7 +145,7 @@ extension FutureRecord4<T1, T2, T3, T4>
+     final v3 = _FutureResult<T3>($3);
+     final v4 = _FutureResult<T4>($4);
+ 
+-    _FutureResult._waitAll([v1, v2, v3, v4], (int errors) {
++    _FutureResult._waitAll([v1, v2, v3, v4], c.future as _Future, (int errors) {
+       if (errors == 0) {
+         c.complete((v1.value, v2.value, v3.value, v4.value));
+       } else {
+@@ -181,7 +181,7 @@ extension FutureRecord5<T1, T2, T3, T4, T5>
+     final v4 = _FutureResult<T4>($4);
+     final v5 = _FutureResult<T5>($5);
+ 
+-    _FutureResult._waitAll([v1, v2, v3, v4, v5], (int errors) {
++    _FutureResult._waitAll([v1, v2, v3, v4, v5], c.future as _Future, (int errors) {
+       if (errors == 0) {
+         c.complete((v1.value, v2.value, v3.value, v4.value, v5.value));
+       } else {
+@@ -239,7 +239,7 @@ extension FutureRecord6<T1, T2, T3, T4, T5, T6>
+     final v5 = _FutureResult<T5>($5);
+     final v6 = _FutureResult<T6>($6);
+ 
+-    _FutureResult._waitAll([v1, v2, v3, v4, v5, v6], (int errors) {
++    _FutureResult._waitAll([v1, v2, v3, v4, v5, v6], c.future as _Future, (int errors) {
+       if (errors == 0) {
+         c.complete((
+           v1.value,
+@@ -309,7 +309,7 @@ extension FutureRecord7<T1, T2, T3, T4, T5, T6, T7>
+     final v6 = _FutureResult<T6>($6);
+     final v7 = _FutureResult<T7>($7);
+ 
+-    _FutureResult._waitAll([v1, v2, v3, v4, v5, v6, v7], (int errors) {
++    _FutureResult._waitAll([v1, v2, v3, v4, v5, v6, v7], c.future as _Future, (int errors) {
+       if (errors == 0) {
+         c.complete((
+           v1.value,
+@@ -385,7 +385,7 @@ extension FutureRecord8<T1, T2, T3, T4, T5, T6, T7, T8>
+     final v7 = _FutureResult<T7>($7);
+     final v8 = _FutureResult<T8>($8);
+ 
+-    _FutureResult._waitAll([v1, v2, v3, v4, v5, v6, v7, v8], (int errors) {
++    _FutureResult._waitAll([v1, v2, v3, v4, v5, v6, v7, v8], c.future as _Future, (int errors) {
+       if (errors == 0) {
+         c.complete((
+           v1.value,
+@@ -467,7 +467,7 @@ extension FutureRecord9<T1, T2, T3, T4, T5, T6, T7, T8, T9>
+     final v8 = _FutureResult<T8>($8);
+     final v9 = _FutureResult<T9>($9);
+ 
+-    _FutureResult._waitAll([v1, v2, v3, v4, v5, v6, v7, v8, v9], (int errors) {
++    _FutureResult._waitAll([v1, v2, v3, v4, v5, v6, v7, v8, v9], c.future as _Future, (int errors) {
+       if (errors == 0) {
+         c.complete((
+           v1.value,
+@@ -642,9 +642,11 @@ class _FutureResult<T> {
+   /// List must not be empty.
+   static void _waitAll(
+     List<_FutureResult> results,
++    _Future owner,
+     @pragma('vm:awaiter-link') void Function(int) whenReady,
+   ) {
+     assert(results.isNotEmpty);
++    owner._flaxPendingDependency = results;
+     var ready = 0;
+     var errors = 0;
+     void onReady(int error) {
+diff --git a/sdk/lib/async/future_impl.dart b/sdk/lib/async/future_impl.dart
+index 5fdd2277828c88f9765781a3ee9556bd6850ba57..c0b3af7f61cd6c18536d6a313b02b244f50ae280 100644
+--- a/sdk/lib/async/future_impl.dart
++++ b/sdk/lib/async/future_impl.dart
+@@ -338,6 +338,10 @@ class _Future<T> implements Future<T> {
+   /// listener callbacks used to create this future should be run in.
+   final Zone _zone;
+ 
++  // A live consumer keeps its unresolved producer; settlement drops the edge.
++  @pragma("vm:entry-point")
++  Object? _flaxPendingDependency;
++
+   /// Either the result, a list of listeners or another future.
+   ///
+   /// The result of the future is either a value or an error.
+@@ -388,6 +392,7 @@ class _Future<T> implements Future<T> {
+ 
+   void _setChained(_Future source) {
+     assert(_mayAddListener);
++    _flaxPendingDependency = null;
+     _state = _stateChained | (_state & _stateIgnoreError);
+     _resultOrListeners = source;
+   }
+@@ -510,12 +515,14 @@ class _Future<T> implements Future<T> {
+   // This method is used by async/await.
+   void _setValue(T value) {
+     assert(!_isComplete); // But may have a completion pending.
++    _flaxPendingDependency = null;
+     _state = _stateValue;
+     _resultOrListeners = value;
+   }
+ 
+   void _setErrorObject(AsyncError error) {
+     assert(!_isComplete); // But may have a completion pending.
++    _flaxPendingDependency = null;
+     _state = _stateError | (_state & _stateIgnoreError);
+     _resultOrListeners = error;
+   }
+@@ -526,6 +533,7 @@ class _Future<T> implements Future<T> {
+   void _cloneResult(_Future source) {
+     assert(!_isComplete);
+     assert(source._isComplete);
++    _flaxPendingDependency = null;
+     _state =
+         (source._state & _completionStateMask) | (_state & _stateIgnoreError);
+     _resultOrListeners = source._resultOrListeners;
+@@ -533,6 +541,7 @@ class _Future<T> implements Future<T> {
+ 
+   void _addListener(_FutureListener listener) {
+     assert(listener._nextListener == null);
++    if (!_isComplete) listener.result._flaxPendingDependency = this;
+     if (_mayAddListener) {
+       listener._nextListener = _resultOrListeners;
+       _resultOrListeners = listener;
+@@ -621,6 +630,7 @@ class _Future<T> implements Future<T> {
+   void _chainForeignFuture(Future source) {
+     assert(!_isComplete);
+     assert(source is! _Future);
++    _flaxPendingDependency = source;
+ 
+     // Mark the target as chained (and as such half-completed).
+     _setPendingComplete();
+@@ -1046,6 +1056,7 @@ class _Future<T> implements Future<T> {
+     if (_isComplete) return _Future.immediate(this);
+     @pragma('vm:awaiter-link')
+     _Future<T> _future = _Future<T>();
++    _future._flaxPendingDependency = this;
+     Timer timer;
+     if (onTimeout == null) {
+       timer = Timer(timeLimit, () {
+diff --git a/sdk/lib/async/stream.dart b/sdk/lib/async/stream.dart
+index a6fd7b635898434202b42e4603229024d405e7d7..95254d8a0ad5860f085e8463f0789bf62721d392 100644
+--- a/sdk/lib/async/stream.dart
++++ b/sdk/lib/async/stream.dart
+@@ -247,12 +247,16 @@ abstract mixin class Stream<T> {
+       null,
+       null,
+     );
++    controller._flaxPendingDependency = future;
++    controller.onCancel = () => controller._flaxPendingDependency = null;
+     future.then(
+       (value) {
++        controller._flaxPendingDependency = null;
+         controller._add(value);
+         controller._closeUnchecked();
+       },
+       onError: (error, stackTrace) {
++        controller._flaxPendingDependency = null;
+         controller._addError(error, stackTrace);
+         controller._closeUnchecked();
+       },
+@@ -301,6 +305,9 @@ abstract mixin class Stream<T> {
+       null,
+       null,
+     );
++    final dependencies = <Future?>[];
++    controller._flaxPendingDependency = dependencies;
++    controller.onCancel = () => controller._flaxPendingDependency = null;
+     int count = 0;
+     // Declare these as variables holding closures instead of as
+     // function declarations.
+@@ -308,23 +315,37 @@ abstract mixin class Stream<T> {
+     void onValue(T value) {
+       if (!controller.isClosed) {
+         controller._add(value);
+-        if (--count == 0) controller._closeUnchecked();
++        if (--count == 0) {
++          controller._flaxPendingDependency = null;
++          controller._closeUnchecked();
++        }
+       }
+     }
+ 
+     void onError(Object error, StackTrace stack) {
+       if (!controller.isClosed) {
+         controller._addError(error, stack);
+-        if (--count == 0) controller._closeUnchecked();
++        if (--count == 0) {
++          controller._flaxPendingDependency = null;
++          controller._closeUnchecked();
++        }
+       }
+     }
+ 
+     // The futures are already running, so start listening to them immediately
+     // (instead of waiting for the stream to be listened on).
+     // If we wait, we might not catch errors in the futures in time.
++    if (futures is List) dependencies.length = futures.length;
++    var dependencyIndex = 0;
+     for (var future in futures) {
+       count++;
+-      future.then(onValue, onError: onError);
++      final dependency = future.then<void>(onValue, onError: onError);
++      if (dependencyIndex < dependencies.length) {
++        dependencies[dependencyIndex] = dependency;
++      } else {
++        dependencies.add(dependency);
++      }
++      dependencyIndex++;
+     }
+     // Use schedule microtask since controller is sync.
+     if (count == 0) scheduleMicrotask(controller.close);
+@@ -1066,6 +1087,7 @@ abstract mixin class Stream<T> {
+   Future<T> reduce(T combine(T previous, T element)) {
+     @pragma('vm:awaiter-link')
+     _Future<T> result = _Future<T>();
++    result._flaxPendingDependency = this;
+     bool seenFirst = false;
+     late T value;
+     StreamSubscription<T> subscription = this.listen(
+@@ -1120,6 +1142,7 @@ abstract mixin class Stream<T> {
+   /// ```
+   Future<S> fold<S>(S initialValue, S combine(S previous, T element)) {
+     _Future<S> result = _Future<S>();
++    result._flaxPendingDependency = this;
+     S value = initialValue;
+     StreamSubscription<T> subscription = this.listen(
+       null,
+@@ -1158,6 +1181,7 @@ abstract mixin class Stream<T> {
+   /// ```
+   Future<String> join([String separator = ""]) {
+     _Future<String> result = _Future<String>();
++    result._flaxPendingDependency = this;
+     StringBuffer buffer = StringBuffer();
+     bool first = true;
+     StreamSubscription<T> subscription = this.listen(
+@@ -1211,6 +1235,7 @@ abstract mixin class Stream<T> {
+   /// ```
+   Future<bool> contains(Object? needle) {
+     _Future<bool> future = _Future<bool>();
++    future._flaxPendingDependency = this;
+     StreamSubscription<T> subscription = this.listen(
+       null,
+       onError: future._completeError,
+@@ -1280,6 +1305,7 @@ abstract mixin class Stream<T> {
+   /// ```
+   Future<bool> every(bool test(T element)) {
+     _Future<bool> future = _Future<bool>();
++    future._flaxPendingDependency = this;
+     StreamSubscription<T> subscription = this.listen(
+       null,
+       onError: future._completeError,
+@@ -1322,6 +1348,7 @@ abstract mixin class Stream<T> {
+   /// ```
+   Future<bool> any(bool test(T element)) {
+     _Future<bool> future = _Future<bool>();
++    future._flaxPendingDependency = this;
+     StreamSubscription<T> subscription = this.listen(
+       null,
+       onError: future._completeError,
+@@ -1353,6 +1380,7 @@ abstract mixin class Stream<T> {
+   /// be reused after finding its length.
+   Future<int> get length {
+     _Future<int> future = _Future<int>();
++    future._flaxPendingDependency = this;
+     int count = 0;
+     this.listen(
+       (_) {
+@@ -1381,6 +1409,7 @@ abstract mixin class Stream<T> {
+   /// be reused after checking whether it is empty.
+   Future<bool> get isEmpty {
+     _Future<bool> future = _Future<bool>();
++    future._flaxPendingDependency = this;
+     StreamSubscription<T> subscription = this.listen(
+       null,
+       onError: future._completeError,
+@@ -1413,6 +1442,7 @@ abstract mixin class Stream<T> {
+   Future<List<T>> toList() {
+     List<T> result = <T>[];
+     _Future<List<T>> future = _Future<List<T>>();
++    future._flaxPendingDependency = this;
+     this.listen(
+       (T data) {
+         result.add(data);
+@@ -1444,6 +1474,7 @@ abstract mixin class Stream<T> {
+   Future<Set<T>> toSet() {
+     Set<T> result = Set<T>();
+     _Future<Set<T>> future = _Future<Set<T>>();
++    future._flaxPendingDependency = this;
+     this.listen(
+       (T data) {
+         result.add(data);
+@@ -1646,6 +1677,7 @@ abstract mixin class Stream<T> {
+   Future<T> get first {
+     @pragma('vm:awaiter-link')
+     _Future<T> future = _Future<T>();
++    future._flaxPendingDependency = this;
+     StreamSubscription<T> subscription = this.listen(
+       null,
+       onError: future._completeError,
+@@ -1674,6 +1706,7 @@ abstract mixin class Stream<T> {
+   Future<T> get last {
+     @pragma('vm:awaiter-link')
+     _Future<T> future = _Future<T>();
++    future._flaxPendingDependency = this;
+     late T result;
+     bool foundResult = false;
+     listen(
+@@ -1708,6 +1741,7 @@ abstract mixin class Stream<T> {
+   Future<T> get single {
+     @pragma('vm:awaiter-link')
+     _Future<T> future = _Future<T>();
++    future._flaxPendingDependency = this;
+     late T result;
+     bool foundResult = false;
+     StreamSubscription<T> subscription = this.listen(
+@@ -1779,6 +1813,7 @@ abstract mixin class Stream<T> {
+   Future<T> firstWhere(bool test(T element), {T orElse()?}) {
+     @pragma('vm:awaiter-link')
+     _Future<T> future = _Future();
++    future._flaxPendingDependency = this;
+     StreamSubscription<T> subscription = this.listen(
+       null,
+       onError: future._completeError,
+@@ -1833,6 +1868,7 @@ abstract mixin class Stream<T> {
+   Future<T> lastWhere(bool test(T element), {T orElse()?}) {
+     @pragma('vm:awaiter-link')
+     _Future<T> future = _Future();
++    future._flaxPendingDependency = this;
+     late T result;
+     bool foundResult = false;
+     StreamSubscription<T> subscription = this.listen(
+@@ -1901,6 +1937,7 @@ abstract mixin class Stream<T> {
+   Future<T> singleWhere(bool test(T element), {T orElse()?}) {
+     @pragma('vm:awaiter-link')
+     _Future<T> future = _Future<T>();
++    future._flaxPendingDependency = this;
+     late T result;
+     bool foundResult = false;
+     StreamSubscription<T> subscription = this.listen(
+@@ -1959,6 +1996,7 @@ abstract mixin class Stream<T> {
+     RangeError.checkNotNegative(index, "index");
+     @pragma('vm:awaiter-link')
+     _Future<T> result = _Future<T>();
++    result._flaxPendingDependency = this;
+     int elementIndex = 0;
+     StreamSubscription<T> subscription;
+     subscription = this.listen(
+diff --git a/sdk/lib/async/stream_controller.dart b/sdk/lib/async/stream_controller.dart
+index 23068cbe2e0ee5856f8160e3397c396fcb9dc8ab..819ab33cf431b350d5f8296174e7cf66687fe325 100644
+--- a/sdk/lib/async/stream_controller.dart
++++ b/sdk/lib/async/stream_controller.dart
+@@ -426,6 +426,8 @@ abstract class _StreamControllerBase<T>
+ ///
+ /// Controls a stream that only supports a single controller.
+ abstract class _StreamController<T> implements _StreamControllerBase<T> {
++  @pragma("vm:entry-point")
++  Object? _flaxPendingDependency;
+   // The states are bit-flags. More than one can be set at a time.
+   //
+   // The "subscription state" goes through the states:
+@@ -610,7 +612,9 @@ abstract class _StreamController<T> implements _StreamControllerBase<T> {
+   Future<void> get done => _ensureDoneFuture();
+ 
+   Future<void> _ensureDoneFuture() =>
+-      _doneFuture ??= _isCanceled ? Future._nullFuture : _Future<void>();
++      _doneFuture ??= _isCanceled
++          ? Future._nullFuture
++          : (_Future<void>().._flaxPendingDependency = this);
+ 
+   /// Send or enqueue a data event.
+   void add(T value) {
+@@ -930,7 +934,9 @@ class _AddStreamState<T> {
+             : controller._addError,
+         onDone: controller._close,
+         cancelOnError: cancelOnError,
+-      );
++      ) {
++    addStreamFuture._flaxPendingDependency = this;
++  }
+ 
+   static makeErrorHandler(_EventSink controller) => (Object e, StackTrace s) {
+     controller._addError(e, s);
+diff --git a/sdk/lib/async/stream_impl.dart b/sdk/lib/async/stream_impl.dart
+index 5ef9d7c5f704296041789896ec668168e3d274d0..1c619b2d300704e23db8abe9c90c0c7ef05c436e 100644
+--- a/sdk/lib/async/stream_impl.dart
++++ b/sdk/lib/async/stream_impl.dart
+@@ -252,6 +252,7 @@ class _BufferingStreamSubscription<T>
+     }
+     // Overwrite the onDone and onError handlers.
+     _Future<E> result = new _Future<E>();
++    result._flaxPendingDependency = this;
+     _onDone = () {
+       result._complete(resultValue);
+     };
+@@ -793,6 +794,7 @@ class _DoneStreamSubscription<T> implements StreamSubscription<T> {
+       resultValue = futureValue;
+     }
+     _Future<E> result = _Future<E>();
++    result._flaxPendingDependency = this;
+     if (!_isDone(_state)) {
+       _onDone = _zone.registerCallback(() {
+         result._completeWithValue(resultValue);
+@@ -1045,6 +1047,7 @@ class _StreamIterator<T> implements StreamIterator<T> {
+     if (subscription != null) {
+       if (_hasValue) {
+         var future = new _Future<bool>();
++        future._flaxPendingDependency = this;
+         _stateData = future;
+         _hasValue = false;
+         subscription.resume();
+@@ -1066,6 +1069,7 @@ class _StreamIterator<T> implements StreamIterator<T> {
+     if (stateData != null) {
+       Stream<T> stream = stateData as dynamic;
+       var future = new _Future<bool>();
++      future._flaxPendingDependency = this;
+       _stateData = future;
+       // The `listen` call may invoke user code, and it might try to emit
+       // events.
