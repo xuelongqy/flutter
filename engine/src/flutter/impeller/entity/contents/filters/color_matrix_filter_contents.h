@@ -13,6 +13,42 @@
 
 namespace impeller {
 
+// Retains a matrix filter's input so Canvas can preserve its output
+// quantization in the final screen pass instead of allocating an intermediate
+// attachment.
+class ColorMatrixContents final : public Contents {
+ public:
+  ColorMatrixContents(Snapshot input,
+                      ColorMatrix matrix,
+                      Scalar input_alpha,
+                      Rect coverage);
+
+  bool CanRenderCanvasScreen(const Entity& entity, ISize output_size) const;
+
+  bool RenderCanvasScreen(const ContentContext& renderer,
+                          const Entity& entity,
+                          RenderPass& pass,
+                          ISize output_size) const;
+
+  std::optional<Rect> GetCoverage(const Entity& entity) const override;
+
+  bool Render(const ContentContext& renderer,
+              const Entity& entity,
+              RenderPass& pass) const override;
+
+ private:
+  template <typename FragmentShader>
+  bool RenderMatrix(const ContentContext& renderer,
+                    const Entity& entity,
+                    RenderPass& pass,
+                    std::optional<ISize> screen_size) const;
+
+  Snapshot input_;
+  ColorMatrix matrix_;
+  Scalar input_alpha_;
+  Rect coverage_;
+};
+
 // Look at example at: https://github.com/flutter/impeller/pull/132
 
 class ColorMatrixFilterContents final : public ColorFilterContents {

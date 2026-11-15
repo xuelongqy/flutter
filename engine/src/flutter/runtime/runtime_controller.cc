@@ -16,6 +16,9 @@
 #include "flutter/runtime/isolate_configuration.h"
 #include "flutter/runtime/runtime_delegate.h"
 #include "third_party/tonic/dart_message_handler.h"
+#if defined(FLAX_ENGINE_EMBEDDED)
+#include "flutter/flax/native/include/flax/engine_gc.h"
+#endif
 
 namespace flutter {
 
@@ -338,7 +341,18 @@ bool RuntimeController::NotifyIdle(fml::TimeDelta deadline) {
     return false;
   }
 
+#if defined(FLAX_ENGINE_EMBEDDED) && defined(FML_OS_ANDROID)
+  // A short inter-frame gap cannot fit synchronous tracing of the shared JS
+  // heap.
+  if (!flax_engine_defer_idle_gc_current_isolate()) {
+    Dart_NotifyIdle(deadline.ToMicroseconds());
+  }
+#else
   Dart_NotifyIdle(deadline.ToMicroseconds());
+#endif
+#if defined(FLAX_ENGINE_EMBEDDED)
+  flax_engine_notify_idle_current_isolate();
+#endif
 
   // Idle notifications being in isolate scope are part of the contract.
   if (idle_notification_callback_) {

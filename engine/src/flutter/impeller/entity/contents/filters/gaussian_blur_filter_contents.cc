@@ -7,6 +7,7 @@
 #include <cmath>
 
 #include "flutter/fml/make_copyable.h"
+#include "fml/trace_event.h"
 #include "impeller/entity/contents/clip_contents.h"
 #include "impeller/entity/contents/content_context.h"
 #include "impeller/entity/entity.h"
@@ -178,6 +179,14 @@ Quad CalculateSnapshotUVs(
       blur_uvs[3] = uvs->GetRightBottom();
     }
   }
+  if (input_snapshot.texture_coverage) {
+    auto coverage = *input_snapshot.texture_coverage;
+    Matrix remap =
+        Matrix::MakeScale(1.0f / Vector2(input_snapshot.texture->GetSize())) *
+        Matrix::MakeTranslation(coverage.GetOrigin()) *
+        Matrix::MakeScale(coverage.GetSize());
+    blur_uvs = remap.Transform(blur_uvs);
+  }
   return blur_uvs;
 }
 
@@ -307,7 +316,13 @@ DownsamplePassArgs CalculateDownsamplePassArgs(
   //     .Contains(coverage_hint.value()))
 
   std::optional<Rect> snapshot_coverage = input_snapshot.GetCoverage();
-  if (input_snapshot.transform.Equals(snapshot_entity.GetTransform()) &&
+  auto input_origin = input_snapshot.transform;
+  if (input_snapshot.texture_coverage) {
+    input_origin =
+        input_origin *
+        Matrix::MakeTranslation(input_snapshot.texture_coverage->GetOrigin());
+  }
+  if (input_origin.Equals(snapshot_entity.GetTransform()) &&
       source_expanded_coverage_hint.has_value() &&
       snapshot_coverage.has_value() &&
       snapshot_coverage->Contains(source_expanded_coverage_hint.value())) {
@@ -356,7 +371,8 @@ DownsamplePassArgs CalculateDownsamplePassArgs(
   } else {
     //////////////////////////////////////////////////////////////////////////////
     auto input_snapshot_size = input_snapshot.texture->GetSize();
-    Rect source_rect = Rect::MakeSize(input_snapshot_size);
+    Rect source_rect = input_snapshot.texture_coverage.value_or(
+        Rect::MakeSize(input_snapshot_size));
     Rect source_rect_padded = source_rect.Expand(padding);
     Vector2 downsampled_size = source_rect_padded.GetSize() * downsample_scalar;
     ISize subpass_size =
@@ -395,7 +411,8 @@ DownsamplePassArgs CalculateDownsamplePassArgs(
         .uv_bounds = uv_bounds,
         .effective_scalar = effective_scalar,
         .transform = input_snapshot.transform *
-                     Matrix::MakeTranslation(-divisible_padding),
+                     Matrix::MakeTranslation(source_rect.GetOrigin() -
+                                             divisible_padding),
     };
   }
 }
@@ -556,7 +573,9 @@ fml::StatusOr<RenderTarget> MakeBlurSubpass(
     const SamplerDescriptor& sampler_descriptor,
     const BlurParameters& blur_info,
     std::optional<RenderTarget> destination_target,
-    const Quad& blur_uvs) {
+    const Quad& blur_uvs,
+    const DownsamplePassArgs* source_mapping = nullptr,
+    std::optional<IRect32> canvas_scissor = std::nullopt) {
   using VS = GaussianBlurVertexShader;
 
   if (blur_info.blur_sigma < kEhCloseEnough) {
@@ -568,7 +587,8 @@ fml::StatusOr<RenderTarget> MakeBlurSubpass(
 
   // TODO(gaaclarke): This blurs the whole image, but because we know the clip
   //                  region we could focus on just blurring that.
-  ISize subpass_size = input_texture->GetSize();
+  ISize subpass_size =
+      source_mapping ? source_mapping->subpass_size : input_texture->GetSize();
   ContentContext::SubpassCallback subpass_callback =
       [&](const ContentContext& renderer, RenderPass& pass) {
         GaussianBlurVertexShader::FrameInfo frame_info;
@@ -579,6 +599,9 @@ fml::StatusOr<RenderTarget> MakeBlurSubpass(
         ContentContextOptions options = OptionsFromPass(pass);
         options.primitive_type = PrimitiveType::kTriangleStrip;
         pass.SetPipeline(renderer.GetGaussianBlurPipeline(options));
+        if (canvas_scissor) {
+          pass.SetScissor(*canvas_scissor);
+        }
 
         KernelSamples kernel_info = GenerateBlurInfo(blur_info);
         LerpHackResult lerped_kernel = LerpHackKernelSamples(kernel_info);
@@ -589,15 +612,21 @@ fml::StatusOr<RenderTarget> MakeBlurSubpass(
         GaussianBlurFragmentShader::BindFragInfo(
             pass, data_host_buffer.EmplaceUniform(frag_info));
 
+        const Quad& texture_uvs =
+            source_mapping ? source_mapping->uvs : blur_uvs;
         std::array<VS::PerVertexData, 4> vertices = {
-            VS::PerVertexData{blur_uvs[0], blur_uvs[0]},
-            VS::PerVertexData{blur_uvs[1], blur_uvs[1]},
-            VS::PerVertexData{blur_uvs[2], blur_uvs[2]},
-            VS::PerVertexData{blur_uvs[3], blur_uvs[3]},
+            VS::PerVertexData{blur_uvs[0], texture_uvs[0]},
+            VS::PerVertexData{blur_uvs[1], texture_uvs[1]},
+            VS::PerVertexData{blur_uvs[2], texture_uvs[2]},
+            VS::PerVertexData{blur_uvs[3], texture_uvs[3]},
         };
         pass.SetVertexBuffer(CreateVertexBuffer(vertices, data_host_buffer));
 
         SamplerDescriptor linear_sampler_descriptor = sampler_descriptor;
+        if (source_mapping) {
+          SetTileMode(&linear_sampler_descriptor, renderer,
+                      Entity::TileMode::kDecal);
+        }
         linear_sampler_descriptor.mag_filter = MinMagFilter::kLinear;
         linear_sampler_descriptor.min_filter = MinMagFilter::kLinear;
         GaussianBlurFragmentShader::BindTextureSampler(
@@ -865,14 +894,13 @@ std::optional<Entity> GaussianBlurFilterContents::RenderFilter(
     return result;
   }
 
-  // Note: The code below uses three different command buffers when it would be
-  // possible to combine the operations into a single buffer. From testing and
-  // user bug reports (see https://github.com/flutter/flutter/issues/154046 ),
-  // this sometimes causes deviceLost errors on older Adreno devices. Breaking
-  // the work up into three different command buffers seems to prevent this
-  // crash.
+  // Metal can encode the dependent passes in one buffer without changing their
+  // order or intermediate textures. Keep separate buffers on other backends for
+  // older Adreno devices (https://github.com/flutter/flutter/issues/154046).
+  const bool combine_command_buffers =
+      renderer.GetContext()->GetBackendType() == Context::BackendType::kMetal;
   std::shared_ptr<CommandBuffer> command_buffer_1 =
-      renderer.GetContext()->CreateCommandBuffer();
+      renderer.CreateSubpassCommandBuffer();
   if (!command_buffer_1) {
     return std::nullopt;
   }
@@ -881,9 +909,42 @@ std::optional<Entity> GaussianBlurFilterContents::RenderFilter(
       blur_info.scaled_sigma, blur_info.padding, input_snapshot.value(),
       source_expanded_coverage_hint, source_bounds, inputs[0], snapshot_entity);
 
-  fml::StatusOr<RenderTarget> pass1_out = MakeDownsampleSubpass(
-      renderer, command_buffer_1, input_snapshot->texture,
-      input_snapshot->sampler_descriptor, downsample_pass_args, tile_mode_);
+  const auto input_size = input_snapshot->texture->GetSize();
+  const Quad padded_uvs =
+      input_snapshot->texture_coverage.value_or(Rect::MakeSize(input_size))
+          .Expand(blur_info.padding)
+          .Scale(1.0f / Vector2(input_size))
+          .GetPoints();
+  // An integer-aligned unorm copy only adds transparent padding. Decal sampling
+  // can supply that padding in the vertical pass without changing quantization.
+  const auto input_format =
+      input_snapshot->texture->GetTextureDescriptor().format;
+  const bool skip_copy =
+      combine_command_buffers && tile_mode_ == Entity::TileMode::kDecal &&
+      !bounds_.has_value() &&
+      renderer.GetDeviceCapabilities().SupportsDecalSamplerAddressMode() &&
+      downsample_pass_args.effective_scalar == Vector2(1, 1) &&
+      downsample_pass_args.uvs == padded_uvs &&
+      blur_info.scaled_sigma.y >= kEhCloseEnough &&
+      input_snapshot->texture->GetMipCount() == 1 &&
+      (input_format == PixelFormat::kR8G8B8A8UNormInt ||
+       input_format == PixelFormat::kB8G8R8A8UNormInt ||
+       input_format == PixelFormat::kB10G10R10A10XR) &&
+      input_format ==
+          renderer.GetSubpassPixelFormat().value_or(
+              renderer.GetDeviceCapabilities().GetDefaultColorFormat());
+  fml::StatusOr<RenderTarget> pass1_out = [&]() -> fml::StatusOr<RenderTarget> {
+    if (skip_copy) {
+      RenderTarget input_target;
+      ColorAttachment color;
+      color.texture = input_snapshot->texture;
+      input_target.SetColorAttachment(color, 0);
+      return input_target;
+    }
+    return MakeDownsampleSubpass(
+        renderer, command_buffer_1, input_snapshot->texture,
+        input_snapshot->sampler_descriptor, downsample_pass_args, tile_mode_);
+  }();
 
   if (!pass1_out.ok()) {
     return std::nullopt;
@@ -894,8 +955,57 @@ std::optional<Entity> GaussianBlurFilterContents::RenderFilter(
 
   Quad blur_uvs = {Point(0, 0), Point(1, 0), Point(0, 1), Point(1, 1)};
 
+  std::optional<IRect32> canvas_y_scissor;
+  std::optional<IRect32> canvas_x_scissor;
+#if defined(FML_OS_ANDROID) && defined(IMPELLER_ENABLE_OPENGLES)
+  if (input_snapshot->canvas_ink_bounds && !skip_copy && !bounds_ &&
+      !input_snapshot->texture_coverage &&
+      input_snapshot->transform.IsTranslationOnly() &&
+      renderer.GetContext()->GetBackendType() ==
+          Context::BackendType::kOpenGLES &&
+      input_format == PixelFormat::kR8G8B8A8UNormInt &&
+      renderer.GetSubpassPixelFormat() == PixelFormat::kR8G8B8A8UNormInt &&
+      tile_mode_ == Entity::TileMode::kDecal &&
+      downsample_pass_args.effective_scalar == Vector2(1, 1) &&
+      downsample_pass_args.uvs == padded_uvs &&
+      blur_info.scaled_sigma.x >= kEhCloseEnough &&
+      blur_info.scaled_sigma.y >= kEhCloseEnough) {
+    // Keep every copy/store and its UV grid; clear the full target before
+    // scissoring ink.
+    const auto copied_ink =
+        input_snapshot->canvas_ink_bounds
+            ->Shift(Point(blur_info.padding.x, blur_info.padding.y))
+            .Expand(2);
+    const auto y_ink =
+        copied_ink.Expand(Point(2, std::ceil(blur_info.blur_radius.y) + 2));
+    const auto x_ink =
+        y_ink.Expand(Point(std::ceil(blur_info.blur_radius.x) + 2, 2));
+    const auto size = pass1_out.value().GetRenderTargetSize();
+    const int64_t full_area = static_cast<int64_t>(size.width) * size.height;
+    const auto clip_ink = [&](const Rect& ink) -> std::optional<IRect32> {
+      const auto clipped = IRect32::RoundOut(ink)
+                               .Intersection(IRect32::MakeSize(size))
+                               .value_or(IRect32());
+      const int64_t area =
+          static_cast<int64_t>(clipped.GetWidth()) * clipped.GetHeight();
+      // Small cuts can cost more GLES driver work than they save.
+      return area * 2 < full_area ? std::optional<IRect32>(clipped)
+                                  : std::nullopt;
+    };
+    canvas_y_scissor = clip_ink(y_ink);
+    canvas_x_scissor = clip_ink(x_ink);
+    if (canvas_y_scissor) {
+      TRACE_EVENT0("impeller", "CanvasGLES::SparseBlurY");
+    }
+    if (canvas_x_scissor) {
+      TRACE_EVENT0("impeller", "CanvasGLES::SparseBlurX");
+    }
+  }
+#endif
+
   std::shared_ptr<CommandBuffer> command_buffer_2 =
-      renderer.GetContext()->CreateCommandBuffer();
+      combine_command_buffers ? command_buffer_1
+                              : renderer.CreateSubpassCommandBuffer();
   if (!command_buffer_2) {
     return std::nullopt;
   }
@@ -912,29 +1022,34 @@ std::optional<Entity> GaussianBlurFilterContents::RenderFilter(
           .step_size = 1,
           .apply_unpremultiply = false,
       },
-      /*destination_target=*/std::nullopt, blur_uvs);
+      /*destination_target=*/std::nullopt, blur_uvs,
+      skip_copy ? &downsample_pass_args : nullptr, canvas_y_scissor);
 
   if (!pass2_out.ok()) {
     return std::nullopt;
   }
+  Vector2 pass2_pixel_size =
+      1.0 / Vector2(pass2_out.value().GetRenderTargetTexture()->GetSize());
 
   std::shared_ptr<CommandBuffer> command_buffer_3 =
-      renderer.GetContext()->CreateCommandBuffer();
+      combine_command_buffers ? command_buffer_1
+                              : renderer.CreateSubpassCommandBuffer();
   if (!command_buffer_3) {
     return std::nullopt;
   }
 
   // Only ping pong if the first pass actually created a render target.
-  auto pass3_destination = pass2_out.value().GetRenderTargetTexture() !=
-                                   pass1_out.value().GetRenderTargetTexture()
-                               ? std::optional<RenderTarget>(pass1_out.value())
-                               : std::optional<RenderTarget>(std::nullopt);
+  auto pass3_destination =
+      !skip_copy && pass2_out.value().GetRenderTargetTexture() !=
+                        pass1_out.value().GetRenderTargetTexture()
+          ? std::optional<RenderTarget>(pass1_out.value())
+          : std::optional<RenderTarget>(std::nullopt);
 
   fml::StatusOr<RenderTarget> pass3_out = MakeBlurSubpass(
       renderer, command_buffer_3, /*input_pass=*/pass2_out.value(),
       input_snapshot->sampler_descriptor,
       BlurParameters{
-          .blur_uv_offset = Point(pass1_pixel_size.x, 0.0),
+          .blur_uv_offset = Point(pass2_pixel_size.x, 0.0),
           .blur_sigma = blur_info.scaled_sigma.x *
                         downsample_pass_args.effective_scalar.x,
           .blur_radius = ScaleBlurRadius(
@@ -942,25 +1057,25 @@ std::optional<Entity> GaussianBlurFilterContents::RenderFilter(
           .step_size = 1,
           .apply_unpremultiply = bounds_.has_value(),
       },
-      pass3_destination, blur_uvs);
+      pass3_destination, blur_uvs, nullptr, canvas_x_scissor);
 
   if (!pass3_out.ok()) {
     return std::nullopt;
   }
 
-  if (!(renderer.GetContext()->EnqueueCommandBuffer(
-            std::move(command_buffer_1)) &&
-        renderer.GetContext()->EnqueueCommandBuffer(
-            std::move(command_buffer_2)) &&
-        renderer.GetContext()->EnqueueCommandBuffer(
-            std::move(command_buffer_3)))) {
+  if (!renderer.EnqueueSubpassCommandBuffer(std::move(command_buffer_1))) {
+    return std::nullopt;
+  }
+  if (!combine_command_buffers &&
+      !(renderer.EnqueueSubpassCommandBuffer(std::move(command_buffer_2)) &&
+        renderer.EnqueueSubpassCommandBuffer(std::move(command_buffer_3)))) {
     return std::nullopt;
   }
 
   // The ping-pong approach requires that each render pass output has the same
   // size.
-  FML_DCHECK((pass1_out.value().GetRenderTargetSize() ==
-              pass2_out.value().GetRenderTargetSize()) &&
+  FML_DCHECK((skip_copy || pass1_out.value().GetRenderTargetSize() ==
+                               pass2_out.value().GetRenderTargetSize()) &&
              (pass2_out.value().GetRenderTargetSize() ==
               pass3_out.value().GetRenderTargetSize()));
 

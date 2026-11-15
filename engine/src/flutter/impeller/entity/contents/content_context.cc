@@ -235,6 +235,7 @@ struct ContentContext::Pipelines {
   Variants<CirclePipeline> circle;
   Variants<ClipPipeline> clip;
   Variants<ColorMatrixColorFilterPipeline> color_matrix_color_filter;
+  Variants<CanvasColorMatrixScreenPipeline> canvas_color_matrix_screen;
   Variants<ConicalGradientFillConicalPipeline> conical_gradient_fill;
   Variants<ConicalGradientFillRadialPipeline> conical_gradient_fill_radial;
   Variants<ConicalGradientFillStripPipeline> conical_gradient_fill_strip;
@@ -262,6 +263,9 @@ struct ContentContext::Pipelines {
   Variants<FramebufferBlendOverlayPipeline> framebuffer_blend_overlay;
   Variants<FramebufferBlendSaturationPipeline> framebuffer_blend_saturation;
   Variants<FramebufferBlendScreenPipeline> framebuffer_blend_screen;
+#if defined(FML_OS_ANDROID) && defined(IMPELLER_ENABLE_OPENGLES)
+  Variants<CanvasFramebufferScreenPipeline> canvas_framebuffer_screen;
+#endif
   Variants<FramebufferBlendSoftLightPipeline> framebuffer_blend_softlight;
   Variants<GaussianBlurPipeline> gaussian_blur;
   Variants<GlyphAtlasPipeline> glyph_atlas;
@@ -323,7 +327,8 @@ struct ContentContext::Pipelines {
 void ContentContextOptions::ApplyToPipelineDescriptor(
     PipelineDescriptor& desc) const {
   auto pipeline_blend = blend_mode;
-  if (blend_mode > Entity::kLastPipelineBlendMode) {
+  if (blend_mode > Entity::kLastPipelineBlendMode &&
+      !(is_canvas_screen && blend_mode == BlendMode::kScreen)) {
     VALIDATION_LOG << "Cannot use blend mode " << static_cast<int>(blend_mode)
                    << " as a pipeline blend.";
     pipeline_blend = BlendMode::kSrcOver;
@@ -432,6 +437,13 @@ void ContentContextOptions::ApplyToPipelineDescriptor(
       color0.dst_color_blend_factor = BlendFactor::kSourceColor;
       color0.src_alpha_blend_factor = BlendFactor::kZero;
       color0.src_color_blend_factor = BlendFactor::kZero;
+      break;
+    case BlendMode::kScreen:
+      FML_DCHECK(is_canvas_screen);
+      color0.dst_alpha_blend_factor = BlendFactor::kOneMinusSourceAlpha;
+      color0.dst_color_blend_factor = BlendFactor::kOneMinusSourceColor;
+      color0.src_alpha_blend_factor = BlendFactor::kOne;
+      color0.src_color_blend_factor = BlendFactor::kOne;
       break;
     default:
       FML_UNREACHABLE();
@@ -766,6 +778,12 @@ ContentContext::ContentContext(
   }
 
   if (context_->GetCapabilities()->SupportsFramebufferFetch()) {
+#if defined(FML_OS_MACOSX)
+    if (context_->GetBackendType() == Context::BackendType::kMetal) {
+      pipelines_->canvas_color_matrix_screen.CreateDefault(
+          *context_, options_trianglestrip);
+    }
+#endif
     pipelines_->framebuffer_blend_color.CreateDefault(
         *context_, options_trianglestrip,
         {static_cast<Scalar>(BlendSelectValues::kColor), supports_decal});
@@ -808,6 +826,13 @@ ContentContext::ContentContext(
     pipelines_->framebuffer_blend_screen.CreateDefault(
         *context_, options_trianglestrip,
         {static_cast<Scalar>(BlendSelectValues::kScreen), supports_decal});
+#if defined(FML_OS_ANDROID) && defined(IMPELLER_ENABLE_OPENGLES)
+    if (context_->GetBackendType() == Context::BackendType::kOpenGLES) {
+      pipelines_->canvas_framebuffer_screen.CreateDefault(
+          *context_, options_trianglestrip,
+          {static_cast<Scalar>(BlendSelectValues::kScreen), supports_decal});
+    }
+#endif
     pipelines_->framebuffer_blend_softlight.CreateDefault(
         *context_, options_trianglestrip,
         {static_cast<Scalar>(BlendSelectValues::kSoftLight), supports_decal});
@@ -897,6 +922,27 @@ std::shared_ptr<Texture> ContentContext::GetEmptyTexture() const {
   return empty_texture_;
 }
 
+void ContentContext::SetSubpassCommandBuffer(
+    std::shared_ptr<CommandBuffer> command_buffer) {
+  FML_DCHECK(!command_buffer || !subpass_command_buffer_);
+  subpass_command_buffer_ = std::move(command_buffer);
+}
+
+std::shared_ptr<CommandBuffer> ContentContext::CreateSubpassCommandBuffer()
+    const {
+  return subpass_command_buffer_ ? subpass_command_buffer_
+                                 : context_->CreateCommandBuffer();
+}
+
+bool ContentContext::EnqueueSubpassCommandBuffer(
+    std::shared_ptr<CommandBuffer> command_buffer) const {
+  if (!command_buffer) {
+    return false;
+  }
+  return command_buffer == subpass_command_buffer_ ||
+         context_->EnqueueCommandBuffer(std::move(command_buffer));
+}
+
 fml::StatusOr<RenderTarget> ContentContext::MakeSubpass(
     std::string_view label,
     ISize texture_size,
@@ -924,12 +970,13 @@ fml::StatusOr<RenderTarget> ContentContext::MakeSubpass(
         /*existing_color_msaa_texture=*/nullptr,
         /*existing_color_resolve_texture=*/nullptr,
         /*existing_depth_stencil_texture=*/nullptr,
-        /*target_pixel_format=*/std::nullopt);
+        /*target_pixel_format=*/GetSubpassPixelFormat());
   } else {
     subpass_target = GetRenderTargetCache()->CreateOffscreen(
         *context, texture_size,
         /*mip_count=*/mip_count, label,
-        RenderTarget::kDefaultColorAttachmentConfig, depth_stencil_config);
+        RenderTarget::kDefaultColorAttachmentConfig, depth_stencil_config,
+        nullptr, nullptr, GetSubpassPixelFormat());
   }
   return MakeSubpass(label, subpass_target, command_buffer, subpass_callback);
 }
@@ -1018,6 +1065,7 @@ void ContentContext::ClearCachedRuntimeEffectPipeline(
 }
 
 void ContentContext::ResetTransientsBuffers() {
+  FML_DCHECK(!subpass_command_buffer_);
   data_host_buffer_->Reset();
 
   // We should only reset the indexes host buffer if it is actually different
@@ -1449,6 +1497,12 @@ PipelineRef ContentContext::GetFramebufferBlendColorPipeline(
   return GetPipeline(this, pipelines_->framebuffer_blend_color, opts);
 }
 
+PipelineRef ContentContext::GetCanvasColorMatrixScreenPipeline(
+    ContentContextOptions opts) const {
+  FML_DCHECK(GetDeviceCapabilities().SupportsFramebufferFetch());
+  return GetPipeline(this, pipelines_->canvas_color_matrix_screen, opts);
+}
+
 PipelineRef ContentContext::GetFramebufferBlendColorBurnPipeline(
     ContentContextOptions opts) const {
   FML_DCHECK(GetDeviceCapabilities().SupportsFramebufferFetch());
@@ -1526,6 +1580,14 @@ PipelineRef ContentContext::GetFramebufferBlendScreenPipeline(
   FML_DCHECK(GetDeviceCapabilities().SupportsFramebufferFetch());
   return GetPipeline(this, pipelines_->framebuffer_blend_screen, opts);
 }
+
+#if defined(FML_OS_ANDROID) && defined(IMPELLER_ENABLE_OPENGLES)
+PipelineRef ContentContext::GetCanvasFramebufferScreenPipeline(
+    ContentContextOptions opts) const {
+  FML_DCHECK(context_->GetBackendType() == Context::BackendType::kOpenGLES);
+  return GetPipeline(this, pipelines_->canvas_framebuffer_screen, opts);
+}
+#endif
 
 PipelineRef ContentContext::GetFramebufferBlendSoftLightPipeline(
     ContentContextOptions opts) const {

@@ -158,7 +158,7 @@ void* DisplayListBuilder::Push(size_t pod, Args&&... args) {
   return op + 1;
 }
 
-sk_sp<DisplayList> DisplayListBuilder::Build() {
+sk_sp<DisplayList> DisplayListBuilder::Build(bool use_unorm8_layers) {
   while (save_stack_.size() > 1) {
     restore();
   }
@@ -211,7 +211,7 @@ sk_sp<DisplayList> DisplayListBuilder::Build() {
       std::move(storage), std::move(offsets), count, nested_bytes, nested_count,
       total_depth, bounds, opacity_compatible, is_safe, affects_transparency,
       max_root_blend_mode, root_has_backdrop_filter, root_is_unbounded,
-      std::move(rtree)));
+      std::move(rtree), use_unorm8_layers));
 }
 
 static constexpr DlRect kEmpty = DlRect();

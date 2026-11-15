@@ -49,6 +49,7 @@ class LazyGlyphAtlas {
 
   AtlasData alpha_data_;
   AtlasData color_data_;
+  size_t font_cache_generation_ = TypographerContext::GetFontCacheGeneration();
 
   AtlasData& GetData(GlyphAtlas::Type type);
 

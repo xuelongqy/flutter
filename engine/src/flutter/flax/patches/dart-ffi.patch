@@ -1,0 +1,17 @@
+diff --git a/runtime/vm/heap/compactor.cc b/runtime/vm/heap/compactor.cc
+index 42163af9d4cba2e24c715e7900b4414f6e814316..5647e5872aa6845390fb1d474f16b9c7a354543a 100644
+--- a/runtime/vm/heap/compactor.cc
++++ b/runtime/vm/heap/compactor.cc
+@@ -811,9 +811,9 @@ void GCCompactor::ForwardLargePages() {
+       MutexLocker ml(freelist->mutex());
+       page_in_use = sweeper.SweepPage(page, freelist);
+     }
+-    ASSERT(page_in_use);
+-
+-    page->VisitObjectPointers(this);
++    // Joint GC can release the last Flax byte pin while marking a fixed page.
++    // SweepPage has already returned an empty page to the freelist.
++    if (page_in_use) page->VisitObjectPointers(this);
+ 
+     ml.Lock();
+   }

@@ -9,6 +9,7 @@
 #include <memory>
 #include <vector>
 
+#include "fml/build_config.h"
 #include "impeller/core/formats.h"
 #include "impeller/core/sampler_descriptor.h"
 #include "impeller/core/texture.h"
@@ -44,6 +45,16 @@ struct Snapshot {
   /// RuntimeEffectContents that the Snapshot will have to be rerasterized to
   /// capture the padding.
   bool needs_rasterization_for_runtime_effects = false;
+
+  // A lossless source bitmap may replace a larger transparent filter input.
+  // Preserve that input's pixel extent without materializing its padding.
+  std::optional<Rect> texture_coverage;
+
+#if defined(FML_OS_ANDROID)
+  // Canvas-only conservative nonzero texels; never changes texture
+  // coverage/UVs.
+  std::optional<Rect> canvas_ink_bounds;
+#endif
 
   /// Any snapshot that is scaled should re-rasterize because we should be
   /// performing the RuntimeEffect at the resolution of the screen, not the

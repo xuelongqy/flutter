@@ -1503,6 +1503,7 @@ class _DialState extends State<_Dial> with SingleTickerProviderStateMixin {
       value: value,
       inner: inner,
       painter: TextPainter(
+        fontCollection: DefaultFontCollection.maybeOf(context),
         text: TextSpan(style: textStyle, text: label),
         textDirection: TextDirection.ltr,
         textScaler: MediaQuery.textScalerOf(context).clamp(maxScaleFactor: 2.0),

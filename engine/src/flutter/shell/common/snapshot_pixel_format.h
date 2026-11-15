@@ -11,6 +11,7 @@ enum class SnapshotPixelFormat {
   kDontCare,
   kRGBA32Float,
   kR32Float,
+  kRGBA8,
 };
 
 }  // namespace flutter

@@ -5,6 +5,9 @@
 #import "flutter/shell/platform/darwin/macos/framework/Source/FlutterExternalTexture.h"
 
 #include "flutter/fml/platform/darwin/cf_utils.h"
+#if defined(FLAX_ENABLE_METAL_INTEROP)
+#include "flutter/flax/native/include/flax/dawn_interop.h"
+#endif
 
 @implementation FlutterExternalTexture {
   FlutterDarwinContextMetalSkia* _darwinMetalContext;
@@ -14,6 +17,9 @@
   id<FlutterTexture> _texture;
 
   std::vector<FlutterMetalTextureHandle> _textures;
+#if defined(FLAX_ENABLE_METAL_INTEROP)
+  id<MTLTexture> _flaxDawnTexture;
+#endif
 }
 
 - (instancetype)initWithFlutterTexture:(id<FlutterTexture>)texture
@@ -32,6 +38,21 @@
 }
 
 - (BOOL)populateTexture:(FlutterMetalExternalTexture*)textureOut {
+#if defined(FLAX_ENABLE_METAL_INTEROP)
+  if ([_texture respondsToSelector:@selector(copyFlaxDawnMetalTexture)]) {
+    _flaxDawnTexture = [(id<FlaxDawnTextureProvider>)_texture copyFlaxDawnMetalTexture];
+    if (!_flaxDawnTexture) {
+      return NO;
+    }
+    _textures = {(__bridge FlutterMetalTextureHandle)_flaxDawnTexture};
+    textureOut->num_textures = 1;
+    textureOut->width = _flaxDawnTexture.width;
+    textureOut->height = _flaxDawnTexture.height;
+    textureOut->pixel_format = FlutterMetalExternalTexturePixelFormat::kRGBA;
+    textureOut->textures = _textures.data();
+    return YES;
+  }
+#endif
   // Copy the pixel buffer from the FlutterTexture instance implemented on the user side.
   fml::CFRef<CVPixelBufferRef> pixelBuffer([_texture copyPixelBuffer]);
 

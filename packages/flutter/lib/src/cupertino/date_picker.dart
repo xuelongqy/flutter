@@ -619,6 +619,7 @@ class CupertinoDatePicker extends StatefulWidget {
     return texts
         .map(
           (String text) => TextPainter.computeMaxIntrinsicWidth(
+            fontCollection: DefaultFontCollection.maybeOf(context),
             text: TextSpan(style: textStyle ?? _themeTextStyle(context), text: text),
             textDirection: Directionality.of(context),
           ),
@@ -2398,6 +2399,7 @@ class _CupertinoTimerPickerState extends State<CupertinoTimerPicker> {
   }
 
   void _measureLabelMetrics() {
+    textPainter.fontCollection = DefaultFontCollection.maybeOf(context);
     textPainter.textDirection = textDirection;
     final TextStyle textStyle = _textStyleFrom(context, _kTimerPickerMagnification);
 

@@ -147,12 +147,13 @@ class TestCompiler {
     FlutterProject? flutterProject,
     BuildInfo buildInfo,
   ) {
-    final ToolContext(:Config config, :FileSystem fs) = toolContext;
+    final ToolContext(:Artifacts artifacts, :Config config, :FileSystem fs) = toolContext;
     return fs.path.join(
       flutterProject!.directory.path,
       getBuildDirectory(),
       'test_cache',
       getDefaultCachedKernelPath(
+        artifacts: artifacts,
         config: config,
         fileSystem: fs,
         trackWidgetCreation: buildInfo.trackWidgetCreation,

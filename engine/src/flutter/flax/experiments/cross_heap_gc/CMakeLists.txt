@@ -1,0 +1,12 @@
+cmake_minimum_required(VERSION 3.24)
+project(flax_joint_gc_probe LANGUAGES C CXX)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_OSX_DEPLOYMENT_TARGET 15.0)
+if(NOT DART_SOURCE OR NOT V8_SDK)
+  message(FATAL_ERROR "Set DART_SOURCE and V8_SDK to the verified source/SDK paths")
+endif()
+include("${V8_SDK}/cmake/FlaxEngineSDKConfig.cmake")
+add_library(flax_joint_gc_probe SHARED probe.cpp
+  "${DART_SOURCE}/runtime/include/dart_api_dl.c")
+target_include_directories(flax_joint_gc_probe PRIVATE "${DART_SOURCE}/runtime/include")
+target_link_libraries(flax_joint_gc_probe PRIVATE FlaxEngineSDK::v8)

@@ -42,7 +42,20 @@ void TextureContents::SetDestinationRect(Rect rect) {
 
 void TextureContents::SetTexture(std::shared_ptr<Texture> texture) {
   texture_ = std::move(texture);
+#if defined(FML_OS_ANDROID)
+  canvas_ink_bounds_.reset();
+#endif
 }
+
+void TextureContents::SetSnapshotTextureCoverage(std::optional<Rect> coverage) {
+  snapshot_texture_coverage_ = coverage;
+}
+
+#if defined(FML_OS_ANDROID)
+void TextureContents::SetCanvasInkBounds(std::optional<Rect> bounds) {
+  canvas_ink_bounds_ = bounds;
+}
+#endif
 
 std::shared_ptr<Texture> TextureContents::GetTexture() const {
   return texture_;
@@ -68,6 +81,13 @@ std::optional<Rect> TextureContents::GetCoverage(const Entity& entity) const {
   if (GetOpacity() == 0) {
     return std::nullopt;
   }
+  if (snapshot_texture_coverage_) {
+    return snapshot_texture_coverage_->TransformBounds(
+        entity.GetTransform() *
+        Matrix::MakeTranslation(destination_rect_.GetOrigin()) *
+        Matrix::MakeScale(destination_rect_.GetSize() /
+                          Size(texture_->GetSize())));
+  }
   return destination_rect_.TransformBounds(entity.GetTransform());
 };
 
@@ -82,15 +102,21 @@ std::optional<Snapshot> TextureContents::RenderToSnapshot(
   if (source_rect_ == Rect::MakeSize(texture_->GetSize()) &&
       (opacity >= 1 - kEhCloseEnough || defer_applying_opacity_)) {
     auto scale = Vector2(bounds.GetSize() / Size(texture_->GetSize()));
-    return Snapshot{.texture = texture_,
-                    .transform = entity.GetTransform() *
-                                 Matrix::MakeTranslation(bounds.GetOrigin()) *
-                                 Matrix::MakeScale(scale),
-                    .sampler_descriptor = options.sampler_descriptor.value_or(
-                        sampler_descriptor_),
-                    .opacity = opacity,
-                    .needs_rasterization_for_runtime_effects =
-                        snapshots_need_rasterization_for_runtime_effects_};
+    return Snapshot{
+        .texture = texture_,
+        .transform = entity.GetTransform() *
+                     Matrix::MakeTranslation(bounds.GetOrigin()) *
+                     Matrix::MakeScale(scale),
+        .sampler_descriptor =
+            options.sampler_descriptor.value_or(sampler_descriptor_),
+        .opacity = opacity,
+        .needs_rasterization_for_runtime_effects =
+            snapshots_need_rasterization_for_runtime_effects_,
+        .texture_coverage = snapshot_texture_coverage_,
+#if defined(FML_OS_ANDROID)
+        .canvas_ink_bounds = canvas_ink_bounds_,
+#endif
+    };
   }
   return Contents::RenderToSnapshot(
       renderer, entity,
@@ -149,6 +175,13 @@ bool TextureContents::Render(const ContentContext& renderer,
 #endif  // IMPELLER_DEBUG
 
   auto pipeline_options = OptionsFromPassAndEntity(pass, entity);
+#if defined(FML_OS_ANDROID)
+  pipeline_options.is_canvas_screen =
+      entity.GetBlendMode() == BlendMode::kScreen &&
+      renderer.GetSubpassPixelFormat() == PixelFormat::kR8G8B8A8UNormInt &&
+      renderer.GetContext()->GetBackendType() ==
+          Context::BackendType::kOpenGLES;
+#endif
   if (!stencil_enabled_) {
     pipeline_options.stencil_mode = ContentContextOptions::StencilMode::kIgnore;
   }

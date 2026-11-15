@@ -1,0 +1,193 @@
+import("//build/config/sysroot.gni")
+import("//flutter/flax/config.gni")
+
+config("system_cxx") {
+  if (is_android) {
+    sdk = exec_script("tools/sdk_info.py",
+                      [
+                        flax_v8_sdk,
+                        "android-arm64",
+                      ],
+                      "json",
+                      [
+                        "source.lock.json",
+                        "$flax_v8_sdk/manifest.json",
+                      ])
+
+    # Dart needs atomic_ref; use the SDK's newer headers without changing tool
+    # pins.
+    cxx_headers = sdk.cxxHeaders
+
+    # Android's -nostdlib requires explicit linkage to the SDK's shared libc++.
+    libs = [ "$flax_v8_sdk/lib/libc++_shared.so" ]
+  } else {
+    cxx_headers = "$sysroot/usr/include/c++/v1"
+
+    # The pinned LLVM linker cannot parse Xcode 27's arm64e.x1 TAPI records.
+    ldflags = [ "--ld-path=/usr/bin/ld" ]
+  }
+  cflags_cc = [
+    "-nostdinc++",
+    "-isystem",
+    rebase_path(cxx_headers, root_build_dir),
+  ]
+  cflags_objcc = cflags_cc
+}
+
+if (flax_enable_runtime) {
+  sdk_target = "macos-arm64"
+  if (is_ios) {
+    sdk_target = "ios-device-arm64"
+    if (use_ios_simulator) {
+      sdk_target = "ios-simulator-arm64"
+    }
+  } else if (is_android) {
+    sdk_target = "android-arm64"
+  }
+  sdk = exec_script("tools/sdk_info.py",
+                    [
+                      flax_v8_sdk,
+                      sdk_target,
+                    ],
+                    "json",
+                    [
+                      "source.lock.json",
+                      "$flax_v8_sdk/manifest.json",
+                    ])
+  config("sdk") {
+    include_dirs = [ "$flax_v8_sdk/include" ]
+    defines = sdk.defines
+    libs = sdk.libraries
+    if (is_ios) {
+      frameworks = [ "CoreFoundation.framework" ]
+    }
+    if (is_android) {
+      # Flutter uses -nostdlib; bridge exceptions need the pinned NDK unwinder.
+      libs += [
+        "$android_toolchain_root/lib/clang/19/lib/linux/aarch64/libunwind.a",
+      ]
+    }
+  }
+  if (is_mac) {
+    config("loader_path") {
+      ldflags = [ "-Wl,-rpath,@loader_path/Libraries" ]
+    }
+  }
+  source_set("runtime") {
+    sources = [ "native/src/runtime.cpp" ]
+    include_dirs = [
+      "native/include",
+      "native/src",
+      "//flutter/third_party/dart/runtime/include",
+    ]
+    deps = []
+    defines = [ "FLAX_BUILDING_BRIDGE" ]
+    if (is_mac) {
+      defines += [ "FLAX_ENABLE_METAL_INTEROP" ]
+    }
+    if (is_mac || is_ios) {
+      defines += [ "FLAX_ENABLE_FFI" ]
+      include_dirs += [
+        "third_party/libffi/include",
+        "third_party/libffi/src/aarch64",
+      ]
+      deps = [ ":ffi" ]
+    }
+    sources += [
+      "native/jsi/jsi/jsi.cpp",
+      "native/src/joint_gc.cc",
+      "native/v8-jsi/src/MurmurHash.cpp",
+      "native/v8-jsi/src/jsi_abi/JsiAbiRuntime.cpp",
+      "native/v8-jsi/src/jsi_abi/jsi_abi_v8.cpp",
+      "native/v8-jsi/src/v8_core.cpp",
+      "native/v8_engine.cpp",
+    ]
+    include_dirs += [
+      "native/jsi",
+      "native/v8-jsi/src",
+    ]
+    defines += [
+      "FLAX_ENGINE_ID=2",
+      "JSI_VERSION=20",
+      "JSI_NOEXCEPT_15=noexcept",
+      "JSI_CONST_10=const",
+      "JSI_NO_CONST_3=",
+    ]
+    configs += [
+      ":sdk",
+      "//build/config/compiler:enable_exceptions",
+    ]
+
+    # ponytail: migrate deprecated vendor APIs when updating the V8 JSI adapter.
+    cflags_cc = [ "-Wno-error=deprecated-declarations" ]
+    public_configs = [ ":sdk" ]
+    if (is_mac) {
+      all_dependent_configs = [ ":loader_path" ]
+    }
+    deps += [
+      "//flutter/fml",
+      "//flutter/lib/ui",
+      "//flutter/third_party/dart/runtime:dart_api",
+      "//flutter/third_party/tonic",
+    ]
+    if (is_mac) {
+      deps += [
+        ":framework_libraries",
+        ":tester_libraries",
+      ]
+    }
+  }
+  if (is_mac) {
+    # The mac copy tool hardlinks files; signing a packaged library must never
+    # mutate the verified SDK input. Only these Flax SDK copies need detaching.
+    action_foreach("framework_libraries") {
+      script = "tools/copy_library.py"
+      sources = sdk.libraries
+      outputs = [ "$root_out_dir/FlutterMacOS.framework/Versions/A/Libraries/{{source_file_part}}" ]
+      args = [
+        "{{source}}",
+        rebase_path(outputs[0], root_build_dir),
+      ]
+    }
+    action_foreach("tester_libraries") {
+      script = "tools/copy_library.py"
+      sources = sdk.libraries
+      outputs = [ "$root_out_dir/Libraries/{{source_file_part}}" ]
+      args = [
+        "{{source}}",
+        rebase_path(outputs[0], root_build_dir),
+      ]
+    }
+  }
+}
+
+# Runtime ABI calls and callbacks share precompiled Apple arm64 assembly.
+if (flax_enable_runtime && (is_mac || is_ios)) {
+  config("ffi_c_language") {
+    # libffi's ARM64 implementation uses GNU inline assembly.
+    cflags_c = [ "-std=gnu11" ]
+  }
+  source_set("ffi") {
+    sources = [
+      "third_party/libffi/src/aarch64/ffi.c",
+      "third_party/libffi/src/aarch64/sysv.S",
+      "third_party/libffi/src/closures.c",
+      "third_party/libffi/src/java_raw_api.c",
+      "third_party/libffi/src/prep_cif.c",
+      "third_party/libffi/src/raw_api.c",
+      "third_party/libffi/src/tramp.c",
+      "third_party/libffi/src/types.c",
+    ]
+    include_dirs = [
+      "third_party/libffi/include",
+      "third_party/libffi/src/aarch64",
+    ]
+    defines = [ "HAVE_CONFIG_H" ]
+    cflags = [ "-Wno-error=deprecated-declarations" ]
+    configs -= [ "//build/config/compiler:chromium_code" ]
+    configs += [
+      "//build/config/compiler:no_chromium_code",
+      ":ffi_c_language",
+    ]
+  }
+}

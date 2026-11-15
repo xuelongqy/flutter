@@ -117,6 +117,10 @@ class StrokePathGeometry final : public StrokePathSourceGeometry {
   StrokePathGeometry(const flutter::DlPath& path,
                      const StrokeParameters& parameters);
 
+#if defined(FML_OS_ANDROID)
+  std::optional<Rect> GetTightCoverage(const Matrix& transform) const override;
+#endif
+
  protected:
   // |StrokePathSourceGeometry|
   const PathSource& GetSource() const override;

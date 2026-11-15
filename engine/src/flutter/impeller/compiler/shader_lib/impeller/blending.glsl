@@ -111,16 +111,6 @@ f16vec3 IPBlendColorDodge(f16vec3 dst, f16vec3 src) {
 
   f16vec3 color = min(f16vec3(1.0hf), dst / (1.0hf - src));
 
-  if (dst.r < kEhCloseEnoughHalf) {
-    color.r = 0.0hf;
-  }
-  if (dst.g < kEhCloseEnoughHalf) {
-    color.g = 0.0hf;
-  }
-  if (dst.b < kEhCloseEnoughHalf) {
-    color.b = 0.0hf;
-  }
-
   if (1.0hf - src.r < kEhCloseEnoughHalf) {
     color.r = 1.0hf;
   }
@@ -131,6 +121,16 @@ f16vec3 IPBlendColorDodge(f16vec3 dst, f16vec3 src) {
     color.b = 1.0hf;
   }
 
+  if (dst.r < kEhCloseEnoughHalf) {
+    color.r = 0.0hf;
+  }
+  if (dst.g < kEhCloseEnoughHalf) {
+    color.g = 0.0hf;
+  }
+  if (dst.b < kEhCloseEnoughHalf) {
+    color.b = 0.0hf;
+  }
+
   return color;
 }
 
@@ -138,16 +138,6 @@ f16vec3 IPBlendColorBurn(f16vec3 dst, f16vec3 src) {
   // https://www.w3.org/TR/compositing-1/#blendingcolorburn
 
   f16vec3 color = 1.0hf - min(f16vec3(1.0hf), (1.0hf - dst) / src);
-
-  if (1.0hf - dst.r < kEhCloseEnoughHalf) {
-    color.r = 1.0hf;
-  }
-  if (1.0hf - dst.g < kEhCloseEnoughHalf) {
-    color.g = 1.0hf;
-  }
-  if (1.0hf - dst.b < kEhCloseEnoughHalf) {
-    color.b = 1.0hf;
-  }
 
   if (src.r < kEhCloseEnoughHalf) {
     color.r = 0.0hf;
@@ -157,6 +147,16 @@ f16vec3 IPBlendColorBurn(f16vec3 dst, f16vec3 src) {
   }
   if (src.b < kEhCloseEnoughHalf) {
     color.b = 0.0hf;
+  }
+
+  if (1.0hf - dst.r < kEhCloseEnoughHalf) {
+    color.r = 1.0hf;
+  }
+  if (1.0hf - dst.g < kEhCloseEnoughHalf) {
+    color.g = 1.0hf;
+  }
+  if (1.0hf - dst.b < kEhCloseEnoughHalf) {
+    color.b = 1.0hf;
   }
 
   return color;

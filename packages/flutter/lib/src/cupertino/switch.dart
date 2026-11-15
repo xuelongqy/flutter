@@ -768,6 +768,7 @@ class _CupertinoSwitchState extends State<CupertinoSwitch>
             autofocus: widget.autofocus,
             size: _kSwitchSize,
             painter: _painter
+              .._textPainter.fontCollection = DefaultFontCollection.maybeOf(context)
               ..position = position
               ..reaction = reaction
               ..reactionFocusFade = reactionFocusFade

@@ -9,6 +9,7 @@
 #include "impeller/typographer/glyph_atlas.h"
 #include "impeller/typographer/text_frame.h"
 #include "impeller/typographer/typographer_context.h"
+#include "third_party/skia/include/core/SkGraphics.h"
 
 #include <memory>
 #include <utility>
@@ -44,6 +45,25 @@ void LazyGlyphAtlas::AddTextFrame(const std::shared_ptr<TextFrame>& frame,
 void LazyGlyphAtlas::ResetTextFrames() {
   alpha_data_.reset();
   color_data_.reset();
+  const auto generation = TypographerContext::GetFontCacheGeneration();
+  if (generation == font_cache_generation_) {
+    return;
+  }
+  font_cache_generation_ = generation;
+  // Retire caches at a raster-frame boundary, never mutate an in-flight atlas.
+  for (auto* data : {&alpha_data_, &color_data_}) {
+    if (!data->context) {
+      continue;
+    }
+    auto old = data->context->GetGlyphAtlas();
+    data->context->UpdateGlyphAtlas(
+        std::make_shared<GlyphAtlas>(old->GetType(),
+                                     old->GetAtlasGeneration() + 1),
+        ISize(0, 0), 0);
+    data->context->UpdateRectPacker(nullptr);
+  }
+  // Unused strikes and typefaces also retain the original font bytes.
+  SkGraphics::PurgeFontCache();
 }
 
 const std::shared_ptr<GlyphAtlas>& LazyGlyphAtlas::CreateOrGetGlyphAtlas(

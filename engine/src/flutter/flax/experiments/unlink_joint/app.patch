@@ -1,0 +1,284 @@
+diff --git a/lib/paced.dart b/lib/paced.dart
+--- a/lib/paced.dart
++++ b/lib/paced.dart
+@@ -17,6 +17,7 @@
+ import 'package:flutter/scheduler.dart';
+ import 'package:flutter/services.dart';
+
++import 'manual_peers.dart';
+ import 'trial.dart';
+
+ const _protocolSha = String.fromEnvironment('FLAX_STAGED_UI_PROTOCOL_SHA');
+@@ -142,21 +143,7 @@
+   runtime.evaluate(
+     'globalThis.heap = Array.from({length: 300000}, (_, i) => ({i}));',
+   );
+-  for (var i = 0; i < 1000; i++) {
+-    runtime.registerHostFunction(
+-      'owner$i',
+-      (_, _) => FlaxJsNumber(i.toDouble()),
+-    );
+-    final callback = runtime.evaluate('owner$i') as FlaxJsFunction;
+-    try {
+-      if ((i == 0 || i == 999) &&
+-          (callback.call([]) as FlaxJsNumber).value != i) {
+-        throw StateError('JS-owned host callback semantic check failed');
+-      }
+-    } finally {
+-      callback.release();
+-    }
+-  }
++
+ }
+
+ int _allocateWave() {
+@@ -178,6 +165,7 @@
+   }
+   final binding = WidgetsFlutterBinding.ensureInitialized();
+   final capture = _Frames();
++  final manualPeers = ManualPeers();
+   final onTimings = capture.timings;
+   final shell = GlobalKey<_RenderShellState>();
+   final storage = calloc<_Timespec>();
+@@ -375,6 +363,7 @@
+       'runtimeCreates': creates,
+       'loadCount': loads.length,
+       'loads': loads,
++      'manualPeers': manualPeers.result(),
+       'bursts': bursts,
+       'phases': phases,
+       'conditions': conditions,
+@@ -466,6 +455,7 @@
+           );
+           return const FlaxJsUndefined();
+         });
++        manualPeers.install(native);
+         return native;
+       },
+       source: source,
+@@ -483,9 +473,8 @@
+       scrolling.future.ignore();
+       final frameStart = capture.frameCount,
+           requestStart = capture.requestCount;
+-      _prepareJsOwnedGraph(
+-        native,
+-      ); // Each explicit load starts after the previous idle.
++      _prepareJsOwnedGraph(native);
++      manualPeers.prepare(native);
+
+       if (cycle == 1) {
+         runApp(_RenderShell(key: shell, session: session, capture: capture));
+@@ -524,6 +513,7 @@
+           throw StateError('Rolling allocation window');
+         waves++;
+         allocations += 400;
++        if (wave < 100 && wave.isOdd) manualPeers.retire(native, wave);
+         if (errors.isNotEmpty || capture.overflow)
+           throw StateError('UI workload/observer error: $errors');
+         await Future<void>.delayed(const Duration(milliseconds: 100));
+@@ -539,9 +529,7 @@
+       shell.currentState!.stop();
+       final count = native.evaluate('globalThis.__stopUi()') as FlaxJsNumber;
+       uiCallbacks = count.value.toInt();
+-      native.evaluate(
+-        'delete globalThis.heap; for (let i=0;i<1000;i++) delete globalThis["owner"+i]; void 0',
+-      );
++      native.evaluate('delete globalThis.heap; void 0');
+       // The UI tree stays attached to this same live Session throughout recovery.
+       loadEnd = now();
+       phase('load_end', at: loadEnd);
+@@ -549,6 +537,7 @@
+         final deadline = loadEnd + seconds * 1000000000;
+         await waitUntil(deadline);
+         final sample = phase('recovery_$seconds', rss: true, target: deadline);
++        manualPeers.sampleRecovery(seconds);
+         if (seconds == 2 &&
+             (sample['workers'] != 0 || sample['channels'] != 0)) {
+           throw StateError(
+@@ -565,6 +554,7 @@
+         ...clockPair(),
+         'frameNumber': binding.platformDispatcher.frameData.frameNumber,
+       });
++      manualPeers.finish(native);
+       await condition('recovery_2');
+       binding.removeTimingsCallback(onTimings);
+       if (capture.frameCount == frameStart ||
+diff --git a/lib/manual_peers.dart b/lib/manual_peers.dart
+new file mode 100644
+--- /dev/null
++++ b/lib/manual_peers.dart
+@@ -0,0 +1,174 @@
++import 'dart:convert' show jsonDecode;
++
++import 'package:flax/flax.dart';
++import 'package:flax/src/native/native_runtime.dart';
++
++import 'trial.dart' show incremental;
++
++final class _Target {
++  _Target(this.value);
++  final int value;
++  late final FlaxJsObject wrapper;
++}
++
++final class ManualPeers {
++  static const _count = 1000;
++  final _targets = List<WeakReference<_Target>?>.filled(_count, null);
++  WeakReference<_Target>? _safetyTarget, _ineligibleTarget;
++  final _batches = <Map<String, int>>[];
++  final _recovery = <Map<String, Object>>[];
++  int _created = 0, _closed = 0, _released = 0;
++  int _callbackCalls = 0, _releasedCallbacks = 0;
++  final _checks = <String, bool>{};
++  bool? _manual;
++  bool _safetyPassed = false;
++
++  void install(FlaxNativeJsRuntime runtime) {
++    runtime.registerHostFunction('__fixturePeerSetup', (_, _) {
++      return FlaxJsBoolean(incremental(17) == 1);
++    });
++    runtime.registerHostFunction('__fixturePeerBind', (_, args) {
++      final wrapper = args[0] as FlaxJsObject;
++      final id = (args[1] as FlaxJsNumber).value.toInt();
++      final target = _Target(id);
++      // Registration precedes retain, which adds a distinct cleanup-bearing origin.
++      runtime.bindDartPeer(wrapper, target);
++      target.wrapper = wrapper.retain();
++      if (id == -1) {
++        runtime.bindDartPeer(args[2] as FlaxJsObject, target);
++        _safetyTarget = WeakReference(target);
++      } else if (id == -2) {
++        _ineligibleTarget = WeakReference(target);
++      } else {
++        if (id != _created || id >= _count) {
++          throw StateError('Invalid fixture peer creation order');
++        }
++        _targets[id] = WeakReference(target);
++        _created++;
++      }
++      return const FlaxJsUndefined();
++    });
++    runtime.registerHostFunction('__fixturePeerRead', (_, args) {
++      final id = (args[0] as FlaxJsNumber).value.toInt();
++      final target = switch (id) {
++        -1 => _safetyTarget?.target,
++        -2 => _ineligibleTarget?.target,
++        _ => _targets[id]?.target,
++      };
++      if (target == null ||
++          (args.length == 2 &&
++              !target.wrapper.strictEquals(args[1] as FlaxJsObject))) {
++        throw StateError('Fixture Dart target or reverse facade unavailable');
++      }
++      return FlaxJsNumber(target.value.toDouble());
++    });
++  }
++
++  void prepare(FlaxNativeJsRuntime runtime) {
++    // Use a separate context in this same UI isolate to exercise runtime ownership.
++    final foreign = FlaxEngine.createRuntime();
++    try {
++      final wrapper = foreign.evaluate('Object.create(null)') as FlaxJsObject;
++      try {
++        var rejected = false;
++        try {
++          runtime.bindDartPeer(wrapper, _Target(-3));
++        } on ArgumentError {
++          rejected = true;
++        }
++        if (!rejected) throw StateError('Accepted foreign fixture owner');
++        _checks['foreignRuntimeRejected'] = true;
++      } finally {
++        wrapper.release();
++      }
++    } finally {
++      foreign.dispose();
++    }
++    final raw = runtime.evaluate('__prepareManualPeers()') as FlaxJsString;
++    final data = jsonDecode(raw.value) as Map<String, dynamic>;
++    _manual = data['manual'] as bool;
++    _checks.addAll((data['checks'] as Map).cast<String, bool>());
++    if (_created != _count ||
++        _checks.length != 5 ||
++        _checks.values.any((passed) => !passed)) {
++      throw StateError('Incomplete fixture peer creation or safety checks');
++    }
++  }
++
++  void retire(FlaxNativeJsRuntime runtime, int wave) {
++    final clock = Stopwatch()..start();
++    final raw = runtime.evaluate('__retireManualPeers()') as FlaxJsString;
++    final evaluateUs = clock.elapsedMicroseconds;
++    final [
++      released,
++      elapsedUs,
++      majorDelta,
++      callbackCalls,
++      releasedCallbacks,
++      callbackReleaseUs,
++    ] = (jsonDecode(raw.value) as List)
++        .cast<int>();
++    if (released != (_manual! ? 20 : 0) ||
++        elapsedUs < 0 ||
++        majorDelta != 0 ||
++        callbackCalls != 1 ||
++        releasedCallbacks != (_manual! ? 1 : 0) ||
++        callbackReleaseUs < 0) {
++      throw StateError(
++        'Wrong batch work or synchronous V8 major: ${raw.value}',
++      );
++    }
++    _closed += 20;
++    _released += released;
++    _callbackCalls += callbackCalls;
++    _releasedCallbacks += releasedCallbacks;
++    _batches.add({
++      'wave': wave,
++      'closed': 20,
++      'releasedTargets': released,
++      'elapsedUs': elapsedUs,
++      'majorDelta': majorDelta,
++      'callbackCalls': callbackCalls,
++      'releasedCallbacks': releasedCallbacks,
++      'callbackReleaseUs': callbackReleaseUs,
++      'evaluateUs': evaluateUs,
++    });
++  }
++
++  @pragma('vm:never-inline')
++  void sampleRecovery(int seconds) {
++    final alive = _targets.where((witness) => witness?.target != null).length;
++    _recovery.add({
++      'seconds': seconds,
++      'retiredDartAlive': alive,
++      'retiredDartCollected': _created - alive,
++    });
++  }
++
++  void finish(FlaxNativeJsRuntime runtime) {
++    final checked = (runtime.evaluate(
++      '__checkManualPeerRecovery()',
++    ) as FlaxJsBoolean).value;
++    if (!checked ||
++        _closed != _count ||
++        _released != (_manual! ? _count : 0) ||
++        _callbackCalls != _count ~/ 20 ||
++        _releasedCallbacks != (_manual! ? _count ~/ 20 : 0)) {
++      throw StateError('Incomplete manual peer work or recovery guard');
++    }
++    _safetyPassed = true;
++  }
++
++  Map<String, Object?> result() => {
++    'manual': _manual,
++    'created': _created,
++    'closed': _closed,
++    'releasedTargets': _released,
++    'safetyPassed': _safetyPassed,
++    'callbackCalls': _callbackCalls,
++    'releasedCallbacks': _releasedCallbacks,
++    'checks': _checks,
++    'retirementBatches': _batches,
++    'recovery': _recovery,
++  };
++}

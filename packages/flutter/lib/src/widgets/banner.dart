@@ -8,6 +8,7 @@
 library;
 
 import 'dart:math' as math;
+import 'dart:ui' as ui show FlaxFontCollection;
 
 import 'package:flutter/foundation.dart';
 
@@ -68,12 +69,17 @@ class BannerPainter extends CustomPainter {
     this.color = _kColor,
     this.textStyle = _kTextStyle,
     this.shadow = _kShadow,
+    this.fontCollection,
   }) : super(repaint: PaintingBinding.instance.systemFonts) {
     assert(debugMaybeDispatchCreated('widgets', 'BannerPainter', this));
   }
 
   /// The message to show in the banner.
   final String message;
+
+  /// Private font domain for the message.
+  @internal
+  final ui.FlaxFontCollection? fontCollection;
 
   /// The directionality of the text.
   ///
@@ -138,6 +144,7 @@ class BannerPainter extends CustomPainter {
     _paintBanner = Paint()..color = color;
     _textPainter?.dispose();
     _textPainter = TextPainter(
+      fontCollection: fontCollection,
       text: TextSpan(style: textStyle, text: message),
       textAlign: TextAlign.center,
       textDirection: textDirection,
@@ -302,6 +309,7 @@ class _BannerState extends State<Banner> {
 
     _painter?.dispose();
     _painter = BannerPainter(
+      fontCollection: DefaultFontCollection.maybeOf(context),
       message: widget.message,
       textDirection: widget.textDirection ?? Directionality.of(context),
       location: widget.location,

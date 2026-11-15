@@ -37,6 +37,9 @@ struct RenderableText {
 ///
 class TypographerContext {
  public:
+  static void InvalidateFontCaches();
+  static size_t GetFontCacheGeneration();
+
   virtual ~TypographerContext();
 
   virtual bool IsValid() const;

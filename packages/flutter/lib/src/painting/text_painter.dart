@@ -11,6 +11,7 @@ import 'dart:ui'
     show
         BoxHeightStyle,
         BoxWidthStyle,
+        FlaxFontCollection,
         GlyphInfo,
         LineMetrics,
         Paragraph,
@@ -642,6 +643,7 @@ class TextPainter {
     this._textWidthBasis = TextWidthBasis.parent,
     this._textHeightBehavior,
     this._hyphens = Hyphens.manual,
+    ui.FlaxFontCollection? fontCollection,
   }) : assert(text == null || text.debugAssertIsValid()),
        assert(maxLines == null || maxLines > 0),
        assert(
@@ -652,8 +654,28 @@ class TextPainter {
        _textScaler = textScaler == const _UnspecifiedTextScaler()
            ? TextScaler.linear(textScaleFactor)
            : textScaler,
-       _maxLines = maxLines {
+       _maxLines = maxLines,
+       _fontCollection = fontCollection,
+       _fontCollectionRevision = fontCollection?.revision ?? 0 {
     assert(debugMaybeDispatchCreated('painting', 'TextPainter', this));
+  }
+
+  /// Private font lookup domain. Null uses the host's public fonts.
+  @internal
+  ui.FlaxFontCollection? get fontCollection => _fontCollection;
+  ui.FlaxFontCollection? _fontCollection;
+  int _fontCollectionRevision;
+  @internal
+  set fontCollection(ui.FlaxFontCollection? value) {
+    final int revision = value?.revision ?? 0;
+    if (identical(value, _fontCollection) && revision == _fontCollectionRevision) {
+      return;
+    }
+    _fontCollection = value;
+    _fontCollectionRevision = revision;
+    _layoutTemplate?.dispose();
+    _layoutTemplate = null;
+    markNeedsLayout();
   }
 
   /// Computes the width of a configured [TextPainter].
@@ -682,6 +704,7 @@ class TextPainter {
     TextWidthBasis textWidthBasis = TextWidthBasis.parent,
     TextHeightBehavior? textHeightBehavior,
     Hyphens hyphens = Hyphens.manual,
+    ui.FlaxFontCollection? fontCollection,
     double minWidth = 0.0,
     double maxWidth = double.infinity,
   }) {
@@ -703,6 +726,7 @@ class TextPainter {
       textWidthBasis: textWidthBasis,
       textHeightBehavior: textHeightBehavior,
       hyphens: hyphens,
+      fontCollection: fontCollection,
     )..layout(minWidth: minWidth, maxWidth: maxWidth);
 
     try {
@@ -738,6 +762,7 @@ class TextPainter {
     TextWidthBasis textWidthBasis = TextWidthBasis.parent,
     TextHeightBehavior? textHeightBehavior,
     Hyphens hyphens = Hyphens.manual,
+    ui.FlaxFontCollection? fontCollection,
     double minWidth = 0.0,
     double maxWidth = double.infinity,
   }) {
@@ -759,6 +784,7 @@ class TextPainter {
       textWidthBasis: textWidthBasis,
       textHeightBehavior: textHeightBehavior,
       hyphens: hyphens,
+      fontCollection: fontCollection,
     )..layout(minWidth: minWidth, maxWidth: maxWidth);
 
     try {
@@ -1152,6 +1178,7 @@ class TextPainter {
   ui.Paragraph _createLayoutTemplate() {
     final builder = ui.ParagraphBuilder(
       _createParagraphStyle(TextAlign.left),
+      fontCollection: _fontCollection,
     ); // direction doesn't matter, text is just a space
     final ui.TextStyle? textStyle = text?.style?.getTextStyle(textScaler: textScaler);
     if (textStyle != null) {
@@ -1248,7 +1275,7 @@ class TextPainter {
   // Creates a ui.Paragraph using the current configurations in this class and
   // assign it to _paragraph.
   ui.Paragraph _createParagraph(InlineSpan text) {
-    final builder = ui.ParagraphBuilder(_createParagraphStyle());
+    final builder = ui.ParagraphBuilder(_createParagraphStyle(), fontCollection: _fontCollection);
     text.build(builder, textScaler: textScaler, dimensions: _placeholderDimensions);
     assert(() {
       _debugMarkNeedsLayoutCallStack = null;

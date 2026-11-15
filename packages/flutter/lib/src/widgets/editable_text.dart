@@ -6244,6 +6244,7 @@ class _Editable extends MultiChildRenderObjectWidget {
   @override
   RenderEditable createRenderObject(BuildContext context) {
     return RenderEditable(
+      fontCollection: DefaultFontCollection.maybeOf(context),
       text: inlineSpan,
       cursorColor: cursorColor,
       startHandleLayerLink: startHandleLayerLink,
@@ -6288,6 +6289,7 @@ class _Editable extends MultiChildRenderObjectWidget {
   @override
   void updateRenderObject(BuildContext context, RenderEditable renderObject) {
     renderObject
+      ..fontCollection = DefaultFontCollection.maybeOf(context)
       ..text = inlineSpan
       ..cursorColor = cursorColor
       ..startHandleLayerLink = startHandleLayerLink

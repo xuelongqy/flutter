@@ -1089,6 +1089,7 @@ class _MaterialSwitchState extends State<_MaterialSwitch>
             autofocus: widget.autofocus,
             size: widget.size,
             painter: _painter
+              .._textPainter.fontCollection = DefaultFontCollection.maybeOf(context)
               ..position = position
               ..reaction = reaction
               ..reactionFocusFade = reactionFocusFade

@@ -6,6 +6,12 @@ source_root = "//flutter/third_party/json"
 
 config("json_public_config") {
   include_dirs = [ "$source_root/include" ]
+
+  # Keep vendored JSON diagnostics outside the consuming target's warning policy.
+  cflags = [
+    "-isystem",
+    rebase_path("$source_root/include"),
+  ]
 }
 
 source_set("json") {

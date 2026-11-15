@@ -260,6 +260,18 @@ TEST_F(DisplayListTest, EmptyRebuild) {
   ASSERT_TRUE(dl2->Equals(dl3));
 }
 
+TEST_F(DisplayListTest, Unorm8LayerPolicyAffectsEquality) {
+  DisplayListBuilder builder;
+  const auto ordinary = builder.Build();
+  const auto unorm8 = builder.Build(/*use_unorm8_layers=*/true);
+  EXPECT_FALSE(ordinary->uses_unorm8_layers());
+  EXPECT_TRUE(unorm8->uses_unorm8_layers());
+  EXPECT_FALSE(ordinary->Equals(unorm8));
+  EXPECT_FALSE(unorm8->Equals(ordinary));
+  EXPECT_TRUE(ordinary->Equals(builder.Build()));
+  EXPECT_TRUE(unorm8->Equals(builder.Build(/*use_unorm8_layers=*/true)));
+}
+
 TEST_F(DisplayListTest, NopReusedBuildIsReallyEmpty) {
   DisplayListBuilder builder;
   builder.DrawRect(DlRect::MakeLTRB(0.0f, 0.0f, 10.0f, 10.0f), DlPaint());

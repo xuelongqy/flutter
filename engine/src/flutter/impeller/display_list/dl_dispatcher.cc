@@ -789,6 +789,17 @@ void DlDispatcherBase::drawDisplayList(
     DlScalar opacity) {
   AUTO_DEPTH_WATCHER(display_list->total_depth());
 
+  const auto& renderer = GetContentContext();
+  const auto previous_format = renderer.GetSubpassPixelFormat();
+  // Vulkan keeps its existing format and resolve path until validated.
+  if (display_list->uses_unorm8_layers() &&
+      renderer.GetContext()->GetBackendType() !=
+          Context::BackendType::kVulkan) {
+    renderer.SetSubpassPixelFormat(PixelFormat::kR8G8B8A8UNormInt);
+  }
+  fml::ScopedCleanupClosure restore_format(
+      [&] { renderer.SetSubpassPixelFormat(previous_format); });
+
   // Save all values that must remain untouched after the operation.
   Paint saved_paint = paint_;
   Matrix saved_initial_matrix = initial_matrix_;
@@ -1280,7 +1291,8 @@ void FirstPassDispatcher::setImageFilter(const flutter::DlImageFilter* filter) {
 
 namespace {
 bool PixelFormatSupportsMSAA(std::optional<PixelFormat> pixel_format) {
-  return !pixel_format.has_value();
+  return !pixel_format.has_value() ||
+         pixel_format == PixelFormat::kR8G8B8A8UNormInt;
 }
 }  // namespace
 

@@ -872,6 +872,16 @@ const PathSource& StrokePathGeometry::GetSource() const {
   return path_;
 }
 
+#if defined(FML_OS_ANDROID)
+std::optional<Rect> StrokePathGeometry::GetTightCoverage(
+    const Matrix& transform) const {
+  const auto bounds = path_.GetSkPath().computeTightBounds();
+  return GetStrokeCoverage(
+      transform, Rect::MakeLTRB(bounds.left(), bounds.top(), bounds.right(),
+                                bounds.bottom()));
+}
+#endif
+
 ArcStrokeGeometry::ArcStrokeGeometry(const Arc& arc,
                                      const StrokeParameters& parameters)
     : StrokeSegmentsGeometry(parameters), arc_(arc) {}

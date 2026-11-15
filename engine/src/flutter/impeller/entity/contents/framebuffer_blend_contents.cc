@@ -4,7 +4,9 @@
 
 #include "framebuffer_blend_contents.h"
 
+#include "fml/trace_event.h"
 #include "impeller/entity/contents/content_context.h"
+#include "impeller/entity/geometry/geometry.h"
 #include "impeller/renderer/render_pass.h"
 
 namespace impeller {
@@ -22,8 +24,10 @@ void FramebufferBlendContents::SetBlendMode(BlendMode blend_mode) {
 }
 
 void FramebufferBlendContents::SetChildContents(
-    std::shared_ptr<Contents> child_contents) {
+    std::shared_ptr<Contents> child_contents,
+    const Geometry* sparse_stroke_geometry) {
   child_contents_ = std::move(child_contents);
+  sparse_stroke_geometry_ = sparse_stroke_geometry;
 }
 
 // |Contents|
@@ -56,6 +60,35 @@ bool FramebufferBlendContents::Render(const ContentContext& renderer,
     return true;
   }
 
+#if defined(FML_OS_ANDROID)
+  const auto& source_descriptor = src_snapshot->texture->GetTextureDescriptor();
+  // Keep RGBA8 storage; an additional opacity multiply changes GLES rounding.
+  if (blend_mode_ == BlendMode::kScreen && src_snapshot->opacity == 1 &&
+      renderer.GetSubpassPixelFormat() == PixelFormat::kR8G8B8A8UNormInt &&
+      renderer.GetContext()->GetBackendType() ==
+          Context::BackendType::kOpenGLES &&
+      renderer.GetDeviceCapabilities().SupportsDecalSamplerAddressMode() &&
+      source_descriptor.format == PixelFormat::kR8G8B8A8UNormInt &&
+      source_descriptor.mip_count == 1 &&
+      (source_descriptor.type == TextureType::kTexture2D ||
+       source_descriptor.type == TextureType::kTexture2DMultisample) &&
+      pass.GetRenderTarget()
+              .GetRenderTargetTexture()
+              ->GetTextureDescriptor()
+              .format == PixelFormat::kR8G8B8A8UNormInt &&
+      src_snapshot->sampler_descriptor.min_filter == MinMagFilter::kNearest &&
+      src_snapshot->sampler_descriptor.mag_filter == MinMagFilter::kNearest) {
+    src_snapshot->sampler_descriptor.width_address_mode =
+        SamplerAddressMode::kDecal;
+    src_snapshot->sampler_descriptor.height_address_mode =
+        SamplerAddressMode::kDecal;
+    TRACE_EVENT0("impeller", "CanvasGLES::FixedScreen");
+    auto screen = Entity::FromSnapshot(*src_snapshot, BlendMode::kScreen);
+    screen.SetClipDepth(entity.GetClipDepth());
+    return screen.Render(renderer, pass);
+  }
+#endif
+
   auto size = src_snapshot->texture->GetSize();
 
   std::array<VS::PerVertexData, 4> vertices = {
@@ -73,8 +106,63 @@ bool FramebufferBlendContents::Render(const ContentContext& renderer,
   pass.SetVertexBuffer(
       CreateVertexBuffer(vertices, renderer.GetTransientsDataBuffer()));
 
+#if defined(FML_OS_ANDROID) && defined(IMPELLER_ENABLE_OPENGLES)
+  std::optional<IRect32> restore_scissor;
+#endif
+
   switch (blend_mode_) {
     case BlendMode::kScreen:
+#if defined(FML_OS_ANDROID) && defined(IMPELLER_ENABLE_OPENGLES)
+      if (sparse_stroke_geometry_ &&
+          renderer.GetSubpassPixelFormat() == PixelFormat::kR8G8B8A8UNormInt &&
+          renderer.GetContext()->GetBackendType() ==
+              Context::BackendType::kOpenGLES &&
+          source_descriptor.format == PixelFormat::kR8G8B8A8UNormInt &&
+          source_descriptor.mip_count == 1 &&
+          (source_descriptor.type == TextureType::kTexture2D ||
+           source_descriptor.type == TextureType::kTexture2DMultisample) &&
+          options.color_attachment_pixel_format ==
+              PixelFormat::kR8G8B8A8UNormInt &&
+          !options.depth_write_enabled &&
+          options.stencil_mode == ContentContextOptions::StencilMode::kIgnore) {
+        TRACE_EVENT0("impeller", "CanvasGLES::SparseScreen");
+        pass.SetPipeline(renderer.GetCanvasFramebufferScreenPipeline(options));
+        if (entity.GetTransform().IsTranslationOnly() &&
+            src_snapshot->transform.IsTranslationOnly()) {
+          auto tight =
+              sparse_stroke_geometry_->GetTightCoverage(entity.GetTransform());
+          if (tight.has_value() && tight->IsFinite()) {
+            const auto previous = pass.GetScissor().value_or(
+                IRect32::MakeSize(pass.GetRenderTargetSize()));
+            const auto source =
+                IRect32::RoundOut(Rect::MakeSize(size).TransformBounds(
+                                      src_snapshot->transform))
+                    .Intersection(previous);
+            const auto clipped =
+                IRect32::RoundOut(tight->Expand(2)).Intersection(previous);
+            if (source.has_value()) {
+              const auto reduced =
+                  source->Intersection(clipped.value_or(IRect32()))
+                      .value_or(IRect32());
+              const int64_t source_area =
+                  static_cast<int64_t>(source->GetWidth()) *
+                  source->GetHeight();
+              const int64_t reduced_area =
+                  static_cast<int64_t>(reduced.GetWidth()) *
+                  reduced.GetHeight();
+              if (reduced_area * 5 < source_area * 4) {
+                // Keep the snapshot and UVs; only skip guaranteed transparent
+                // ink.
+                TRACE_EVENT0("impeller", "CanvasGLES::TightScreenScissor");
+                restore_scissor = previous;
+                pass.SetScissor(reduced);
+              }
+            }
+          }
+        }
+        break;
+      }
+#endif
       pass.SetPipeline(renderer.GetFramebufferBlendScreenPipeline(options));
       break;
     case BlendMode::kOverlay:
@@ -144,7 +232,13 @@ bool FramebufferBlendContents::Render(const ContentContext& renderer,
   frag_info.dst_input_alpha = 1.0;
   FS::BindFragInfo(pass, data_host_buffer.EmplaceUniform(frag_info));
 
-  return pass.Draw().ok();
+  const bool result = pass.Draw().ok();
+#if defined(FML_OS_ANDROID) && defined(IMPELLER_ENABLE_OPENGLES)
+  if (restore_scissor.has_value()) {
+    pass.SetScissor(restore_scissor.value());
+  }
+#endif
+  return result;
 }
 
 }  // namespace impeller

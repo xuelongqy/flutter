@@ -712,6 +712,7 @@ class _SnackBarState extends State<SnackBar> {
 
     // Calculate combined width of Action, Icon, and their padding, if they are present.
     final actionTextPainter = TextPainter(
+      fontCollection: DefaultFontCollection.maybeOf(context),
       text: TextSpan(
         text: widget.action?.label ?? '',
         style: Theme.of(context).textTheme.labelLarge,

@@ -1,0 +1,44 @@
+{
+  "flutter": "3.50.0",
+  "flutterRevision": "ab2912035e160d9cad6306df307576da6128ebdb",
+  "dartRevision": "fa8c1270c374c1346931583a17c3b7f278d3822d",
+  "flaxBridgeRevision": "10d4d8c07cefceaaceb1eef56d319f303133a038",
+  "sdkVersion": "0.3.0",
+  "v8Version": "15.4.80.15",
+  "v8Revision": "e959d47215186f24e182a0503a52374c96569722",
+  "targets": {
+    "macos-arm64": {
+      "sdkManifestSha256": "ec103ede166ad7b30ce8d1cab251b4ce4612bc1551ef4d22e221e86eba0199ac",
+      "libraries": {
+        "lib/libchrome_zlib.dylib": "343eb7d5685133758ee4a09ded7c4c0680fd4980a7e7abea58a33e5e4088c5e2",
+        "lib/libthird_party_abseil-cpp_absl.dylib": "2482b22c108c2d0e6cb88dfb6d2eb73efca4c04be12e074ea4afe15ebcfcb455",
+        "lib/libv8.dylib": "fb2aff71509c6785a5655a008596781b0f80416dbdee762bcd265afb1dcd62d2",
+        "lib/libv8_libbase.dylib": "b3e08e51b58190a856e2a16ecff016caeb044b0ea32e81d33a65ea620aba9e18",
+        "lib/libv8_libplatform.dylib": "7d5fd5d8273ac8652ab879fe69bc8a4abeaac3a974ea9e7d828e4a8553244343"
+      }
+    },
+    "android-arm64": {
+      "sdkManifestSha256": "121e20d7ce78f0277ef7469c161ad3223dbe96cf1ffdd4c2fd117c66e045c0fb",
+      "libraries": {
+        "lib/libv8.so": "70f21916992fbb05f2ebc8160b530d876f6eef82d136ede117449505699f9990",
+        "lib/libc++_shared.so": "179286feca53f3c2a6b10239594f640820c5704cc3d6b23d8622f835ed233e4f"
+      }
+    },
+    "ios-device-arm64": {
+      "sdkVersion": "0.3.2",
+      "sdkManifestSha256": "d1f6aaaa4416dfa303fe6616546e7a9333eacb58cf18bb6908afe2d9669e2a4b",
+      "libraries": {
+        "lib/libv8_monolith.a": "06f95b926e1004c372fcd9bdb9a44e597014044ffcd56a92b1a8bfac55f5eda3"
+      },
+      "sdkProducerRevision": "3fa63023dd6e2c18bf41790dd8cd26428064ad25"
+    },
+    "ios-simulator-arm64": {
+      "sdkVersion": "0.3.2",
+      "sdkManifestSha256": "3bc85f0d6cb2d4da19db5849c19ba87158313bd37f4e1f77666be154b86c693a",
+      "libraries": {
+        "lib/libv8_monolith.a": "21336d45a54acefe7ff2d8061fd9ca82dd457d9fc44e522e123c9e42a3262793"
+      },
+      "sdkProducerRevision": "3fa63023dd6e2c18bf41790dd8cd26428064ad25"
+    }
+  }
+}

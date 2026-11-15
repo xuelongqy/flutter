@@ -27,6 +27,17 @@ class FontLoader {
   /// how to render a specific [FontWeight] and [FontStyle] within the family.
   final String family;
 
+  /// Optional private collection supplied by an embedding runtime.
+  FlaxFontCollection? _fontCollection;
+
+  /// Private font domain supplied by the embedding runtime.
+  @internal
+  FlaxFontCollection? get fontCollection => _fontCollection;
+
+  /// Selects a private domain; null preserves public host registration.
+  @internal
+  set fontCollection(FlaxFontCollection? value) => _fontCollection = value;
+
   /// Registers a font asset to be loaded by this font loader.
   ///
   /// The [bytes] argument specifies the actual font asset bytes. Currently,
@@ -73,7 +84,12 @@ class FontLoader {
   @protected
   @visibleForTesting
   Future<void> loadFont(Uint8List list, String family) {
-    return loadFontFromList(list, fontFamily: family);
+    final FlaxFontCollection? collection = fontCollection;
+    if (collection == null) {
+      return loadFontFromList(list, fontFamily: family);
+    }
+    collection.addFont(list, family: family);
+    return Future<void>.value();
   }
 
   bool _loaded;

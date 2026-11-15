@@ -82,6 +82,9 @@ class RenderPass : public ResourceBinder {
   ///
   virtual void SetScissor(IRect32 scissor);
 
+  // The pending scissor, or the last recorded scissor inherited by this draw.
+  std::optional<IRect32> GetScissor() const;
+
   //----------------------------------------------------------------------------
   /// The number of elements to draw. When only a vertex buffer is set, this is
   /// the vertex count. When an index buffer is set, this is the index count.

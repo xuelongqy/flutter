@@ -8,6 +8,7 @@
 
 #include "flutter/flow/surface.h"
 #include "flutter/fml/build_config.h"
+#include "flutter/fml/closure.h"
 #include "flutter/fml/trace_event.h"
 #include "flutter/impeller/display_list/dl_dispatcher.h"
 #include "flutter/impeller/display_list/dl_image_impeller.h"
@@ -53,6 +54,9 @@ std::shared_ptr<impeller::Texture> DoMakeRasterSnapshot(
     case SnapshotPixelFormat::kDontCare:
       impeller_pixel_format = std::nullopt;
       break;
+    case SnapshotPixelFormat::kRGBA8:
+      impeller_pixel_format = impeller::PixelFormat::kR8G8B8A8UNormInt;
+      break;
     case SnapshotPixelFormat::kRGBA32Float:
       impeller_pixel_format = impeller::PixelFormat::kR32G32B32A32Float;
       break;
@@ -60,6 +64,24 @@ std::shared_ptr<impeller::Texture> DoMakeRasterSnapshot(
       impeller_pixel_format = impeller::PixelFormat::kR32Float;
       break;
   }
+
+  // A Canvas unorm8 snapshot includes its filter and save-layer intermediates.
+  const auto gpu_context = context->GetContext();
+  const auto previous_format =
+      gpu_context->GetCapabilities()->GetDefaultColorFormat();
+  const bool changed_format =
+      pixel_format == SnapshotPixelFormat::kRGBA8 &&
+      previous_format != impeller::PixelFormat::kR8G8B8A8UNormInt &&
+      gpu_context->UpdateOffscreenLayerPixelFormat(
+          impeller::PixelFormat::kR8G8B8A8UNormInt);
+  fml::ScopedCleanupClosure restore_format([&] {
+    if (changed_format)
+      gpu_context->UpdateOffscreenLayerPixelFormat(previous_format);
+  });
+  if (pixel_format == SnapshotPixelFormat::kRGBA8 && !changed_format &&
+      previous_format != impeller::PixelFormat::kR8G8B8A8UNormInt &&
+      previous_format != impeller::PixelFormat::kB8G8R8A8UNormInt)
+    return nullptr;
 
   return impeller::DisplayListToTexture(
       display_list, render_target_size, *context,

@@ -159,11 +159,17 @@ void ParagraphBuilder::Create(Dart_Handle wrapper,
                               double fontSize,
                               double height,
                               const std::u16string& ellipsis,
-                              const std::string& locale) {
+                              const std::string& locale,
+                              Dart_Handle font_collection_handle) {
   UIDartState::ThrowIfUIOperationsProhibited();
+  auto* scoped_fonts =
+      Dart_IsNull(font_collection_handle)
+          ? nullptr
+          : tonic::DartConverter<FlaxFontCollection*>::FromDart(
+                font_collection_handle);
   auto res = fml::MakeRefCounted<ParagraphBuilder>(
       encoded_handle, strutData, fontFamily, strutFontFamilies, fontSize,
-      height, ellipsis, locale);
+      height, ellipsis, locale, scoped_fonts);
   res->AssociateWithDartWrapper(wrapper);
 }
 
@@ -232,7 +238,8 @@ ParagraphBuilder::ParagraphBuilder(
     double fontSize,
     double height,
     const std::u16string& ellipsis,
-    const std::string& locale) {
+    const std::string& locale,
+    FlaxFontCollection* scoped_fonts) {
   int32_t mask = 0;
   txt::ParagraphStyle style;
   {
@@ -306,7 +313,10 @@ ParagraphBuilder::ParagraphBuilder(
 
   auto impeller_enabled = UIDartState::Current()->IsImpellerEnabled();
   m_paragraph_builder_ = txt::ParagraphBuilder::CreateSkiaBuilder(
-      style, font_collection.GetFontCollection(), impeller_enabled);
+      style,
+      scoped_fonts ? scoped_fonts->GetFontCollection()
+                   : font_collection.GetFontCollection(),
+      impeller_enabled);
 }
 
 ParagraphBuilder::~ParagraphBuilder() = default;

@@ -1229,6 +1229,7 @@ abstract class ResidentRunner extends ResidentHandlers {
       final TargetModel targetModel = TargetModel.fromTargetPlatform(targetPlatform);
       final BuildInfo buildInfo = debuggingOptions.buildInfo;
       final String copyPath = getDefaultCachedKernelPath(
+        artifacts: artifacts,
         trackWidgetCreation: trackWidgetCreation,
         dartDefines: buildInfo.dartDefines,
         // Must match the options the resident compiler uses to compute the

@@ -648,12 +648,12 @@ static std::optional<Entity> PipelineBlend(
   }
 
   fml::StatusOr<RenderTarget> render_target =
-      renderer.MakeSubpass("Pipeline Blend Filter",            //
-                           ISize(subpass_coverage.GetSize()),  //
-                           command_buffer,                     //
-                           callback,                           //
-                           /*msaa_enabled=*/false,             //
-                           /*depth_stencil_enabled=*/false     //
+      renderer.MakeSubpass("Pipeline Blend Filter",                  //
+                           ISize::Ceil(subpass_coverage.GetSize()),  //
+                           command_buffer,                           //
+                           callback,                                 //
+                           /*msaa_enabled=*/false,                   //
+                           /*depth_stencil_enabled=*/false           //
       );
 
   if (!render_target.ok()) {

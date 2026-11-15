@@ -3,6 +3,9 @@
 // found in the LICENSE file.
 
 #include "impeller/renderer/backend/metal/render_pass_mtl.h"
+#if defined(FLAX_ENABLE_METAL_INTEROP)
+#include "flutter/flax/native/include/flax/dawn_interop.h"
+#endif
 
 #include "flutter/fml/closure.h"
 #include "flutter/fml/logging.h"
@@ -188,6 +191,14 @@ void RenderPassMTL::OnSetLabel(std::string_view label) {
 bool RenderPassMTL::OnEncodeCommands(const Context& context) const {
   did_finish_encoding_ = true;
   [encoder_ endEncoding];
+#if defined(FLAX_ENABLE_METAL_INTEROP)
+  for (id<FlaxDawnFrame> frame in objc_getAssociatedObject(
+           encoder_, @selector(copyFlaxDawnMetalTexture))) {
+    [frame encodeReadComplete:buffer_];
+  }
+  objc_setAssociatedObject(encoder_, @selector(copyFlaxDawnMetalTexture), nil,
+                           OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+#endif
   return true;
 }
 
@@ -217,13 +228,36 @@ static bool Bind(PassBindingsCacheMTL& pass,
                  ShaderStage stage,
                  size_t bind_index,
                  raw_ptr<const Sampler> sampler,
-                 const Texture& texture) {
+                 const Texture& texture,
+                 [[maybe_unused]] id<MTLCommandBuffer> commands,
+                 [[maybe_unused]] id<MTLRenderCommandEncoder> encoder) {
   if (!sampler || !texture.IsValid()) {
     return false;
   }
 
-  return pass.SetTexture(stage, bind_index,
-                         TextureMTL::Cast(texture).GetMTLTexture()) &&
+  auto metal_texture = TextureMTL::Cast(texture).GetMTLTexture();
+#if defined(FLAX_ENABLE_METAL_INTEROP)
+  if (id<FlaxDawnFrame> frame = FlaxDawnFrameForTexture(metal_texture)) {
+    // The gate waits on Dawn's shared event; this fence orders the actual read.
+    auto fence = [frame prepareOnQueue:commands.commandQueue];
+    if (!fence) {
+      return false;
+    }
+    [encoder
+        waitForFence:fence
+        beforeStages:stage == ShaderStage::kVertex ? MTLRenderStageVertex
+                                                   : MTLRenderStageFragment];
+    NSMutableSet* frames =
+        objc_getAssociatedObject(encoder, @selector(copyFlaxDawnMetalTexture));
+    if (!frames) {
+      frames = [NSMutableSet new];
+      objc_setAssociatedObject(encoder, @selector(copyFlaxDawnMetalTexture),
+                               frames, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    [frames addObject:frame];
+  }
+#endif
+  return pass.SetTexture(stage, bind_index, metal_texture) &&
          pass.SetSampler(stage, bind_index,
                          SamplerMTL::Cast(*sampler).GetMTLSamplerState());
 }
@@ -406,7 +440,8 @@ bool RenderPassMTL::BindResource(ShaderStage stage,
   if (!texture) {
     return false;
   }
-  return Bind(pass_bindings_, stage, slot.texture_index, sampler, *texture);
+  return Bind(pass_bindings_, stage, slot.texture_index, sampler, *texture,
+              buffer_, encoder_);
 }
 
 bool RenderPassMTL::BindDynamicResource(
@@ -419,7 +454,8 @@ bool RenderPassMTL::BindDynamicResource(
   if (!texture) {
     return false;
   }
-  return Bind(pass_bindings_, stage, slot.texture_index, sampler, *texture);
+  return Bind(pass_bindings_, stage, slot.texture_index, sampler, *texture,
+              buffer_, encoder_);
 }
 
 }  // namespace impeller

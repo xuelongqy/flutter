@@ -1,0 +1,49 @@
+#ifndef FLUTTER_FLAX_NATIVE_INCLUDE_FLAX_ENGINE_GC_H_
+#define FLUTTER_FLAX_NATIVE_INCLUDE_FLAX_ENGINE_GC_H_
+#include "runtime.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
+typedef struct _Dart_Handle* Dart_Handle;
+#define FLAX_ENGINE_GC_VERSION 1
+
+/* Internal engine extension. The public native ABI remains 2. */
+typedef struct FlaxEngineGcApi {
+  uint32_t version;
+  size_t struct_size;
+  const char* flutter_revision;
+  const char* dart_revision;
+  int32_t (*bind_value)(FlaxRuntime*,
+                        FlaxValueId,
+                        Dart_Handle origin,
+                        FlaxError*);
+  int32_t (*bind_peer)(FlaxRuntime*,
+                       FlaxValueId,
+                       Dart_Handle target,
+                       Dart_Handle origin,
+                       FlaxError*);
+  int32_t (*register_host)(FlaxRuntime*,
+                           const uint16_t*,
+                           size_t,
+                           FlaxHostCallback,
+                           void*,
+                           Dart_Handle,
+                           FlaxError*);
+  uint64_t (*cell_count)(FlaxRuntime*);
+} FlaxEngineGcApi;
+const FlaxApi* flax_engine_get_api(uint32_t version);
+const FlaxEngineGcApi* flax_engine_get_gc_api(uint32_t version);
+/* Optional internal entries. Keep the version 1 table layout stable. */
+int32_t flax_engine_bind_owned_peer(FlaxRuntime*,
+                                    FlaxValueId,
+                                    Dart_Handle target,
+                                    FlaxError*);
+int32_t flax_engine_unlink_owned_peer(FlaxRuntime*, FlaxValueId, FlaxError*);
+/* Called by the embedder before tearing down the Dart UI isolate. */
+void flax_engine_shutdown_current_isolate(void);
+void flax_engine_notify_idle_current_isolate(void);
+int32_t flax_engine_defer_idle_gc_current_isolate(void);
+#ifdef __cplusplus
+}
+#endif
+#endif  // FLUTTER_FLAX_NATIVE_INCLUDE_FLAX_ENGINE_GC_H_
