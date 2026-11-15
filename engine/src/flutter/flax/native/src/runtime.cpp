@@ -1336,6 +1336,30 @@ flax_engine_get_gc_api(uint32_t version) {
   return version == FLAX_ENGINE_GC_VERSION ? &gcApi : nullptr;
 }
 
+extern "C" __attribute__((visibility("default"))) int32_t
+flax_engine_bind_owned_peer(FlaxRuntime* runtime,
+                            FlaxValueId id,
+                            Dart_Handle target,
+                            FlaxError* error) {
+  return enter(runtime, error, [&] {
+    if (!target || Dart_IsNull(target) ||
+        !flax::bindOwnedDartPeer(*runtime->js, object(runtime, id), target)) {
+      throw BridgeError(FLAX_ARGUMENT_ERROR, "Expected a fresh local JS view");
+    }
+  });
+}
+
+extern "C" __attribute__((visibility("default"))) int32_t
+flax_engine_unlink_owned_peer(FlaxRuntime* runtime,
+                              FlaxValueId id,
+                              FlaxError* error) {
+  return enter(runtime, error, [&] {
+    if (!flax::unlinkOwnedDartPeer(*runtime->js, object(runtime, id))) {
+      throw BridgeError(FLAX_ARGUMENT_ERROR, "Expected a local owned JS view");
+    }
+  });
+}
+
 extern "C" __attribute__((visibility("default"))) const FlaxEngineBindingApi*
 flax_engine_get_binding_api(uint32_t version) {
   return version == FLAX_ENGINE_BINDING_VERSION ? &bindingApi : nullptr;

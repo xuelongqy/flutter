@@ -111,6 +111,9 @@ bool TiledTextureContents::IsOpaque(const Matrix& transform) const {
   if (color_filter_) {
     return false;
   }
+  if (!texture_) {
+    return false;
+  }
   return texture_->IsOpaque() && !AppliesAlphaForStrokeCoverage(transform);
 }
 
@@ -223,6 +226,9 @@ std::optional<Snapshot> TiledTextureContents::RenderToSnapshot(
     const ContentContext& renderer,
     const Entity& entity,
     const SnapshotOptions& options) const {
+  if (!texture_) {
+    return std::nullopt;
+  }
   std::optional<Rect> geometry_coverage = GetGeometry()->GetCoverage({});
   // Reusing the entire texture cannot represent a crop or transformed tile.
   if (GetInverseEffectTransform().IsIdentity() &&

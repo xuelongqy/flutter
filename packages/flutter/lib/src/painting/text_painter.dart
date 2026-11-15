@@ -32,7 +32,7 @@ import 'text_scaler.dart';
 import 'text_span.dart';
 import 'text_style.dart';
 
-export 'dart:ui' show LineMetrics;
+export 'dart:ui' show Hyphens, LineMetrics;
 
 export 'package:flutter/services.dart' show TextRange, TextSelection;
 
@@ -523,8 +523,38 @@ class _TextPainterLayoutCacheWithOffset {
       _cachedInlinePlaceholderBoxes ??= paragraph.getBoxesForPlaceholders();
   List<TextBox>? _cachedInlinePlaceholderBoxes;
 
-  List<ui.LineMetrics> get lineMetrics => _cachedLineMetrics ??= paragraph.computeLineMetrics();
+  List<ui.LineMetrics> get _rawLineMetrics =>
+      _cachedRawLineMetrics ??= paragraph.computeLineMetrics();
+  List<ui.LineMetrics>? _cachedRawLineMetrics;
+
+  /// The line metrics of the laid out paragraph, in the TextPainter's
+  /// coordinate space (in other words, translated by [paintOffset]).
+  ///
+  /// The identity of the returned list only changes when the text layout or the
+  /// paint offset changes, so callers may use `identical` to check whether the
+  /// text layout has been invalidated since the last access.
+  List<ui.LineMetrics> get lineMetrics {
+    final Offset offset = paintOffset;
+    final List<ui.LineMetrics>? cachedMetrics = _cachedLineMetrics;
+    if (cachedMetrics != null && offset == _cachedLineMetricsPaintOffset) {
+      return cachedMetrics;
+    }
+    final List<ui.LineMetrics> shiftedMetrics;
+    if (!offset.dx.isFinite || !offset.dy.isFinite) {
+      shiftedMetrics = const <ui.LineMetrics>[];
+    } else if (offset == Offset.zero) {
+      shiftedMetrics = _rawLineMetrics;
+    } else {
+      shiftedMetrics = _rawLineMetrics
+          .map((ui.LineMetrics metrics) => TextPainter._shiftLineMetrics(metrics, offset))
+          .toList(growable: false);
+    }
+    _cachedLineMetricsPaintOffset = offset;
+    return _cachedLineMetrics = shiftedMetrics;
+  }
+
   List<ui.LineMetrics>? _cachedLineMetrics;
+  Offset? _cachedLineMetricsPaintOffset;
 
   // Used to determine whether the caret metrics cache should be invalidated.
   int? _previousCaretPositionKey;
@@ -592,13 +622,13 @@ class TextPainter {
   /// Creates a text painter that paints the given text.
   ///
   /// The `text` and `textDirection` arguments are optional but [text] and
-  /// [textDirection] must be non-null before calling [layout].
+  /// [_textDirection] must be non-null before calling [layout].
   ///
   /// The [maxLines] property, if non-null, must be greater than zero.
   TextPainter({
     InlineSpan? text,
-    TextAlign textAlign = TextAlign.start,
-    TextDirection? textDirection,
+    this._textAlign = TextAlign.start,
+    this._textDirection,
     @Deprecated(
       'Use textScaler instead. '
       'Use of textScaleFactor was deprecated in preparation for the upcoming nonlinear text scaling support. '
@@ -607,11 +637,12 @@ class TextPainter {
     double textScaleFactor = 1.0,
     TextScaler textScaler = const _UnspecifiedTextScaler(),
     int? maxLines,
-    String? ellipsis,
-    Locale? locale,
-    StrutStyle? strutStyle,
-    TextWidthBasis textWidthBasis = TextWidthBasis.parent,
-    TextHeightBehavior? textHeightBehavior,
+    this._ellipsis,
+    this._locale,
+    this._strutStyle,
+    this._textWidthBasis = TextWidthBasis.parent,
+    this._textHeightBehavior,
+    this._hyphens = Hyphens.manual,
     ui.FlaxFontCollection? fontCollection,
   }) : assert(text == null || text.debugAssertIsValid()),
        assert(maxLines == null || maxLines > 0),
@@ -620,17 +651,10 @@ class TextPainter {
          'Use textScaler instead.',
        ),
        _text = text,
-       _textAlign = textAlign,
-       _textDirection = textDirection,
        _textScaler = textScaler == const _UnspecifiedTextScaler()
            ? TextScaler.linear(textScaleFactor)
            : textScaler,
        _maxLines = maxLines,
-       _ellipsis = ellipsis,
-       _locale = locale,
-       _strutStyle = strutStyle,
-       _textWidthBasis = textWidthBasis,
-       _textHeightBehavior = textHeightBehavior,
        _fontCollection = fontCollection,
        _fontCollectionRevision = fontCollection?.revision ?? 0 {
     assert(debugMaybeDispatchCreated('painting', 'TextPainter', this));
@@ -679,6 +703,7 @@ class TextPainter {
     StrutStyle? strutStyle,
     TextWidthBasis textWidthBasis = TextWidthBasis.parent,
     TextHeightBehavior? textHeightBehavior,
+    Hyphens hyphens = Hyphens.manual,
     ui.FlaxFontCollection? fontCollection,
     double minWidth = 0.0,
     double maxWidth = double.infinity,
@@ -700,6 +725,7 @@ class TextPainter {
       strutStyle: strutStyle,
       textWidthBasis: textWidthBasis,
       textHeightBehavior: textHeightBehavior,
+      hyphens: hyphens,
       fontCollection: fontCollection,
     )..layout(minWidth: minWidth, maxWidth: maxWidth);
 
@@ -735,6 +761,7 @@ class TextPainter {
     StrutStyle? strutStyle,
     TextWidthBasis textWidthBasis = TextWidthBasis.parent,
     TextHeightBehavior? textHeightBehavior,
+    Hyphens hyphens = Hyphens.manual,
     ui.FlaxFontCollection? fontCollection,
     double minWidth = 0.0,
     double maxWidth = double.infinity,
@@ -756,6 +783,7 @@ class TextPainter {
       strutStyle: strutStyle,
       textWidthBasis: textWidthBasis,
       textHeightBehavior: textHeightBehavior,
+      hyphens: hyphens,
       fontCollection: fontCollection,
     )..layout(minWidth: minWidth, maxWidth: maxWidth);
 
@@ -1058,6 +1086,25 @@ class TextPainter {
     markNeedsLayout();
   }
 
+  /// {@template flutter.painting.textPainter.hyphens}
+  /// The behavior of soft hyphens (U+00AD) at a line break.
+  ///
+  /// Defaults to [Hyphens.manual], which renders a hyphen glyph at a line break
+  /// that falls on a soft hyphen. [Hyphens.hidden] suppresses the glyph; the line
+  /// still breaks at U+00AD regardless.
+  ///
+  /// Not yet supported on the web, where the hyphen glyph is never rendered.
+  /// {@endtemplate}
+  Hyphens get hyphens => _hyphens;
+  Hyphens _hyphens;
+  set hyphens(Hyphens value) {
+    if (_hyphens == value) {
+      return;
+    }
+    _hyphens = value;
+    markNeedsLayout();
+  }
+
   /// An ordered list of [TextBox]es that bound the positions of the placeholders
   /// in the paragraph.
   ///
@@ -1120,6 +1167,7 @@ class TextPainter {
       textScaler: textScaler,
       maxLines: _maxLines,
       textHeightBehavior: _textHeightBehavior,
+      hyphens: _hyphens,
       ellipsis: _ellipsis,
       locale: _locale,
       strutStyle: _strutStyle,
@@ -1816,20 +1864,13 @@ class TextPainter {
   /// widgets to a particular line.
   ///
   /// Valid only after [layout] has been called.
+  ///
+  /// The returned list is cached, and this method returns the same instance as
+  /// long as the text layout has not changed.
   List<ui.LineMetrics> computeLineMetrics() {
     assert(_debugAssertTextLayoutIsValid);
     assert(!_debugNeedsRelayout);
-    final _TextPainterLayoutCacheWithOffset layout = _layoutCache!;
-    final Offset offset = layout.paintOffset;
-    if (!offset.dx.isFinite || !offset.dy.isFinite) {
-      return const <ui.LineMetrics>[];
-    }
-    final List<ui.LineMetrics> rawMetrics = layout.lineMetrics;
-    return offset == Offset.zero
-        ? rawMetrics
-        : rawMetrics
-              .map((ui.LineMetrics metrics) => _shiftLineMetrics(metrics, offset))
-              .toList(growable: false);
+    return _layoutCache!.lineMetrics;
   }
 
   bool _disposed = false;

@@ -33,6 +33,12 @@ typedef struct FlaxEngineGcApi {
 } FlaxEngineGcApi;
 const FlaxApi* flax_engine_get_api(uint32_t version);
 const FlaxEngineGcApi* flax_engine_get_gc_api(uint32_t version);
+/* Optional internal entries. Keep the version 1 table layout stable. */
+int32_t flax_engine_bind_owned_peer(FlaxRuntime*,
+                                    FlaxValueId,
+                                    Dart_Handle target,
+                                    FlaxError*);
+int32_t flax_engine_unlink_owned_peer(FlaxRuntime*, FlaxValueId, FlaxError*);
 /* Called by the embedder before tearing down the Dart UI isolate. */
 void flax_engine_shutdown_current_isolate(void);
 void flax_engine_notify_idle_current_isolate(void);

@@ -138,13 +138,25 @@ if (flax_enable_runtime) {
     }
   }
   if (is_mac) {
-    copy("framework_libraries") {
+    # The mac copy tool hardlinks files; signing a packaged library must never
+    # mutate the verified SDK input. Only these Flax SDK copies need detaching.
+    action_foreach("framework_libraries") {
+      script = "tools/copy_library.py"
       sources = sdk.libraries
       outputs = [ "$root_out_dir/FlutterMacOS.framework/Versions/A/Libraries/{{source_file_part}}" ]
+      args = [
+        "{{source}}",
+        rebase_path(outputs[0], root_build_dir),
+      ]
     }
-    copy("tester_libraries") {
+    action_foreach("tester_libraries") {
+      script = "tools/copy_library.py"
       sources = sdk.libraries
       outputs = [ "$root_out_dir/Libraries/{{source_file_part}}" ]
+      args = [
+        "{{source}}",
+        rebase_path(outputs[0], root_build_dir),
+      ]
     }
   }
 }

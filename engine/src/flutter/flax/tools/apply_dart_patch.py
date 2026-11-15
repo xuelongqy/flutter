@@ -29,25 +29,8 @@ def apply(dart: Path, patch: Path, expected: str) -> None:
 
 def apply_all(dart: Path, flax: Path) -> None:
   revision = (flax / "patches/dart_revision").read_text().strip()
-  base = flax / "patches/dart.patch"
-  actual = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=dart, text=True).strip()
-  # Upgrade an existing maintained checkout without reverting its local patches.
-  # Fresh checkouts use the consolidated base; edited hunks still fail safely.
-  if actual == revision and subprocess.run(
-      ["git", "apply", "--reverse", "--check", str(base)],
-      cwd=dart,
-      stdout=subprocess.DEVNULL,
-      stderr=subprocess.DEVNULL,
-  ).returncode != 0:
-    for name in ("dart-startup.patch", "dart-joint-gc.patch"):
-      upgrade = flax / "patches" / name
-      if subprocess.run(
-          ["git", "apply", "--check", str(upgrade)],
-          cwd=dart,
-          stdout=subprocess.DEVNULL,
-          stderr=subprocess.DEVNULL,
-      ).returncode == 0:
-        apply(dart, upgrade, revision)
+  # Only the consolidated target patch is maintained. Older or partially
+  # patched checkouts fail closed; never guess an upgrade or revert local edits.
   for name in ("dart.patch", "dart-ffi.patch"):
     apply(dart, flax / "patches" / name, revision)
 

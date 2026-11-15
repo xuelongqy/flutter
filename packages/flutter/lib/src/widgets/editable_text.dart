@@ -25,8 +25,6 @@ import 'package:flutter/rendering.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 
-import '_web_browser_detection_io.dart'
-    if (dart.library.js_interop) '_web_browser_detection_web.dart';
 import 'actions.dart';
 import 'app_lifecycle_listener.dart';
 import 'autofill.dart';
@@ -200,6 +198,14 @@ class _RenderCompositionCallback extends RenderProxyBox {
 /// between the framework and the input method. Consider using
 /// [TextInputFormatter]s instead for as-you-type text modification.
 ///
+/// [TextInputFormatter]s, such as those supplied to
+/// [EditableText.inputFormatters], only run when the user changes the text in
+/// the text field, for example using the keyboard or the text selection menu.
+/// They don't run when the text is changed programmatically through this
+/// controller, such as by setting [value] or [text], or by calling [clear].
+/// If a programmatically set value needs to be formatted, apply the
+/// formatting manually before updating the controller.
+///
 /// If both the [text] and [selection] properties need to be changed, set the
 /// controller's [value] instead. Setting [text] will clear the selection
 /// and composing range.
@@ -277,6 +283,9 @@ class TextEditingController extends ValueNotifier<TextEditingValue> {
   /// this value should only be set between frames, e.g. in response to user
   /// actions, not during the build, layout, or paint phases. This property can
   /// be set from a listener added to this [TextEditingController].
+  ///
+  /// Setting this does not run [TextInputFormatter]s. Apply them manually if
+  /// needed.
   set text(String newText) {
     value = value.copyWith(
       text: newText,
@@ -285,6 +294,8 @@ class TextEditingController extends ValueNotifier<TextEditingValue> {
     );
   }
 
+  /// Setting this does not run [TextInputFormatter]s. Apply them manually if
+  /// needed.
   @override
   set value(TextEditingValue newValue) {
     assert(
@@ -346,6 +357,9 @@ class TextEditingController extends ValueNotifier<TextEditingValue> {
   ///
   /// If the new selection is outside the composing range, the composing range is
   /// cleared.
+  ///
+  /// Setting this does not run [TextInputFormatter]s. Apply them manually if
+  /// needed.
   set selection(TextSelection newSelection) {
     if (text.length < newSelection.end || text.length < newSelection.start) {
       throw FlutterError('invalid text selection: $newSelection');
@@ -365,6 +379,9 @@ class TextEditingController extends ValueNotifier<TextEditingValue> {
   /// that they need to update (it calls [notifyListeners]). For this reason,
   /// this method should only be called between frames, e.g. in response to user
   /// actions, not during the build, layout, or paint phases.
+  ///
+  /// Calling this method does not run [TextInputFormatter]s. Apply them
+  /// manually if needed.
   void clear() {
     value = const TextEditingValue(selection: TextSelection.collapsed(offset: 0));
   }
@@ -379,6 +396,9 @@ class TextEditingController extends ValueNotifier<TextEditingValue> {
   /// that they need to update (it calls [notifyListeners]). For this reason,
   /// this method should only be called between frames, e.g. in response to user
   /// actions, not during the build, layout, or paint phases.
+  ///
+  /// Calling this method does not run [TextInputFormatter]s. Apply them
+  /// manually if needed.
   void clearComposing() {
     value = value.copyWith(composing: TextRange.empty);
   }
@@ -842,7 +862,7 @@ class EditableText extends StatefulWidget {
     SmartQuotesType? smartQuotesType,
     this.enableSuggestions = true,
     required this.style,
-    StrutStyle? strutStyle,
+    this._strutStyle,
     required this.cursorColor,
     required this.backgroundCursorColor,
     this.textAlign = TextAlign.start,
@@ -965,7 +985,6 @@ class EditableText extends StatefulWidget {
              spellCheckConfiguration.misspelledTextStyle != null,
          'spellCheckConfiguration must specify a misspelledTextStyle if spell check behavior is desired',
        ),
-       _strutStyle = strutStyle,
        keyboardType =
            keyboardType ?? _inferKeyboardType(autofillHints: autofillHints, maxLines: maxLines),
        inputFormatters = maxLines == 1
@@ -1424,12 +1443,22 @@ class EditableText extends StatefulWidget {
   /// of editing, such as when pressing the "done" button on the keyboard. That
   /// default behavior can be overridden. See [onEditingComplete] for details.
   ///
-  /// {@tool dartpad}
+  /// <callout-box>
+  ///
   /// This example shows how onChanged could be used to check the TextField's
   /// current value each time the user inserts or deletes a character.
   ///
-  /// ** See code in examples/api/lib/widgets/editable_text/editable_text.on_changed.0.dart **
-  /// {@end-tool}
+  // TODO(framework): Replace the following block with a @dartpad directive
+  // when it's supported. https://github.com/dart-lang/dartdoc/issues/4123
+  /// <small>
+  ///
+  /// To see it in action, copy and run this code snippet on [DartPad](https://dartpad.dev/).
+  ///
+  /// </small>
+  ///
+  /// {@example /examples/api/lib/widgets/editable_text/editable_text.on_changed.0.dart#body}
+  ///
+  /// </callout-box>
   /// {@endtemplate}
   ///
   /// ## Handling emojis and other complex characters
@@ -1973,13 +2002,22 @@ class EditableText extends StatefulWidget {
   /// Additionally, set [ContentInsertionConfiguration.allowedMimeTypes]
   /// to limit the allowable mime types for inserted content.
   ///
-  /// {@tool dartpad}
+  /// <callout-box>
   ///
   /// This example shows how to access the data for inserted content in your
   /// `TextField`.
   ///
-  /// ** See code in examples/api/lib/widgets/editable_text/editable_text.on_content_inserted.0.dart **
-  /// {@end-tool}
+  // TODO(framework): Replace the following block with a @dartpad directive
+  // when it's supported. https://github.com/dart-lang/dartdoc/issues/4123
+  /// <small>
+  ///
+  /// To see it in action, copy and run this code snippet on [DartPad](https://dartpad.dev/).
+  ///
+  /// </small>
+  ///
+  /// {@example /examples/api/lib/widgets/editable_text/editable_text.on_content_inserted.0.dart#body}
+  ///
+  /// </callout-box>
   ///
   /// If [contentInsertionConfiguration] is not provided, by default
   /// an empty list of mime types will be sent to the Flutter Engine.
@@ -2023,19 +2061,39 @@ class EditableText extends StatefulWidget {
   /// [contextMenuBuilder] is ignored and the
   /// [TextSelectionControls.buildToolbar] method is used instead.
   ///
-  /// {@tool dartpad}
+  /// <callout-box>
+  ///
   /// This example shows how to customize the menu, in this case by keeping the
   /// default buttons for the platform but modifying their appearance.
   ///
-  /// ** See code in examples/api/lib/material/context_menu/editable_text_toolbar_builder.0.dart **
-  /// {@end-tool}
+  // TODO(framework): Replace the following block with a @dartpad directive
+  // when it's supported. https://github.com/dart-lang/dartdoc/issues/4123
+  /// <small>
   ///
-  /// {@tool dartpad}
+  /// To see it in action, copy and run this code snippet on [DartPad](https://dartpad.dev/).
+  ///
+  /// </small>
+  ///
+  /// {@example /examples/api/lib/widgets/context_menu/editable_text_toolbar_builder.0.dart#body}
+  ///
+  /// </callout-box>
+  ///
+  /// <callout-box>
+  ///
   /// This example shows how to show a custom button only when an email address
   /// is currently selected.
   ///
-  /// ** See code in examples/api/lib/material/context_menu/editable_text_toolbar_builder.1.dart **
-  /// {@end-tool}
+  // TODO(framework): Replace the following block with a @dartpad directive
+  // when it's supported. https://github.com/dart-lang/dartdoc/issues/4123
+  /// <small>
+  ///
+  /// To see it in action, copy and run this code snippet on [DartPad](https://dartpad.dev/).
+  ///
+  /// </small>
+  ///
+  /// {@example /examples/api/lib/widgets/context_menu/editable_text_toolbar_builder.1.dart#body}
+  ///
+  /// </callout-box>
   ///
   /// See also:
   ///   * [AdaptiveTextSelectionToolbar], which builds the default text selection
@@ -2056,9 +2114,9 @@ class EditableText extends StatefulWidget {
   /// [TextStyle] used to style text with misspelled words.
   ///
   /// Spell check is disabled for password input, including when [obscureText]
-  /// is true, [keyboardType] is [TextInputType.visiblePassword], or
-  /// [autofillHints] contains [AutofillHints.password] or
-  /// [AutofillHints.newPassword].
+  /// is true, [keyboardType] is [TextInputType.visiblePassword],
+  /// [TextInputType.password] is true, or [autofillHints] contains
+  /// [AutofillHints.password] or [AutofillHints.newPassword].
   ///
   /// If the [SpellCheckService] is left null, spell check is disabled by
   /// default unless the [DefaultSpellCheckService] is supported, in which case
@@ -2095,21 +2153,8 @@ class EditableText extends StatefulWidget {
 
   /// The default value for [selectionWidthStyle].
   ///
-  /// On web platforms, this defaults to [ui.BoxWidthStyle.max] for Apple platforms running
-  /// Safari (webkit) based browsers and [ui.BoxWidthStyle.tight] for all others.
-  ///
-  /// On non-web platforms, this defaults to [ui.BoxWidthStyle.max].
-  static ui.BoxWidthStyle get defaultSelectionWidthStyle {
-    if (kIsWeb) {
-      if (defaultTargetPlatform == TargetPlatform.iOS || WebBrowserDetection.isSafari) {
-        // On macOS web, the selection width behavior differs when running on
-        // Chrom(e|ium) (blink) or Safari (webkit).
-        return ui.BoxWidthStyle.max;
-      }
-      return ui.BoxWidthStyle.tight;
-    }
-    return ui.BoxWidthStyle.max;
-  }
+  /// Returns [ui.BoxWidthStyle.tight] on all platforms.
+  static ui.BoxWidthStyle get defaultSelectionWidthStyle => ui.BoxWidthStyle.tight;
 
   /// The default value for [stylusHandwritingEnabled].
   static const bool defaultStylusHandwritingEnabled = true;
@@ -2264,6 +2309,7 @@ class EditableText extends StatefulWidget {
             AutofillHints.countryName: TextInputType.name,
             AutofillHints.creditCardNumber: TextInputType.number, // Couldn't test.
             AutofillHints.email: TextInputType.emailAddress,
+            AutofillHints.emailOTPCode: TextInputType.text,
             AutofillHints.familyName: TextInputType.name,
             AutofillHints.fullStreetAddress: TextInputType.name,
             AutofillHints.givenName: TextInputType.name,
@@ -2326,6 +2372,7 @@ class EditableText extends StatefulWidget {
       AutofillHints.creditCardSecurityCode: TextInputType.number,
       AutofillHints.creditCardType: TextInputType.text,
       AutofillHints.email: TextInputType.emailAddress,
+      AutofillHints.emailOTPCode: TextInputType.text,
       AutofillHints.familyName: TextInputType.name,
       AutofillHints.fullStreetAddress: TextInputType.streetAddress,
       AutofillHints.gender: TextInputType.text,
@@ -3111,6 +3158,7 @@ class EditableTextState extends State<EditableText>
   }) {
     return obscureText ||
         keyboardType == TextInputType.visiblePassword ||
+        keyboardType.password == true ||
         (autofillHints?.any(
               (String hint) => hint == AutofillHints.password || hint == AutofillHints.newPassword,
             ) ??
@@ -4035,12 +4083,13 @@ class EditableTextState extends State<EditableText>
   bool get _hasFocus => widget.focusNode.hasFocus;
   bool get _isMultiline => widget.maxLines != 1;
 
-  /// Flag to track whether this [EditableText] was in focus when [onTapOutside]
-  /// was called.
+  /// Flag to track whether this [EditableText] was in focus when
+  /// [EditableText.onTapOutside] was called.
   ///
-  /// This is used to determine whether [onTapUpOutside] should be called.
-  /// The reason [_hasFocus] can't be used directly is because [onTapOutside]
-  /// might unfocus this [EditableText] and block the [onTapUpOutside] call.
+  /// This is used to determine whether [EditableText.onTapUpOutside] should be
+  /// called. The reason [_hasFocus] can't be used directly is because
+  /// [EditableText.onTapOutside] might unfocus this [EditableText] and block
+  /// the [EditableText.onTapUpOutside] call.
   bool _hadFocusOnTapDown = false;
 
   // Finds the closest scroll offset to the current scroll offset that fully
@@ -5148,7 +5197,17 @@ class EditableTextState extends State<EditableText>
   void userUpdateTextEditingValue(TextEditingValue value, SelectionChangedCause? cause) {
     // Compare the current TextEditingValue with the pre-format new
     // TextEditingValue value, in case the formatter would reject the change.
-    final shouldShowCaret = widget.readOnly ? _value.selection != value.selection : _value != value;
+    // Do not automatically scroll to the caret during a selection drag.
+    // Viewport scrolling is instead managed downstream by _bringIntoViewBySelectionState
+    // (called via _formatAndSetValue), which ensures the active handle is kept in view.
+    // Bypassing the default caret auto-scroll here prevents conflicts that would snap
+    // the viewport back to the opposite, static selection end.
+    // TODO(Renzo-Olivares): Remove this special case once the caret reveal paths are
+    // consolidated, https://github.com/flutter/flutter/issues/192595.
+    final bool shouldShowCaret =
+        (widget.readOnly ? _value.selection != value.selection : _value != value) &&
+        cause != SelectionChangedCause.drag;
+
     if (shouldShowCaret) {
       _scheduleShowCaretOnScreen(withAnimation: true);
     }

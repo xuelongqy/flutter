@@ -49,7 +49,7 @@ class PatchTest(unittest.TestCase):
       self.assertEqual(source.read_text(), "conflicting edit\n")
       self.assertEqual(unrelated.read_text(), "keep\n")
 
-  def test_consolidated_and_existing_patch_upgrade(self):
+  def test_consolidated_patch_rejects_obsolete_partial_checkouts(self):
     checkout = Path(__file__).resolve().parents[5]
     scratch = checkout / ".local/flax-patch-tests"
     scratch.mkdir(parents=True, exist_ok=True)
@@ -88,8 +88,7 @@ class PatchTest(unittest.TestCase):
       gc.write_text("after\n")
       (patches / "dart-joint-gc.patch").write_text(git("diff", "--", "gc"))
       git("reset", "--quiet", "HEAD")
-      for initial, gc_initial in (("base", "upstream"), ("previous", "before"),
-                                  ("current", "before"), ("current", "after")):
+      for initial, gc_initial in (("base", "upstream"), ("current", "after")):
         source.write_text(initial + "\n")
         ffi.write_text("before\n")
         gc.write_text(gc_initial + "\n")
@@ -100,13 +99,19 @@ class PatchTest(unittest.TestCase):
         self.assertEqual(ffi.read_text(), "after\n")
         self.assertEqual(gc.read_text(), "after\n")
         self.assertEqual((repo / "unrelated").read_text(), "keep\n")
-      gc.write_text("conflicting edit\n")
-      with self.assertRaises(subprocess.CalledProcessError):
-        apply_all(repo, root)
-      self.assertEqual(source.read_text(), "current\n")
-      self.assertEqual(ffi.read_text(), "after\n")
-      self.assertEqual(gc.read_text(), "conflicting edit\n")
-      self.assertEqual((repo / "unrelated").read_text(), "keep\n")
+      # Even when obsolete upgrade files are present, only the exact consolidated
+      # target is accepted. A previous/partial patch must not be repaired in place.
+      for initial, gc_initial in (("previous", "before"), ("current", "before"),
+                                  ("current", "conflicting edit")):
+        source.write_text(initial + "\n")
+        ffi.write_text("before\n")
+        gc.write_text(gc_initial + "\n")
+        with self.assertRaises(subprocess.CalledProcessError):
+          apply_all(repo, root)
+        self.assertEqual(source.read_text(), initial + "\n")
+        self.assertEqual(ffi.read_text(), "before\n")
+        self.assertEqual(gc.read_text(), gc_initial + "\n")
+        self.assertEqual((repo / "unrelated").read_text(), "keep\n")
 
 
 if __name__ == "__main__":

@@ -1,9 +1,9 @@
 # One-way joint GC experiment
 
 The Android arm64 Release/AOT experiment is available in a separate engine
-checkout. The maintained build uses the existing joint collector. The
-experimental checkout pins the staged VM, the one-way collector and request
-batching together.
+checkout. It pins the staged VM, the one-way collector and request batching
+used in the trial. See the [collector notes](../../native/src/README.md) for
+the current policy.
 
 | Revision | Experiment |
 | --- | --- |
@@ -32,5 +32,5 @@ The Android trial permits at most one additional eligible Dart isolate in the
 group. Persistent denial can postpone cycle reclamation. Turning on one-way
 by default in a macOS test build failed eight existing GC lifetime contracts.
 The staged control also increased both longest screen gaps in a matched
-Pixel 4 comparison against the maintained engine. These results limit the
-changes to the experiment checkout.
+Pixel 4 comparison against the maintained engine. These results describe
+the trial revision.

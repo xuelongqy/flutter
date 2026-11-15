@@ -36,6 +36,8 @@ flax::JointCell* bindDartPeer(jsi_runtime* runtime, jsi_object object,
                   void (*cleanup)(void*) = nullptr, void* cleanup_data = nullptr);
 size_t jointCellCount(jsi_runtime* runtime);
 void releaseDartPeer(jsi_runtime* runtime, flax::JointCell* cell);
+bool bindOwnedDartPeer(jsi_runtime*, jsi_object, Dart_Handle target);
+bool unlinkOwnedDartPeer(jsi_runtime*, jsi_object);
 
 /// Whether the runtime was constructed with multi-threaded isolate access.
 /// Used to decide whether v8::Locker should be acquired around scoped work.

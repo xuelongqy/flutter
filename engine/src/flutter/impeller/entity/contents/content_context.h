@@ -190,7 +190,6 @@ class ContentContext {
   PipelineRef GetFramebufferBlendSoftLightPipeline(ContentContextOptions opts) const;
   PipelineRef GetGaussianBlurPipeline(ContentContextOptions opts) const;
   PipelineRef GetGlyphAtlasPipeline(ContentContextOptions opts) const;
-  PipelineRef GetLinePipeline(ContentContextOptions opts) const;
   PipelineRef GetLinearGradientFillPipeline(ContentContextOptions opts) const;
   PipelineRef GetLinearGradientSSBOFillPipeline(ContentContextOptions opts) const;
   PipelineRef GetLinearGradientUniformFillPipeline(ContentContextOptions opts) const;
@@ -221,6 +220,7 @@ class ContentContext {
   PipelineRef GetXorBlendPipeline(ContentContextOptions opts) const;
   PipelineRef GetYUVToRGBFilterPipeline(ContentContextOptions opts) const;
   PipelineRef GetUberSDFPipeline(ContentContextOptions opts) const;
+  PipelineRef GetUberSDFSSBOPipeline(ContentContextOptions opts) const;
   PipelineRef GetComplexRSEPipeline(ContentContextOptions opts) const;
 #ifdef IMPELLER_ENABLE_OPENGLES
 #if !defined(FML_OS_EMSCRIPTEN)
@@ -321,6 +321,9 @@ class ContentContext {
 
   /// @brief Clear all cached textures.
   void ClearCachedTextures() const;
+
+  /// @brief Clear all cached render targets from the render target cache.
+  void ClearRenderTargetCache() const;
 
   /// @brief Retrieve the current host buffer for transient storage of indexes
   ///        used for indexed draws.
